@@ -46,9 +46,10 @@ mod tests {
         ]));
 
         // Step 3: Create parquet file
-        let file_path = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap() + "/Downloads/test_performance.parquet";
+        let file_path = std::env::temp_dir()
+            .join("test_performance.parquet")
+            .to_string_lossy()
+            .to_string();
 
         println!("Creating parquet file: {}", file_path);
         let file = File::create(&file_path)?;
