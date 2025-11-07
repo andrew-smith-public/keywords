@@ -1,0 +1,21 @@
+Copyright (c) 2025 Andrew Smith. All rights reserved.
+
+PROPRIETARY AND CONFIDENTIAL
+Unauthorized copying, distribution, or use of this software is strictly prohibited.
+
+NO WARRANTY
+This software is provided "as is" without warranty of any kind, express or
+implied, including but not limited to merchantability, fitness for a particular
+purpose, or non-infringement.
+
+LIMITATION OF LIABILITY
+In no event shall the author be liable for any damages whatsoever including
+direct, indirect, incidental, special, exemplary, or consequential damages
+arising out of the use of or inability to use this software, even if advised
+of the possibility of such damage.
+
+NO SUPPORT
+The author has no obligation to provide maintenance, support, updates,
+enhancements, or modifications.
+
+By using this software, you agree to these terms

@@ -1,0 +1,20 @@
+# Third-Party Licenses
+
+{{#each licenses}}
+## {{id}}
+
+The following components are licensed under {{id}}:
+
+{{#if used_by}}
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+{{/if}}
+
+### License Text
+```text
+{{{text}}}
+```
+
+---
+{{/each}}
