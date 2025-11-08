@@ -5,18 +5,44 @@ use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, pa
 use url::Url;
 
 /// Cache key for S3 stores that distinguishes between authenticated and anonymous access
-#[derive(Hash, Eq, PartialEq, Clone)]
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct S3CacheKey {
     bucket: String,
     anonymous: bool,
 }
 
-/// Global cache for S3 stores, keyed by bucket name.
+/// Global cache for S3 stores, keyed by (bucket, anonymous) tuple.
 ///
 /// This cache prevents recreating S3 stores (which involves credential fetching
 /// and potentially querying the EC2 metadata service) for the same bucket.
 /// Uses DashMap for lock-free concurrent access.
-static S3_STORE_CACHE: Lazy<DashMap<String, Arc<dyn ObjectStore>>> =
+///
+/// # Credential Management
+///
+/// **✅ Automatic Credential Refresh:**
+/// This implementation uses `AmazonS3Builder::from_env()` which leverages AWS's
+/// built-in credential provider chain with automatic refresh for:
+/// - **IAM Instance Roles (EC2)**: Credentials refresh automatically before expiration
+/// - **IAM Task Roles (ECS)**: Container credentials refresh automatically
+/// - **IAM Service Account Roles (EKS)**: Pod identity credentials refresh automatically
+/// - **IAM Identity Center (SSO)**: Session tokens refresh when close to expiring
+/// - **Assume Role credentials**: Refreshed automatically by AWS SDK
+///
+/// **⚠️ STS Temporary Credentials Limitation:**
+/// If you're using short-lived STS credentials obtained via `AssumeRole` that are
+/// NOT managed by the AWS SDK's credential provider chain (e.g., you're fetching
+/// them yourself and passing them explicitly via `.with_access_key_id()`), cached
+/// stores will NOT automatically refresh them. In that case, you would need to
+/// implement cache expiration or store recreation logic.
+///
+/// **❌ NOT Supported (No Auto-Refresh):**
+/// - Static access keys set via environment variables (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)
+///   These don't expire, so no refresh is needed, but rotating them requires restarting the app.
+///
+/// **Assumption:**
+/// This code assumes you are running in an AWS environment with IAM roles or have
+/// configured AWS credentials that support automatic refresh (SSO, assume role, etc.).
+static S3_STORE_CACHE: Lazy<DashMap<S3CacheKey, Arc<dyn ObjectStore>>> =
     Lazy::new(DashMap::new);
 
 /// Gets or creates a cached S3 store for the given bucket.
@@ -25,21 +51,25 @@ static S3_STORE_CACHE: Lazy<DashMap<String, Arc<dyn ObjectStore>>> =
 /// of recreating stores and refetching credentials for each operation. The
 /// cache is thread-safe and uses lock-free concurrent access for high performance.
 ///
+/// **Credential Refresh:** The underlying AWS SDK handles credential refresh
+/// automatically for IAM roles, ECS tasks, EKS pods, and SSO tokens. The cached
+/// store will continue to work as credentials are refreshed transparently.
+///
 /// # Arguments
 ///
 /// * `bucket` - S3 bucket name (without "s3://" prefix)
-/// * `anonymous` - Ignores authentication if true, otherwise authenticates
+/// * `anonymous` - If true, uses unsigned requests (for public buckets)
 ///
 /// # Returns
 ///
 /// Returns an `Arc<dyn ObjectStore>` for the specified S3 bucket. If a store
-/// for this bucket already exists in the cache, returns the cached instance.
-/// Otherwise, creates a new store, caches it, and returns it.
+/// for this (bucket, anonymous) combination already exists in the cache, returns
+/// the cached instance. Otherwise, creates a new store, caches it, and returns it.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// * AWS credentials cannot be found or are invalid
+/// * AWS credentials cannot be found or are invalid (when anonymous=false)
 /// * Bucket name is invalid
 /// * Network connection to AWS fails during store creation
 ///
@@ -63,6 +93,10 @@ static S3_STORE_CACHE: Lazy<DashMap<String, Arc<dyn ObjectStore>>> =
 ///
 /// // Both are the same instance
 /// assert!(Arc::ptr_eq(&store1, &store2));
+///
+/// // Different anonymous flag = different store
+/// let store3 = get_cached_s3_store("globalnightlight", false).unwrap();
+/// assert!(!Arc::ptr_eq(&store1, &store3));
 /// ```
 pub fn get_cached_s3_store(
     bucket: &str,
@@ -72,7 +106,7 @@ pub fn get_cached_s3_store(
         bucket: bucket.to_string(),
         anonymous,
     };
-    let entry = S3_STORE_CACHE.entry(cache_key.bucket.clone());
+    let entry = S3_STORE_CACHE.entry(cache_key.clone());
     let store = entry.or_try_insert_with(|| {
         create_s3_store(bucket, anonymous)
     })?;
@@ -90,7 +124,7 @@ pub fn get_cached_s3_store(
 ///
 /// # Supported Path Formats
 ///
-/// * **S3**: `"s3://bucket/key"` → Uses AWS S3 with credential chain (cached by bucket)
+/// * **S3**: `"s3://bucket/key"` or `"s3://bucket/key?anon=true"` → Uses AWS S3 (cached by bucket)
 /// * **Local**: Absolute or relative paths → Uses local filesystem
 ///   - Windows: `"C:\\path\\to\\file"` or relative paths
 ///   - Unix: `"/path/to/file"` or relative paths
@@ -115,12 +149,13 @@ pub fn get_cached_s3_store(
 ///
 /// # Implementation Notes
 ///
-/// * **S3 Caching**: S3 stores are cached globally by bucket name. The first
-///   access to a bucket creates the store (involves credential fetching and
-///   potentially querying the EC2 metadata service). Subsequent accesses to
-///   the same bucket reuse the cached store.
+/// * **S3 Caching**: S3 stores are cached globally by (bucket, anonymous) tuple.
+///   The first access to a bucket creates the store (involves credential fetching
+///   and potentially querying the EC2 metadata service). Subsequent accesses to
+///   the same bucket with the same anonymous flag reuse the cached store.
 /// * **Credentials**: For S3, uses AWS credential chain (environment variables,
-///   credentials file, EC2 instance profile, ECS task role)
+///   credentials file, EC2 instance profile, ECS task role, EKS service account, SSO)
+///   with automatic refresh for supported providers.
 /// * **Path Normalization**: Converts Windows backslashes to forward slashes
 ///   and resolves relative paths to absolute paths
 ///
@@ -142,7 +177,7 @@ pub fn get_cached_s3_store(
 /// # });
 /// ```
 ///
-/// ## S3 paths (requires AWS credentials)
+/// ## S3 paths
 ///
 /// ```no_run
 /// # use keywords::utils::file_interaction_local_and_cloud::get_object_store;
@@ -151,8 +186,11 @@ pub fn get_cached_s3_store(
 /// let (store, path) = get_object_store("s3://globalnightlight/201204/201204_catalog.json?anon=true").await.unwrap();
 /// let bytes = store.get(&path).await.unwrap();
 ///
-/// // S3 path - same bucket, reuses cached store (fast!)
+/// // S3 path - same bucket and anon flag, reuses cached store (fast!)
 /// let (store2, path2) = get_object_store("s3://globalnightlight/201204/GDNBO_npp_d20120401_t0653006_e0658410_b02212_c20120428182646476060_devl_pop.li.co.tif?anon=true").await.unwrap();
+///
+/// // Different anon flag - creates separate cached store
+/// let (store3, path3) = get_object_store("s3://globalnightlight/data.json").await.unwrap(); // anon=false
 /// # });
 /// ```
 pub async fn get_object_store(
@@ -210,29 +248,33 @@ pub async fn get_object_store(
     }
 }
 
-
 /// Creates a reusable S3 `ObjectStore` for a specific bucket.
 ///
 /// This function creates an S3 store that can be reused for multiple operations
 /// on the same bucket, avoiding the overhead of recreating stores and refetching
 /// credentials for each operation.
 ///
-/// **Note**: When using `get_object_store()`, S3 stores are automatically cached,
-/// so you typically don't need to call this function directly unless you want
-/// explicit control over store creation.
+/// **Note**: When using `get_object_store()` or `get_cached_s3_store()`, S3 stores
+/// are automatically cached, so you typically don't need to call this function
+/// directly unless you want explicit control over store creation.
 ///
-/// # AWS Credential Chain
+/// # AWS Credential Chain with Automatic Refresh
 ///
-/// Credentials are resolved in the following order:
+/// Credentials are resolved using `from_env()` which checks (in order):
 /// 1. **Environment variables**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
 /// 2. **AWS credentials file**: `~/.aws/credentials`
-/// 3. **EC2 instance profile**: Queries metadata service at `169.254.169.254`
-/// 4. **ECS task role**: For containers running in ECS
+/// 3. **EC2 instance profile**: Queries metadata service (credentials auto-refresh)
+/// 4. **ECS task role**: For containers running in ECS (credentials auto-refresh)
+/// 5. **EKS service account**: For pods in EKS (credentials auto-refresh)
+/// 6. **SSO tokens**: From `aws sso login` (credentials auto-refresh)
+///
+/// The AWS SDK will automatically refresh credentials before they expire for
+/// supported credential providers (IAM roles, ECS, EKS, SSO).
 ///
 /// # Arguments
 ///
 /// * `bucket` - S3 bucket name (without `"s3://"` prefix or trailing slashes)
-/// * `anonymous` - Ignores authentication if true, otherwise authenticates
+/// * `anonymous` - If true, skips signing (for public buckets); if false, uses credentials
 ///
 /// # Returns
 ///
@@ -242,7 +284,7 @@ pub async fn get_object_store(
 /// # Errors
 ///
 /// Returns an error if:
-/// * AWS credentials cannot be found or are invalid
+/// * AWS credentials cannot be found or are invalid (when anonymous=false)
 /// * Bucket name is invalid
 /// * Network connection to AWS fails
 ///
@@ -256,7 +298,7 @@ pub async fn get_object_store(
 /// # tokio_test::block_on(async {
 /// let store = create_s3_store("globalnightlight", true).unwrap();
 ///
-/// // Use it for multiple operations
+/// // Use it for multiple operations - credentials auto-refresh
 /// let file1 = store.get(&Path::from("201204/201204_catalog.json")).await.unwrap();
 /// let file2 = store.get(&Path::from("201204/GDNBO_npp_d20120401_t0653006_e0658410_b02212_c20120428182646476060_devl_pop.li.co.tif")).await.unwrap();
 /// # })
