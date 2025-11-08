@@ -105,7 +105,7 @@ impl PrunedParquetReader {
     ///
     /// // From in-memory bytes
     /// let parquet_bytes = vec![/* ... */];
-    /// let reader = PrunedParquetReader::new(ParquetSource::Bytes(parquet_bytes));
+    /// let reader = PrunedParquetReader::new(ParquetSource::from(parquet_bytes));
     /// ```
     pub fn new(source: ParquetSource) -> Self {
         Self { source }
@@ -139,11 +139,12 @@ impl PrunedParquetReader {
     ///
     /// ```no_run
     /// use keywords::searching::pruned_reader::PrunedParquetReader;
+    /// use bytes::Bytes;
     ///
     /// let parquet_bytes = vec![/* ... */];
-    /// let reader = PrunedParquetReader::from_bytes(parquet_bytes);
+    /// let reader = PrunedParquetReader::from_bytes(Bytes::from(parquet_bytes));
     /// ```
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+    pub fn from_bytes(bytes: Bytes) -> Self {
         Self::new(ParquetSource::Bytes(bytes))
     }
 
@@ -995,10 +996,10 @@ mod tests {
     use crate::searching::keyword_search::KeywordSearcher;
 
     static TEST_SEARCHER: OnceCell<KeywordSearcher> = OnceCell::const_new();
-    static TEST_PARQUET: OnceCell<Vec<u8>> = OnceCell::const_new();
+    static TEST_PARQUET: OnceCell<Bytes> = OnceCell::const_new();
 
     /// Generate a small test parquet file with 500 distinct values, 1000 rows
-    fn create_test_parquet() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_test_parquet() -> Result<Bytes, Box<dyn std::error::Error>> {
         const DISTINCT_VALUES: usize = 500;
         const TOTAL_ROWS: usize = 1000;
 
@@ -1073,10 +1074,10 @@ mod tests {
                 "Small parquet should be < 1MB, got {} bytes ({:.2} MB)",
                 buffer.len(), buffer.len() as f64 / (1024.0 * 1024.0));
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
-    async fn get_test_parquet() -> &'static Vec<u8> {
+    async fn get_test_parquet() -> &'static Bytes {
         TEST_PARQUET.get_or_init(|| async {
             create_test_parquet().expect("Failed to create test parquet")
         }).await

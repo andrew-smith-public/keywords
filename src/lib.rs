@@ -51,6 +51,7 @@ use indexmap::IndexSet;
 use std::rc::Rc;
 use std::collections::{HashSet as StdHashSet, HashMap as StdHashMap};
 use std::path::Path;
+use bytes::Bytes;
 use crate::index_data::{build_distributed_index, save_distributed_index, ColumnKeywordsFile};
 use crate::utils::column_pool::ColumnPool;
 use crate::index_structure::column_filter::ColumnFilter;
@@ -74,20 +75,27 @@ use crate::searching::search_results::SearchResult;
 ///
 /// ```no_run
 /// use keywords::ParquetSource;
+/// use bytes::Bytes;
 ///
 /// // From file path
 /// let source = ParquetSource::Path("data.parquet".to_string());
 ///
 /// // From bytes
 /// let parquet_bytes = vec![/* parquet data */];
-/// let source = ParquetSource::Bytes(parquet_bytes);
+/// let source = ParquetSource::from(parquet_bytes);
 /// ```
 #[derive(Debug, Clone)]
 pub enum ParquetSource {
     /// Path to a Parquet file (local or remote like s3://)
     Path(String),
     /// In-memory Parquet data as bytes
-    Bytes(Vec<u8>),
+    Bytes(Bytes),
+}
+
+impl From<Vec<u8>> for ParquetSource {
+    fn from(vec: Vec<u8>) -> Self {
+        ParquetSource::Bytes(Bytes::from(vec))
+    }
 }
 
 // ============================================================================

@@ -4,16 +4,15 @@ mod tests {
     use std::sync::Arc;
     use arrow::array::{StringArray};
     use indexmap::IndexSet;
-    use object_store::{path::Path as ObjectPath};
     use crate::{build_index_in_memory, ParquetSource};
     use crate::keyword_shred::{perform_split, build_column_keywords_map};
     use crate::index_structure::column_filter::ColumnFilter;
     use crate::utils::column_pool::ColumnPool;
-    use crate::utils::file_interaction_local_and_cloud::{create_local_store};
-    use crate::column_parquet_reader::{process_arrow_string_array, process_parquet_file, read_parquet_metadata, read_parquet_metadata_with_store};
+    use crate::column_parquet_reader::{process_arrow_string_array, process_parquet_file};
     use arrow::datatypes::{Schema, Field, DataType};
     use arrow::record_batch::RecordBatch;
     use arrow::array::{Int32Array, Int64Array, Float64Array, BooleanArray};
+    use bytes::Bytes;
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::{WriterProperties, WriterVersion};
     use parquet::basic::Compression;
@@ -21,7 +20,7 @@ mod tests {
 
     /// Generate a test parquet file with 500 distinct values, 1000 rows, single row group
     /// This represents the "small" test file with various column types
-    fn create_small_test_parquet() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_small_test_parquet() -> Result<Bytes, Box<dyn std::error::Error>> {
         const DISTINCT_VALUES: usize = 500;
         const TOTAL_ROWS: usize = 1000;
 
@@ -105,12 +104,12 @@ mod tests {
                 "Small parquet should be < 1MB, got {} bytes ({:.2} MB)",
                 buffer.len(), buffer.len() as f64 / (1024.0 * 1024.0));
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
     /// Generate a larger test parquet file with 5000 distinct values, 250K rows, 5 row groups
     /// This represents the "larger" test file that exceeds 2MB to test caching behavior
-    fn create_larger_test_parquet() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_larger_test_parquet() -> Result<Bytes, Box<dyn std::error::Error>> {
         const DISTINCT_VALUES: usize = 5000;
         const ROWS_PER_GROUP: usize = 50_000;
         const NUM_ROW_GROUPS: usize = 5;
@@ -193,12 +192,12 @@ mod tests {
                 "Larger parquet should be > 3MB, got {} bytes ({:.2} MB)",
                 buffer.len(), buffer.len() as f64 / (1024.0 * 1024.0));
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
     /// Generate a parquet file with completely random ASCII data including split characters
     /// This is useful for stress testing and memory profiling
-    fn create_random_ascii_parquet(rows_per_group: usize, num_row_groups: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_random_ascii_parquet(rows_per_group: usize, num_row_groups: usize) -> Result<Bytes, Box<dyn std::error::Error>> {
         // Use a different seed for each call based on parameters to get different data
         let seed = (rows_per_group as u64).wrapping_mul(1000).wrapping_add(num_row_groups as u64);
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -294,7 +293,7 @@ mod tests {
         let size_mb = buffer.len() as f64 / (1024.0 * 1024.0);
         println!("  Parquet file created: {} bytes ({:.2} MB)", buffer.len(), size_mb);
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
     #[tokio::test]
@@ -373,43 +372,6 @@ mod tests {
         println!("  Version: {}", info.version);
         println!("  Columns: {}", info.num_columns);
         println!("  Chunks: {}", info.num_chunks);
-    }
-
-    #[tokio::test]
-    #[ignore] // Remove this to test with real S3 credentials
-    async fn test_read_s3_parquet() {
-        let file_path = "s3://my-bucket/path/to/file.parquet";
-
-        let metadata_with_cache = read_parquet_metadata(file_path).await
-            .expect("Failed to read S3 parquet metadata");
-
-        println!("S3 File Information:");
-        println!("  Number of rows: {}", metadata_with_cache.metadata.file_metadata().num_rows());
-        println!("  Number of row groups: {}", metadata_with_cache.metadata.num_row_groups());
-    }
-
-    #[tokio::test]
-    async fn test_reuse_store() {
-        // Create a store once and reuse for multiple files
-        let store = create_local_store();
-
-        let files = vec![
-            "file1.parquet",
-            "file2.parquet",
-            "file3.parquet",
-        ];
-
-        for file in files {
-            let path = ObjectPath::from(file);
-            match read_parquet_metadata_with_store(store.clone(), &path).await {
-                Ok(metadata_with_cache) => {
-                    println!("{}: {} rows", file, metadata_with_cache.metadata.file_metadata().num_rows());
-                }
-                Err(e) => {
-                    println!("{}: Error - {}", file, e);
-                }
-            }
-        }
     }
 
     #[tokio::test]
@@ -802,7 +764,7 @@ mod tests {
 
         // Build index in memory
         println!("\n2. Building index in memory...");
-        let _searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01)).await
+        let _searcher = build_index_in_memory(ParquetSource::Bytes(Bytes::from(parquet_bytes)), None, Some(0.01)).await
             .expect("Failed to build index");
         println!("✓ Index built successfully in memory");
     }
@@ -1078,12 +1040,13 @@ mod column_filter_integration_tests {
     use std::sync::Arc;
     use arrow::array::{StringArray, Int32Array, RecordBatch};
     use arrow::datatypes::{Schema, Field, DataType};
+    use bytes::Bytes;
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
     use crate::{build_index_in_memory, ParquetSource};
 
     /// Helper to create a test Parquet with multiple columns (in memory)
-    fn create_test_parquet_multi_column() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_test_parquet_multi_column() -> Result<Bytes, Box<dyn std::error::Error>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("email", DataType::Utf8, false),
@@ -1136,11 +1099,11 @@ mod column_filter_integration_tests {
         writer.write(&batch)?;
         writer.close()?;
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
     /// Helper to create a Parquet with many columns (in memory) - tests index 0 efficiency
-    fn create_test_parquet_many_columns() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_test_parquet_many_columns() -> Result<Bytes, Box<dyn std::error::Error>> {
         // Create 50 string columns
         let mut fields = vec![Field::new("id", DataType::Int32, false)];
         for i in 0..50 {
@@ -1170,11 +1133,11 @@ mod column_filter_integration_tests {
         writer.write(&batch)?;
         writer.close()?;
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
     /// Helper to create a parquet with hierarchical phrases in different columns (in memory)
-    fn create_test_parquet_hierarchical() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_test_parquet_hierarchical() -> Result<Bytes, Box<dyn std::error::Error>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("email", DataType::Utf8, false),
@@ -1216,7 +1179,7 @@ mod column_filter_integration_tests {
         writer.write(&batch)?;
         writer.close()?;
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ mod comprehensive_large_file_tests {
     use std::sync::Arc;
     use arrow::array::{Array, StringArray, Int32Array, RecordBatch};
     use arrow::datatypes::{Schema, Field, DataType};
+    use bytes::Bytes;
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::{WriterProperties, WriterVersion};
     use parquet::basic::Compression;
@@ -547,7 +548,7 @@ mod comprehensive_large_file_tests {
     }
 
     /// Create a large test parquet file with strategic test data
-    fn create_comprehensive_test_parquet() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_comprehensive_test_parquet() -> Result<Bytes, Box<dyn std::error::Error>> {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42); // Deterministic random data
 
         // Create schema with 10 string columns
@@ -601,7 +602,7 @@ mod comprehensive_large_file_tests {
             let id_data: Vec<i32> = (0..ROWS_PER_GROUP).map(|i| (global_row + i) as i32).collect();
             let id_array = Int32Array::from(id_data);
 
-            let mut column_arrays: Vec<Arc<dyn arrow::array::Array>> = vec![Arc::new(id_array)];
+            let mut column_arrays: Vec<Arc<dyn Array>> = vec![Arc::new(id_array)];
 
             // Create data for each column
             for col in 0..NUM_COLUMNS {
@@ -637,7 +638,7 @@ mod comprehensive_large_file_tests {
         println!("  Parquet file created: {} bytes ({:.2} MB)",
                  buffer.len(), buffer.len() as f64 / (1024.0 * 1024.0));
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
     #[tokio::test]

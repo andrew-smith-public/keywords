@@ -5,6 +5,7 @@ mod tests {
     use arrow::array::{StringArray, Int32Array, Int64Array, Float64Array, BooleanArray};
     use arrow::datatypes::{Schema, Field, DataType};
     use arrow::record_batch::RecordBatch;
+    use bytes::Bytes;
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::{WriterProperties, WriterVersion};
     use parquet::basic::Compression;
@@ -15,7 +16,7 @@ mod tests {
     static TEST_SEARCHER: OnceCell<KeywordSearcher> = OnceCell::const_new();
 
     /// Generate a small test parquet file with 500 distinct values, 1000 rows
-    fn create_test_parquet() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn create_test_parquet() -> Result<Bytes, Box<dyn std::error::Error>> {
         const DISTINCT_VALUES: usize = 500;
         const TOTAL_ROWS: usize = 1000;
 
@@ -90,13 +91,13 @@ mod tests {
                 "Small parquet should be < 1MB, got {} bytes ({:.2} MB)",
                 buffer.len(), buffer.len() as f64 / (1024.0 * 1024.0));
 
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 
     async fn get_searcher() -> &'static KeywordSearcher {
         TEST_SEARCHER.get_or_init(|| async {
             println!("Building test index in memory...");
-            let parquet_bytes = create_test_parquet().expect("Failed to create test parquet");
+            let parquet_bytes: Bytes = create_test_parquet().expect("Failed to create test parquet");
             build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None)
                 .await
                 .expect("Build Index Failed")

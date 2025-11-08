@@ -236,10 +236,10 @@ fn convert_to_flat(
 /// # async fn example() -> () {
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
-///     let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None).await.unwrap();
+///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None).await.unwrap();
 ///     build_distributed_index(
 ///         &result,
-///         &ParquetSource::Bytes(parquet_bytes),
+///         &ParquetSource::from(parquet_bytes),
 ///         0.01
 ///     ).await.unwrap();
 /// # }
@@ -456,9 +456,9 @@ pub struct DistributedIndexFiles {
 /// # async fn example() -> () {
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
-///     let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None).await.unwrap();
+///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None).await.unwrap();
 ///
-///     let index_files = build_distributed_index(&result, &ParquetSource::Bytes(parquet_bytes), 0.01).await.unwrap();
+///     let index_files = build_distributed_index(&result, &ParquetSource::from(parquet_bytes), 0.01).await.unwrap();
 ///
 ///     // Save without prefix (path can be arbitrary for in-memory sources)
 ///     save_distributed_index(&index_files, "my_data.parquet", None).await.unwrap();

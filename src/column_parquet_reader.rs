@@ -1,17 +1,13 @@
 use std::collections::HashSet;
-use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::rc::Rc;
 use std::sync::Arc;
-
 use arrow::array::*;
 use arrow::compute::cast;
 use arrow::datatypes::*;
-use arrow::array::ArrayRef;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::StreamExt;
 use hashbrown::HashMap;
 use indexmap::IndexSet;
-use object_store::{ObjectStore, path::Path as ObjectPath};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::ParquetMetaData;
@@ -26,25 +22,25 @@ use crate::utils::file_interaction_local_and_cloud::get_object_store;
 /// Files under this size are read entirely in a single request.
 pub const TWO_MB: u64 = 2 * 1024 * 1024;
 
+/// Amount of data to read for larger files that should normally cover parquet metadata without over reading
+pub const ONE_MB: u64 = 1024 * 1024;
+
 /// Parquet footer size: 4 bytes metadata length + 4 bytes "PAR1" magic number.
 pub const FOOTER_SIZE: usize = 8;
 
-// Step 1: Define a custom error type
-#[derive(Debug)]
-struct UnexpectedMathError;
-impl Display for UnexpectedMathError {
-    fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        write!(f, "Integer underflow occurred during subtraction.")
-    }
+#[derive(Debug, Clone)]
+pub struct CachedData {
+    pub cached_file_data: Bytes,
+    pub cached_range_start: u64   // Cache is ALWAYS the end of the file
 }
-impl std::error::Error for UnexpectedMathError {}
 
 /// Metadata with optional cached file data
 #[derive(Debug, Clone)]
 pub struct MetadataWithCache {
+    pub parquet_source: ParquetSource,
     pub metadata: ParquetMetaData,
-    pub cached_file_data: Option<Bytes>,
-    pub file_size: u64,
+    pub cached_file_data: CachedData,
+    pub file_size: u64
 }
 
 /// Information about a column chunk extracted from metadata
@@ -64,81 +60,6 @@ struct ColumnChunk {
     row_group: u16,
     column_index: usize,
     start_offset: u64,
-}
-
-/// Reads Parquet file metadata from S3 or local filesystem.
-///
-/// This is the primary entry point for reading Parquet metadata with intelligent caching
-/// based on file size. For small files (<2MB), the entire file is read and cached for
-/// later reuse, avoiding additional network requests. For larger files, only the metadata
-/// is read using optimized range requests.
-///
-/// # Arguments
-///
-/// * `file_path` - File path. S3 paths must start with "s3://bucket/key", local paths can be
-///   absolute or relative
-///
-/// # Returns
-///
-/// Returns `Result<MetadataWithCache, Box<dyn std::error::Error + Send + Sync>>`:
-/// - `Ok(MetadataWithCache)` - Contains the Parquet metadata, optional cached file data, and file size
-/// - `Err` - If file access, parsing, or credential issues occur
-///
-/// # Optimization Strategy
-///
-/// - **Files <2MB**: Reads entire file (1 request), caches file data for reuse
-/// - **Files ≥2MB**: Reads last 1MB, fetches more only if needed (1-2 requests)
-///
-/// # Errors
-///
-/// Returns error if:
-/// - File path is invalid
-/// - File doesn't exist or is inaccessible
-/// - File is not a valid Parquet file
-/// - S3 credentials are missing or invalid (for S3 paths)
-///
-/// # Examples
-///
-/// ```no_run
-/// # use keywords::column_parquet_reader::read_parquet_metadata;
-/// #
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-/// // Read from local file
-/// let metadata = read_parquet_metadata("data/file.parquet").await?;
-/// println!("File has {} rows", metadata.metadata.file_metadata().num_rows());
-///
-/// // Read from S3
-/// let metadata = read_parquet_metadata("s3://my-bucket/data.parquet").await?;
-/// if let Some(cached_data) = metadata.cached_file_data {
-///     println!("File was small enough to cache ({} bytes)", cached_data.len());
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub async fn read_parquet_metadata(
-    file_path: &str,
-) -> Result<MetadataWithCache, Box<dyn std::error::Error + Send + Sync>> {
-    let (store, path) = get_object_store(file_path).await?;
-    let object_meta = store.head(&path).await?;
-    let file_size: u64 = object_meta.size;
-
-    if file_size < TWO_MB {
-        let bytes = store.get(&path).await?.bytes().await?;
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone())?;
-        Ok(MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size
-        })
-    } else {
-        let metadata = read_metadata_only(&store, &path, file_size).await?;
-        Ok(MetadataWithCache {
-            metadata,
-            cached_file_data: None,
-            file_size
-        })
-    }
 }
 
 /// Extracts metadata length from Parquet footer bytes.
@@ -195,9 +116,11 @@ fn read_metadata_length(footer_bytes: &[u8]) -> Result<usize, Box<dyn std::error
     Ok(metadata_length)
 }
 
-/// Reads only Parquet metadata from files ≥2MB using optimized range requests.
+/// Reads Parquet metadata using optimized range requests.
 ///
-/// This function implements an efficient two-phase metadata reading strategy for large files:
+/// For files <= 2MB we read the whole file and cache the data.
+///
+/// For files > 2MB we use an efficient two-phase metadata reading strategy:
 /// 1. **Initial read**: Fetch the last 1MB of the file (contains footer + likely all metadata)
 /// 2. **Parse footer**: Determine the actual metadata size from the footer
 /// 3. **Conditional fetch**: If 1MB was insufficient, fetch only the missing bytes
@@ -207,20 +130,20 @@ fn read_metadata_length(footer_bytes: &[u8]) -> Result<usize, Box<dyn std::error
 ///
 /// # Arguments
 ///
-/// * `store` - Reference to the ObjectStore for file access
-/// * `path` - Path to the Parquet file within the object store
-/// * `file_size` - Total size of the Parquet file in bytes
+/// * `parquet_source` - Path to the Parquet file within the object store or Bytes of the file
+/// * `file_size` - Total size of the Parquet file in bytes (if available, will head the file if not
+/// provided, or take the length of the bytes if the source is bytes)
 ///
 /// # Returns
 ///
-/// Returns `Result<ParquetMetaData, Box<dyn std::error::Error + Send + Sync>>`:
-/// - `Ok(ParquetMetaData)` - Parsed Parquet metadata
+/// Returns `Result<MetadataWithCache, Box<dyn std::error::Error + Send + Sync>>`:
+/// - `Ok(MetadataWithCache)` - Parsed Parquet metadata with cache of some or all data from the file
 /// - `Err` - If range requests fail, parsing fails, or arithmetic underflow occurs
 ///
 /// # Strategy Details
 ///
 /// **Phase 1 - Initial Read:**
-/// - Reads last 1MB (or entire file if smaller)
+/// - Reads last 1MB (or entire file if <= 2MB)
 /// - Typical Parquet metadata is 10-500KB, so 1MB covers most cases
 ///
 /// **Phase 2 - Conditional Fetch:**
@@ -241,182 +164,91 @@ fn read_metadata_length(footer_bytes: &[u8]) -> Result<usize, Box<dyn std::error
 /// - Integer underflow in offset calculations
 /// - Parquet metadata parsing fails
 /// - File is not a valid Parquet file
-async fn read_metadata_only(
-    store: &Arc<dyn ObjectStore>,
-    path: &ObjectPath,
-    file_size: u64,
-) -> Result<ParquetMetaData, Box<dyn std::error::Error + Send + Sync>> {
-    const ONE_MB: u64 = 1024 * 1024;
-
-    let initial_read_size :u64 = ONE_MB.min(file_size);
-
-    let initial_start :u64 = match file_size.checked_sub(initial_read_size) {
-        Some(result) => Ok(result),
-        None => Err(Box::new(UnexpectedMathError)),
-    }?;
-    let initial_bytes = store.get_range(path, initial_start..file_size).await?;
-
-    let footer_offset :usize = initial_bytes.len().saturating_sub(FOOTER_SIZE);
-    let metadata_length :usize = read_metadata_length(&initial_bytes[footer_offset..])?;
-    let total_metadata_size :usize = metadata_length + FOOTER_SIZE;
-
-    if total_metadata_size <= initial_bytes.len() {
-        // Initial read contained all metadata
-        let metadata_start = initial_bytes.len() - total_metadata_size;
-        let metadata_bytes = initial_bytes.slice_ref(&initial_bytes[metadata_start..]);
-        parse_metadata_from_owned_bytes(metadata_bytes)
-    } else {
-        // Need additional bytes
-        let additional_bytes_needed :usize = total_metadata_size - initial_bytes.len();
-        let additional_start :u64 = match initial_start.checked_sub(additional_bytes_needed as u64) {
-            Some(result) => Ok(result),
-            None => Err(Box::new(UnexpectedMathError)),
-        }?;
-        let additional_bytes = store.get_range(path, additional_start..initial_start).await?;
-
-        let mut combined = Vec::with_capacity(total_metadata_size);
-        combined.extend_from_slice(&additional_bytes);
-        combined.extend_from_slice(&initial_bytes);
-
-        let metadata_start :usize = combined.len() - total_metadata_size;
-        let metadata_bytes = Bytes::from(combined).slice(metadata_start..);
-        parse_metadata_from_owned_bytes(metadata_bytes)
-    }
-}
-
-/// Parses Parquet metadata from owned `Bytes` without copying.
-///
-/// This function creates a SerializedFileReader from owned Bytes and extracts the metadata.
-/// The Bytes type is Arc-based internally, so cloning the metadata is cheap and doesn't
-/// duplicate the underlying buffer.
-///
-/// # Arguments
-///
-/// * `bytes` - Owned Bytes containing the complete metadata section of a Parquet file
-///
-/// # Returns
-///
-/// Returns `Result<ParquetMetaData, Box<dyn std::error::Error + Send + Sync>>`:
-/// - `Ok(ParquetMetaData)` - Parsed Parquet metadata structure
-/// - `Err` - If bytes don't contain valid Parquet metadata
-///
-/// # Performance
-///
-/// - Zero-copy operation: Uses Bytes directly without additional allocation
-/// - Metadata clone is cheap (Arc-based reference counting)
-fn parse_metadata_from_owned_bytes(bytes: Bytes) -> Result<ParquetMetaData, Box<dyn std::error::Error + Send + Sync>> {
-    let reader = SerializedFileReader::new(bytes)?;
-    Ok(reader.metadata().clone())
-}
-
-
-/// Reads Parquet metadata using a pre-created ObjectStore (recommended for batch processing).
-///
-/// This function is the **preferred method** when processing multiple files because it reuses
-/// the ObjectStore connection, eliminating the overhead of repeated credential fetching and
-///
-/// # Arguments
-///
-/// * `store` - Pre-created ObjectStore (from [`object_store::local::LocalFileSystem::new`]
-///   or S3 store creation)
-/// * `path` - Object path relative to store's root
-///
-/// # Returns
-///
-/// Returns `Result<MetadataWithCache, Box<dyn std::error::Error + Send + Sync>>`:
-/// - `Ok(MetadataWithCache)` - Contains the Parquet metadata, optional cached data, and file size
-/// - `Err` - If file doesn't exist, is inaccessible, or is not valid Parquet
-///
-/// # Performance Benefits
-///
-/// When processing multiple files, this method is **dramatically faster** than calling
-/// [`read_parquet_metadata`] repeatedly because:
-/// - **Reuses connections**: No TCP handshake overhead per file
-///
-///
-/// # Errors
-///
-/// Returns error if:
-/// - File doesn't exist at the specified path
-/// - File is inaccessible due to permissions
-/// - File is not a valid Parquet file
-/// - Network errors occur (for remote stores)
-///
-/// # Examples
-///
-/// ```no_run
-/// # use object_store::local::LocalFileSystem;
-/// # use object_store::path::Path;
-/// # use object_store::ObjectStore;
-/// # use std::sync::Arc;
-/// # use keywords::column_parquet_reader::read_parquet_metadata_with_store;
-/// #
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-/// // Create store once for multiple files
-/// let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
-///
-/// // Process multiple files efficiently
-/// let files = vec!["file1.parquet", "file2.parquet", "file3.parquet"];
-/// for file in files {
-///     let path = Path::from(file);
-///     let metadata = read_parquet_metadata_with_store(
-///         Arc::clone(&store),
-///         &path
-///     ).await?;
-///     println!("{}: {} rows", file, metadata.metadata.file_metadata().num_rows());
-/// }
-/// # Ok(())
-/// # }
-/// ```
-///
-/// # Comparison with `read_parquet_metadata`
-///
-/// ```no_run
-/// # use keywords::column_parquet_reader::{read_parquet_metadata, read_parquet_metadata_with_store};
-/// # use object_store::local::LocalFileSystem;
-/// # use object_store::path::Path;
-/// # use object_store::ObjectStore;
-/// # use std::sync::Arc;
-/// #
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-/// // SLOW: Creates new ObjectStore for each file
-/// for i in 0..1000 {
-///     let metadata = read_parquet_metadata(&format!("file{}.parquet", i)).await?;
-/// }
-///
-/// // FAST: Reuses ObjectStore across all files
-/// let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
-/// for i in 0..1000 {
-///     let path = Path::from(format!("file{}.parquet", i));
-///     let metadata = read_parquet_metadata_with_store(Arc::clone(&store), &path).await?;
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub async fn read_parquet_metadata_with_store(
-    store: Arc<dyn ObjectStore>,
-    path: &ObjectPath,
+async fn read_metadata(
+    parquet_source: ParquetSource,
+    file_size_in: Option<u64>,
 ) -> Result<MetadataWithCache, Box<dyn std::error::Error + Send + Sync>> {
-    let object_meta = store.head(path).await?;
-    let file_size = object_meta.size;
 
-    if file_size < TWO_MB {
-        let bytes = store.get(path).await?.bytes().await?;
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone())?;
-        Ok(MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size
-        })
-    } else {
-        let metadata = read_metadata_only(&store, path, file_size).await?;
-        Ok(MetadataWithCache {
-            metadata,
-            cached_file_data: None,
-            file_size
-        })
+    match &parquet_source {
+        ParquetSource::Path(path_str) => {
+            let (store, path) = get_object_store(path_str).await?;
+
+            let file_size: u64 = if file_size_in.is_none() {
+                let object_meta = store.head(&path).await?;
+                object_meta.size
+            } else {
+                file_size_in.unwrap()
+            };
+
+            let initial_read_size :u64 = if file_size <= TWO_MB {
+                file_size
+            } else {
+                ONE_MB.min(file_size)
+            };
+
+            let initial_start :u64 = file_size - initial_read_size;  // Subtraction is safe by definition of initial_read_size
+            let initial_bytes = store.get_range(&path, initial_start..file_size).await?;
+
+            let footer_offset :usize = initial_bytes.len().saturating_sub(FOOTER_SIZE);
+            let metadata_length :usize = read_metadata_length(&initial_bytes[footer_offset..])?;
+            let total_metadata_size :usize = metadata_length + FOOTER_SIZE;
+
+            if total_metadata_size <= initial_bytes.len() {
+                // Initial read contained all metadata
+                let metadata_start = initial_bytes.len() - total_metadata_size;
+                let metadata_bytes = initial_bytes.slice_ref(&initial_bytes[metadata_start..]);
+                let reader = SerializedFileReader::new(metadata_bytes)?;
+                let metadata = reader.metadata();
+
+                Ok(MetadataWithCache {
+                    metadata: metadata.clone(),
+                    cached_file_data: CachedData {
+                        cached_file_data: initial_bytes,
+                        cached_range_start: initial_start
+                    },
+                    file_size,
+                    parquet_source
+                })
+            } else {
+                // Need additional bytes
+                let additional_bytes_needed :usize = total_metadata_size - initial_bytes.len();
+                let additional_start :u64 = initial_start.checked_sub(additional_bytes_needed as u64)
+                    .ok_or("Subtraction Overflow on Parquet Metadata, Parquet file is corrupt")?;
+                let additional_bytes = store.get_range(&path, additional_start..initial_start).await?;
+
+                let mut combined_mut = BytesMut::with_capacity(initial_bytes.len() + additional_bytes.len());
+                combined_mut.extend_from_slice(&initial_bytes);
+                combined_mut.extend_from_slice(&additional_bytes);
+                let combined: Bytes = combined_mut.freeze();
+
+                let reader = SerializedFileReader::new(combined.clone())?;
+                let metadata = reader.metadata();
+
+                Ok(MetadataWithCache {
+                    metadata: metadata.clone(),
+                    cached_file_data: CachedData {
+                        cached_file_data: combined,
+                        cached_range_start: additional_start
+                    },
+                    file_size,
+                    parquet_source
+                })
+            }
+        }
+        ParquetSource::Bytes(bytes) => {
+            let reader = SerializedFileReader::new(bytes.clone())?;
+            let metadata = reader.metadata();
+
+            Ok(MetadataWithCache {
+                metadata: metadata.clone(),
+                file_size: bytes.len() as u64,
+                cached_file_data: CachedData {
+                    cached_file_data: bytes.clone(),
+                    cached_range_start: 0
+                },
+                parquet_source
+            })
+        }
     }
 }
 
@@ -465,7 +297,6 @@ pub async fn read_parquet_metadata_with_store(
 /// - **Adaptive buffering**: 1000 chunks for small files, 2 for large files
 /// - **Overlapped I/O**: Reader and processor run concurrently
 pub(crate) async fn stream_and_process_parquet(
-    file_path: Option<&str>,
     excluded_columns: Option<HashSet<String>>,
     metadata_with_cache: &MetadataWithCache,
     keyword_map: &mut HashMap<Rc<str>, KeywordOneFile>,
@@ -474,10 +305,10 @@ pub(crate) async fn stream_and_process_parquet(
 
     // Extract metadata
     let metadata = metadata_with_cache.metadata.clone();
-    let cached_bytes = metadata_with_cache.cached_file_data.clone();  // Cheap as Bytes is Arc-Based
+    let cache = metadata_with_cache.cached_file_data.clone();
 
-    // Extract all column chunks from metadata, ordered by file position
-    let column_chunks = extract_column_chunks(&metadata, &excluded_columns);
+    // Extract all column chunks metadata from parquet metadata object, ordered by file position
+    let column_chunks = extract_column_chunk_metadata(&metadata, &excluded_columns);
 
     if column_chunks.is_empty() {
         return Ok(());
@@ -504,7 +335,7 @@ pub(crate) async fn stream_and_process_parquet(
     let metadata_for_processor = Arc::clone(&metadata_arc);
 
     // Choose path based on whether we have cached bytes
-    let reader_handle = if let Some(file_bytes) = cached_bytes {
+    let reader_handle = if cache.cached_range_start == 0 {
         // Fast path: slice directly from cached bytes (zero-copy)
         tokio::spawn(async move {
             for chunk_info in column_chunks {
@@ -512,7 +343,7 @@ pub(crate) async fn stream_and_process_parquet(
                 let end = start + chunk_info.size as usize;
 
                 // Zero-copy slice from cached bytes
-                let column_bytes = file_bytes.slice(start..end);
+                let column_bytes = cache.cached_file_data.slice(start..end);
 
                 tx.send(ColumnChunk {
                     bytes: column_bytes,
@@ -526,15 +357,23 @@ pub(crate) async fn stream_and_process_parquet(
             }
         })
     } else {
-        // Network path: stream from object store
-        let file_path = file_path.ok_or("file_path required when data is not cached")?;
-        let (store, path) = get_object_store(file_path).await?;
+        // Network path: stream from object store (except the end that we have already cached)
+        // We should be guaranteed by design to have path information in the metadata_with_cache object
+        let path_str: &str = match &metadata_with_cache.parquet_source {
+            ParquetSource::Path(path) => {
+                path.as_str()
+            }
+            ParquetSource::Bytes(_) => {
+                panic!("Design error, should not be possible to get bytes parquet source in this else block")
+            }
+        };
+        let (store, path) = get_object_store(path_str).await?;
         let get_result = store.get(&path).await?;
-        let stream = get_result.into_stream();
+        let stream_file = get_result.into_stream();
 
         // Spawn reader task (handles streaming and buffering)
         tokio::spawn(async move {
-            reader_task(stream, column_chunks, tx).await;
+            reader_task(stream_file, column_chunks, tx).await;
         })
     };
 
@@ -582,7 +421,7 @@ pub(crate) async fn stream_and_process_parquet(
 ///
 /// Panics if the file has more than `u16::MAX` (65,535) row groups, which exceeds the
 /// supported limit.
-fn extract_column_chunks(
+fn extract_column_chunk_metadata(
     metadata: &ParquetMetaData,
     excluded_columns: &Option<HashSet<String>>
 ) -> Vec<ColumnChunkInfo> {
@@ -801,7 +640,7 @@ fn process_column_chunk(
         // Should only be one column due to projection
         for array in batch.columns() {
             // Convert Arrow array to StringArray (returns ArrayRef)
-            let string_array_ref = convert_to_string_array(array);
+            let string_array_ref = cast(array, &DataType::Utf8).expect("Failed to cast array to string");
 
             // Downcast to concrete StringArray type
             let string_array = string_array_ref
@@ -933,34 +772,6 @@ impl ChunkReader for ColumnBytesReader {
             )))
         }
     }
-}
-
-/// Converts any Arrow array type to StringArray using Arrow's cast kernel.
-///
-/// This function handles conversion of all Arrow data types to UTF-8 strings:
-/// - Numeric types: Formatted as decimal strings
-/// - Boolean: Converted to "true"/"false"
-/// - Date/Time: Formatted as ISO 8601 strings
-/// - Binary: Formatted as hex or base64
-/// - Complex types (List, Struct, Map): Converted to JSON representation
-///
-/// # Arguments
-///
-/// * `array` - Reference to any Arrow array implementing the Array trait
-///
-/// # Returns
-///
-/// Returns `ArrayRef` (Arc<dyn Array>) containing a StringArray. The Arc wrapper
-/// avoids cloning the underlying string data.
-///
-/// # Panics
-///
-/// Panics if the cast operation fails (this should not happen in practice as all
-/// Arrow types support casting to UTF-8).
-fn convert_to_string_array(array: &dyn Array) -> ArrayRef {
-    // Cast any array type to Utf8 (StringArray)
-    cast(array, &DataType::Utf8)
-        .expect("Failed to cast array to string")
 }
 
 /// Processes an Arrow StringArray efficiently by extracting and splitting keywords.
@@ -1099,8 +910,8 @@ pub(crate) fn process_arrow_string_array(
 /// ).await?;
 ///
 /// // Use bloom filters for fast lookups
-/// if result.global_filter.might_contain("searchterm") {
-///     println!("'searchterm' may exist in the file");
+/// if result.global_filter.might_contain("search_term") {
+///     println!("'search_term' may exist in the file");
 /// }
 /// # Ok(())
 /// # }
@@ -1121,23 +932,7 @@ pub async fn process_parquet_file(
     let error_rate = error_rate.unwrap_or(0.01);
 
     // Read metadata and determine file path for streaming
-    let (metadata_with_cache, owned_path) = match source {
-        ParquetSource::Path(ref path) => {
-            let metadata = read_parquet_metadata(path).await?;
-            (metadata, Some(path.clone()))
-        }
-        ParquetSource::Bytes(vec) => {
-            let bytes = Bytes::from(vec);
-            let file_size = bytes.len() as u64;
-            let metadata = parse_metadata_from_owned_bytes(bytes.clone())?;
-            let metadata_with_cache = MetadataWithCache {
-                metadata,
-                cached_file_data: Some(bytes),
-                file_size,
-            };
-            (metadata_with_cache, None)
-        }
-    };
+    let metadata_with_cache: MetadataWithCache = read_metadata(source, None).await?;
 
     let num_rows: i64 = metadata_with_cache.metadata.file_metadata().num_rows();
     let num_cols: usize = metadata_with_cache.metadata.file_metadata().schema_descr().num_columns();
@@ -1155,7 +950,6 @@ pub async fn process_parquet_file(
     let mut column_pool = ColumnPool::new();
 
     stream_and_process_parquet(
-        owned_path.as_deref(),
         exclude_columns,
         &metadata_with_cache,
         &mut keyword_map,
@@ -1245,15 +1039,9 @@ mod tests {
         let mut keyword_map = HashMap::new();
         let mut column_pool = ColumnPool::new();
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone()).unwrap();
-        let metadata_with_cache = MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size: parquet_bytes.len() as u64,
-        };
+        let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
         stream_and_process_parquet(
-            None, // No file path for in-memory
             None,
             &metadata_with_cache,
             &mut keyword_map,
@@ -1309,15 +1097,9 @@ mod tests {
         let mut keyword_map = HashMap::new();
         let mut column_pool = ColumnPool::new();
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone()).unwrap();
-        let metadata_with_cache = MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size: parquet_bytes.len() as u64,
-        };
+        let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
         stream_and_process_parquet(
-            None,
             None,
             &metadata_with_cache,
             &mut keyword_map,
@@ -1379,15 +1161,9 @@ mod tests {
         let mut keyword_map = HashMap::new();
         let mut column_pool = ColumnPool::new();
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone()).unwrap();
-        let metadata_with_cache = MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size: parquet_bytes.len() as u64,
-        };
+        let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
         stream_and_process_parquet(
-            None,
             None,
             &metadata_with_cache,
             &mut keyword_map,
@@ -1434,15 +1210,9 @@ mod tests {
         let mut keyword_map = HashMap::new();
         let mut column_pool = ColumnPool::new();
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone()).unwrap();
-        let metadata_with_cache = MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size: parquet_bytes.len() as u64,
-        };
+        let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
         stream_and_process_parquet(
-            None,
             None,
             &metadata_with_cache,
             &mut keyword_map,
@@ -1479,15 +1249,9 @@ mod tests {
         let mut keyword_map = HashMap::new();
         let mut column_pool = ColumnPool::new();
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone()).unwrap();
-        let metadata_with_cache = MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size: parquet_bytes.len() as u64,
-        };
+        let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
         stream_and_process_parquet(
-            None,
             Some(excluded),
             &metadata_with_cache,
             &mut keyword_map,
@@ -1537,15 +1301,9 @@ mod tests {
         let mut keyword_map = HashMap::new();
         let mut column_pool = ColumnPool::new();
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone()).unwrap();
-        let metadata_with_cache = MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size: parquet_bytes.len() as u64,
-        };
+        let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
         stream_and_process_parquet(
-            None,
             None,
             &metadata_with_cache,
             &mut keyword_map,
@@ -1610,15 +1368,9 @@ mod tests {
         let mut keyword_map = HashMap::new();
         let mut column_pool = ColumnPool::new();
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
-        let metadata = parse_metadata_from_owned_bytes(bytes.clone()).unwrap();
-        let metadata_with_cache = MetadataWithCache {
-            metadata,
-            cached_file_data: Some(bytes),
-            file_size: parquet_bytes.len() as u64,
-        };
+        let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
         stream_and_process_parquet(
-            None,
             None,
             &metadata_with_cache,
             &mut keyword_map,
