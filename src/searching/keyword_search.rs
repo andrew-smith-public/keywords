@@ -526,6 +526,10 @@ impl KeywordSearcher {
     /// This unified search method handles both exact keyword matching and phrase searches
     /// with token splitting and parent verification.
     ///
+    /// Performs fast lookup using bloom filters and binary search to find all occurrences
+    /// of the keyword across all columns. Returns detailed location information including
+    /// columns, row groups, and specific row ranges.
+    ///
     /// # Arguments
     ///
     /// * `search_for` - The text to search for (keyword or phrase)
@@ -597,117 +601,39 @@ impl KeywordSearcher {
         }
     }
 
-    /// Internal keyword search implementation.
+    /// Internal zero-copy keyword search implementation.
     ///
-    /// Performs fast lookup using bloom filters and binary search to find all occurrences
-    /// of the keyword across all columns. Returns detailed location information including
-    /// columns, row groups, and specific row ranges.
+    /// Performs keyword lookup with minimal memory allocations by using zero-copy
+    /// deserialization. Only the specific keyword data needed is converted from
+    /// the archived format to native Rust structures.
     ///
-    /// This is the old search() logic, now wrapped by the unified search() method.
+    /// This is the primary internal search method called by the public `search()` API
+    /// for exact keyword matching.
     ///
     /// # Arguments
     ///
-    /// * `keyword` - The exact keyword to search for (case-sensitive). This should be a
+    /// * `keyword` - The exact keyword to search for (case-sensitive). Must be a
     ///   complete token as it was indexed, not a partial match or pattern.
     /// * `column_filter` - Optional column name to restrict search to a specific column.
+    ///   If `None`, searches all columns using the global bloom filter.
     ///
     /// # Returns
     ///
-    /// `Ok(SearchResult)` - Search result with:
+    /// `Ok(SearchResult)` with:
     /// * `found: false` - Keyword definitely not in index (bloom filter rejection)
-    /// * `found: true` - Keyword found with detailed location data including columns,
-    ///   row groups, row ranges, and occurrence counts
-    ///
-    /// Note: Due to bloom filter false positives (~1%), `found: true` means the keyword
-    /// is *likely* present. Actual verification requires reading the Parquet file.
+    /// * `found: true` - Keyword found with detailed location data
     ///
     /// # Errors
     ///
     /// Returns error if:
     /// * Index data is corrupted (rkyv deserialization failure)
-    /// * Column pool is missing required column IDs (corrupted index)
+    /// * Column pool is missing required column IDs
+    /// * I/O error reading data chunks
     ///
-    /// # Examples
+    /// # Note
     ///
-    /// **Basic search:**
-    ///
-    /// ```no_run
-    /// use keywords::searching::keyword_search::KeywordSearcher;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    ///     let result = searcher.search("alice", None, true).await?;
-    ///
-    ///     if result.found {
-    ///         let data = result.verified_matches.unwrap();
-    ///         println!("Found '{}' in columns: {:?}", result.query, data.columns);
-    ///         println!("Total occurrences: {}", data.total_occurrences);
-    ///     } else {
-    ///         println!("Keyword '{}' not found", result.query);
-    ///     }
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
-    ///
-    /// **Analyze search results:**
-    ///
-    /// ```no_run
-    /// use keywords::searching::keyword_search::KeywordSearcher;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ///     let searcher = KeywordSearcher::load("logs.parquet", None).await?;
-    ///     let result = searcher.search("error", None, true).await?;
-    ///
-    ///     if let Some(data) = result.verified_matches {
-    ///         println!("Keyword: {}", result.query);
-    ///         println!("Columns: {}", data.columns.len());
-    ///
-    ///         for col in &data.column_details {
-    ///             println!("  Column '{}': {} row groups",
-    ///                 col.column_name, col.row_groups.len());
-    ///
-    ///             for rg in &col.row_groups {
-    ///                 let total_rows: u32 = rg.row_ranges.iter()
-    ///                     .map(|r| r.end_row - r.start_row + 1)
-    ///                     .sum();
-    ///                 println!("    Row group {}: {} rows",
-    ///                     rg.row_group_id, total_rows);
-    ///             }
-    ///         }
-    ///     }
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
-    ///
-    /// **Search multiple keywords:**
-    ///
-    /// ```no_run
-    /// use keywords::searching::keyword_search::KeywordSearcher;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    ///
-    ///     let keywords = vec!["alice", "bob", "charlie", "david"];
-    ///     let mut found_count = 0;
-    ///
-    ///     for keyword in keywords {
-    ///         let result = searcher.search(keyword, None, true).await?;
-    ///         if result.found {
-    ///             found_count += 1;
-    ///             println!("Found: {}", keyword);
-    ///         }
-    ///     }
-    ///
-    ///     println!("Found {} out of {} keywords", found_count, 4);
-    ///     Ok(())
-    /// }
-    /// ```
-    /// Zero-copy search that only converts the specific keyword data needed.
+    /// Due to bloom filter false positives (~1%), `found: true` means the keyword
+    /// is *likely* present. For absolute certainty, verify by reading the Parquet file.
     async fn search_keyword_internal_zerocopy(
         &self,
         keyword: &str,
@@ -934,6 +860,34 @@ impl KeywordSearcher {
         })
     }
 
+    /// Internal keyword search implementation with full deserialization.
+    ///
+    /// Alternative search implementation that fully deserializes chunk data.
+    /// Currently not used by the public API, which prefers `search_keyword_internal_zerocopy`
+    /// for better performance.
+    ///
+    /// # Arguments
+    ///
+    /// * `keyword` - The exact keyword to search for (case-sensitive)
+    /// * `column_filter` - Optional column name to restrict search to a specific column
+    ///
+    /// # Returns
+    ///
+    /// `Ok(SearchResult)` containing:
+    /// * `found: false` - Keyword not in index (bloom filter rejection)
+    /// * `found: true` - Keyword found with complete location information
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// * Index data cannot be read or deserialized
+    /// * Column pool lookup fails
+    ///
+    /// # Implementation Note
+    ///
+    /// This method performs full deserialization of chunk data, while
+    /// `search_keyword_internal_zerocopy` uses zero-copy deserialization for
+    /// better performance. Kept for potential future use or debugging.
     async fn search_keyword_internal(
         &self,
         keyword: &str,
@@ -1181,7 +1135,38 @@ impl KeywordSearcher {
         })
     }
 
-    /// Find the chunk that might contain a keyword
+    /// Find the chunk that potentially contains a keyword using binary search.
+    ///
+    /// Performs binary search on the chunk index to locate which chunk should contain
+    /// the keyword based on lexicographic ordering of start keywords. The keyword might
+    /// not actually exist in the chunk (requires exact match after loading), but if it
+    /// exists anywhere, it must be in the returned chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `keyword` - The keyword to find the chunk for
+    ///
+    /// # Returns
+    ///
+    /// * `Some((chunk_number, chunk_info))` - The chunk that should contain this keyword
+    /// * `None` - If the chunk index is empty
+    ///
+    /// # Algorithm
+    ///
+    /// Uses binary search with the invariant:
+    /// ```text
+    /// chunk[i].start_keyword <= keyword < chunk[i+1].start_keyword
+    /// ```
+    ///
+    /// Special cases:
+    /// * If keyword is before all chunks: Returns first chunk (chunk 0)
+    /// * If exact match on start_keyword: Returns that chunk
+    /// * Otherwise: Returns the chunk immediately before the insertion point
+    ///
+    /// # Performance
+    ///
+    /// O(log n) where n is the number of chunks, typically very fast since
+    /// chunk count is usually small (< 100 for most indexes)
     fn find_chunk_for_keyword(&self, keyword: &str) -> Option<(u16, &ChunkInfo)> {
         // Binary search to find the right chunk
         // We want to find the chunk where: chunk.start_keyword <= keyword < next_chunk.start_keyword
@@ -2122,7 +2107,45 @@ impl KeywordSearcher {
         }
     }
 
-    /// Find rows where all tokens exist and verify using parent keywords
+    /// Find rows where all tokens exist and verify phrase matches using parent keywords.
+    ///
+    /// This is the core phrase verification algorithm that:
+    /// 1. Finds rows containing all tokens in the same column
+    /// 2. Checks if tokens share the same parent keyword
+    /// 3. Verifies if the parent contains the exact phrase
+    /// 4. Recurses to grandparents if needed
+    ///
+    /// # Arguments
+    ///
+    /// * `phrase` - The complete phrase being searched for
+    /// * `token_results` - Search results for each individual token in the phrase
+    ///
+    /// # Returns
+    ///
+    /// `Ok((confirmed, needs_verification))` tuple containing:
+    /// * `confirmed` - Matches verified via parent keyword relationships
+    /// * `needs_verification` - Potential matches requiring Parquet verification
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// * Parent keyword batch lookup fails
+    /// * Token result data is malformed
+    ///
+    /// # Algorithm
+    ///
+    /// For each column where all tokens appear:
+    /// 1. Find rows containing all tokens
+    /// 2. For each row, collect parent references for all tokens
+    /// 3. Check if tokens share the same parent (cartesian product of possibilities)
+    /// 4. Batch lookup all parent keywords
+    /// 5. Verify if parent contains the phrase
+    /// 6. Recurse to grandparents if parent doesn't contain phrase
+    ///
+    /// # Performance
+    ///
+    /// Uses batch parent lookups to minimize I/O. Groups all parent lookups
+    /// for a column together and reads each chunk only once.
     async fn find_and_verify_multi_token_matches(
         &self,
         phrase: &str,
@@ -2352,6 +2375,42 @@ impl KeywordSearcher {
         None // Root token (only bit 0 set or no bits set)
     }
 
+    /// Verify if a phrase match is confirmed by checking the parent keyword.
+    ///
+    /// Checks if all tokens in a potential match share the same parent keyword,
+    /// and if so, whether that parent contains the complete phrase. If the parent
+    /// doesn't contain the phrase, recursively checks grandparents.
+    ///
+    /// # Arguments
+    ///
+    /// * `phrase` - The phrase to verify
+    /// * `parent_refs` - List of (chunk, position) pairs for each token's parent
+    /// * `parent_keywords` - Pre-loaded map of (chunk, position) to parent keyword strings
+    ///
+    /// # Returns
+    ///
+    /// * `MatchStatus::Confirmed` - Parent contains the phrase, match is verified
+    /// * `MatchStatus::Rejected` - Reached root without finding phrase (rare)
+    /// * `MatchStatus::NeedsVerification` - Cannot determine without Parquet read
+    ///
+    /// # Verification Logic
+    ///
+    /// 1. **Same parent check**: All tokens must have identical parent references
+    ///    - If different parents: `NeedsVerification` (tokens not adjacent)
+    ///
+    /// 2. **Parent contains phrase**: Check if parent keyword contains phrase substring
+    ///    - If yes: `Confirmed` (phrase definitely exists)
+    ///    - If no: Recurse to grandparent (phrase might be in ancestor)
+    ///
+    /// 3. **No parent (root)**: Tokens are roots without parent
+    ///    - `NeedsVerification` (need Parquet to confirm)
+    ///
+    /// # Example
+    ///
+    /// Searching for "user-name" where tokens are ["user-name", "user", "name"]:
+    /// - If parent of "user" and "name" is "user-name": Confirmed ✓
+    /// - If parent is "bob-user-name": Recurse to check if grandparent contains phrase
+    /// - If tokens have different parents: NeedsVerification
     async fn verify_match_with_parent(
         &self,
         phrase: &str,
@@ -2453,12 +2512,12 @@ impl KeywordSearcher {
                                     }
                                 }
 
-                                if let (Some(grandparent_chunk), Some(grandparent_position)) =
+                                return if let (Some(grandparent_chunk), Some(grandparent_position)) =
                                     (range.parent_chunk, range.parent_position)
                                 {
                                     match self.lookup_parent_keyword(grandparent_chunk, grandparent_position).await {
                                         Ok(grandparent_keyword) => {
-                                            return if grandparent_keyword.contains(phrase) {
+                                            if grandparent_keyword.contains(phrase) {
                                                 MatchStatus::Confirmed {
                                                     parent_keyword: grandparent_keyword,
                                                 }
@@ -2470,20 +2529,20 @@ impl KeywordSearcher {
                                                     min_phrase_level,
                                                     depth + 1
                                                 )).await
-                                            };
+                                            }
                                         }
                                         Err(_) => {
-                                            return MatchStatus::NeedsVerification {
+                                            MatchStatus::NeedsVerification {
                                                 reason: format!("Error looking up grandparent at ({}, {})", grandparent_chunk, grandparent_position),
-                                            };
+                                            }
                                         }
                                     }
                                 } else {
                                     // No grandparent (reached root) - phrase not confirmed
-                                    return MatchStatus::Rejected {
+                                    MatchStatus::Rejected {
                                         parent_keyword: current_keyword.to_string(),
                                         reason: format!("Reached root '{}' without finding phrase '{}'", current_keyword, phrase),
-                                    };
+                                    }
                                 }
                             }
                         }
@@ -2502,7 +2561,42 @@ impl KeywordSearcher {
         }
     }
 
-    /// Helper to get cartesian product of parent info combinations
+    /// Compute the cartesian product of parent information vectors.
+    ///
+    /// Used during phrase search to generate all possible combinations of parent
+    /// references when tokens have multiple occurrences per row. Each token might
+    /// appear multiple times in a row with different parent keywords, so we need
+    /// to check all combinations to find matching parent sets.
+    ///
+    /// # Arguments
+    ///
+    /// * `vecs` - Slice of vectors containing parent info tuples for each token.
+    ///   Each tuple is (split_level, parent_chunk, parent_position).
+    ///
+    /// # Returns
+    ///
+    /// Vector of all possible combinations, where each combination contains one
+    /// element from each input vector.
+    ///
+    /// # Example
+    ///
+    /// ```text
+    /// Input:  [ [A1, A2], [B1], [C1, C2, C3] ]
+    /// Output: [ [A1, B1, C1], [A1, B1, C2], [A1, B1, C3],
+    ///           [A2, B1, C1], [A2, B1, C2], [A2, B1, C3] ]
+    /// ```
+    ///
+    /// # Use Case
+    ///
+    /// When searching for phrase "a.b.c" and token "b" appears twice in the same row
+    /// (with different parents), we need to check both possibilities to see if either
+    /// parent leads to a verified match.
+    ///
+    /// # Performance
+    ///
+    /// Time complexity: O(∏ |vec_i|) - product of all vector lengths.
+    /// Space complexity: Same as time (stores all combinations).
+    /// Typically small since tokens rarely appear many times in same row.
     fn cartesian_product<'a>(&self, vecs: &[&'a Vec<(u16, Option<u16>, Option<u16>)>]) -> Vec<Vec<&'a (u16, Option<u16>, Option<u16>)>> {
         if vecs.is_empty() {
             return vec![Vec::new()];

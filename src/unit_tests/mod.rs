@@ -4,3 +4,4 @@ pub mod performance_test;
 pub mod integration_tests;
 #[cfg(test)]
 pub mod comprehensive_test;
+mod performance_comparison_test;

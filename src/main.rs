@@ -395,7 +395,7 @@ async fn handle_search(file_path: &str, keyword: &str) {
 /// --------------
 /// Version:              1
 /// Error Rate:           0.01 (1.00%)
-/// Chunk Size:           1000 keywords
+/// Max Chunk Size:       1000000 bytes (~1 MB target)
 /// Number of Chunks:     15
 ///
 /// PARQUET FILE VALIDATION
@@ -473,7 +473,9 @@ async fn handle_index_info(file_path: &str) {
             println!("──────────────");
             println!("Version:              {}", info.version);
             println!("Error Rate:           {} ({:.2}%)", info.error_rate, info.error_rate * 100.0);
-            println!("Max Chunk Size Bytes: {} keywords", info.max_chunk_size_bytes);
+            println!("Max Chunk Size:       {} bytes ({:.2} MB)",
+                     info.max_chunk_size_bytes,
+                     info.max_chunk_size_bytes as f64 / (1024.0 * 1024.0));
             println!("Number of Chunks:     {}", info.num_chunks);
             println!();
 

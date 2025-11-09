@@ -852,7 +852,7 @@ pub(crate) fn process_arrow_string_array(
 ///
 /// # Arguments
 ///
-/// * `file_path` - Path to the Parquet file (S3: "s3://bucket/key", local: any path)
+/// * `source` - Parquet data source (ParquetSource::Path or ParquetSource::Bytes)
 /// * `exclude_columns` - Optional set of column names to skip during indexing
 /// * `error_rate` - Optional bloom filter false positive rate (default: 0.01 = 1%)
 ///

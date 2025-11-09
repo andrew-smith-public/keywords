@@ -21,7 +21,7 @@ High-performance Rust library and CLI tool for building keyword indexes on Parqu
 **Production-Oriented Patterns**
 - **Cloud and local support**: Seamless operation with S3 and local filesystems via unified interface
 - **Comprehensive testing**: 13 test modules covering edge cases, integration, and performance scenarios
-- **Distributed index structure with configurable chunk size** for efficient partial loading
+- **Distributed index structure with dynamic chunk sizing** for efficient partial loading
 - **Centralized configuration**: All tunable parameters in dedicated config module
 
 **Proven Capabilities**
@@ -113,10 +113,8 @@ The index is stored as a `.index` directory adjacent to the Parquet file:
 ```
 data.parquet
 data.parquet.index/
-├── filters.rkyv          # Bloom filters, metadata, column pool
-├── metadata.rkyv         # Keyword metadata chunks
-├── data.bin              # Serialized keyword data
-└── column_keywords.rkyv  # Column-to-keyword mappings
+├── filters.rkyv          # Bloom filters, metadata, column pool, and chunk index
+└── data.bin              # Chunked keyword lists and occurrence data
 ```
 
 ### Core Components
@@ -175,7 +173,7 @@ This hierarchical approach enables:
 - Searching for complete 'words': `"user@example.com"`
 - Searching for components: `"example"` or `"com"`
 - Efficient phrase matching using parent tracking
-- Does not bloat by storing entire sentences, full json objects or full pieces of xml 
+- Does not bloat by storing entire sentences, full json objects or full pieces of xml
 
 ### Performance Characteristics
 
@@ -241,7 +239,7 @@ Testing on representative hardware with a 100,000-row Parquet file containing ra
 
 ### Fast Searches
 - Bloom filter-based existence checks (configurable false positive rate)
-- Binary search within metadata chunks
+- Binary search to locate data chunks
 - Parent keyword verification without Parquet access
 - Configurable column filtering
 
