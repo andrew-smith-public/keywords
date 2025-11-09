@@ -1,7 +1,7 @@
 //! Index file management utilities.
 //!
-//! This module provides utilities for managing the various files that comprise a distributed
-//! index. Each index consists of multiple specialized files stored in an `.index` directory
+//! This module provides utilities for managing the files that comprise a distributed
+//! index. Each index consists of specialized files stored in an `.index` directory
 //! alongside the source parquet file.
 //!
 //! # File Structure
@@ -9,10 +9,8 @@
 //! For a parquet file at `data/records.parquet`, the index files are stored in:
 //! ```text
 //! data/records.parquet.index/
-//! ├── filters.rkyv          # Bloom filters and metadata
-//! ├── metadata.rkyv         # Metadata entries
-//! ├── data.bin              # Keyword data
-//! └── column_keywords.rkyv  # Column keywords mapping
+//! ├── filters.rkyv          # Bloom filters, metadata, and chunk index
+//! └── data.bin              # Keyword data (keywords + occurrence data per chunk)
 //! ```
 //!
 //! # File Prefixes
@@ -21,9 +19,9 @@
 //! ```text
 //! data/records.parquet.index/
 //! ├── v1_filters.rkyv
-//! ├── v1_metadata.rkyv
+//! ├── v1_data.bin
 //! ├── test_filters.rkyv
-//! └── test_metadata.rkyv
+//! └── test_data.bin
 //! ```
 
 /// Types of files in the distributed index.
@@ -33,10 +31,8 @@
 ///
 /// # File Purposes
 ///
-/// - **Filters**: Bloom filters for quick keyword existence checks
-/// - **Metadata**: Index metadata and configuration
-/// - **Data**: Raw keyword data in binary format
-/// - **ColumnKeywords**: Mapping of columns to their associated keywords
+/// - **Filters**: Bloom filters, metadata, column pool, and chunk index for navigation
+/// - **Data**: Chunked keyword lists and occurrence data in binary format
 ///
 /// # Examples
 ///
@@ -50,29 +46,22 @@
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub enum IndexFile {
-    /// Bloom filters and metadata (filters.rkyv).
+    /// Bloom filters, metadata, and chunk index (filters.rkyv).
     ///
     /// Contains serialized Bloom filters used for probabilistic keyword lookups,
-    /// along with associated metadata like filter parameters and statistics.
+    /// Parquet metadata for validation, column pool for string interning,
+    /// and the chunk index that maps keyword ranges to their locations in data.bin.
     Filters,
 
-    /// Metadata entries (metadata.rkyv).
+    /// Chunked keyword data (data.bin).
     ///
-    /// Contains index configuration, version information, column schemas,
-    /// and other metadata required for index operations.
-    Metadata,
-
-    /// Keyword data (data.bin).
+    /// Contains chunks of 1000 keywords each. Each chunk has two sections:
+    /// 1. Keyword list (Vec<String>) - searchable keyword strings
+    /// 2. Data section (Vec<KeywordDataFlat>) - occurrence information
     ///
-    /// Contains the raw binary data for keywords, stored in a compact format
-    /// for efficient retrieval during query operations.
+    /// This structure allows reading just keyword strings for parent lookups
+    /// or reading the full chunk for search operations.
     Data,
-
-    /// Column keywords mapping (column_keywords.rkyv).
-    ///
-    /// Contains the mapping between column names and their associated keywords,
-    /// enabling column-specific keyword lookups.
-    ColumnKeywords,
 }
 
 impl IndexFile {
@@ -94,9 +83,7 @@ impl IndexFile {
     fn base_name(&self) -> &'static str {
         match self {
             IndexFile::Filters => "filters.rkyv",
-            IndexFile::Metadata => "metadata.rkyv",
             IndexFile::Data => "data.bin",
-            IndexFile::ColumnKeywords => "column_keywords.rkyv",
         }
     }
 }
@@ -127,8 +114,8 @@ impl IndexFile {
 /// assert_eq!(name, "v2_filters.rkyv");
 ///
 /// // Generate filename with test prefix
-/// let name = index_filename(IndexFile::Metadata, Some("test_"));
-/// assert_eq!(name, "test_metadata.rkyv");
+/// let name = index_filename(IndexFile::Data, Some("test_"));
+/// assert_eq!(name, "test_data.bin");
 /// ```
 pub(crate) fn index_filename(file_type: IndexFile, prefix: Option<&str>) -> String {
     match prefix {

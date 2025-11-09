@@ -23,7 +23,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //!     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-//!     let result = searcher.search("keyword", None, true)?;
+//!     let result = searcher.search("keyword", None, true).await?;
 //!
 //!     let reader = PrunedParquetReader::from_path("data.parquet");
 //!     // Use the new read_search_result method that accepts SearchResult directly
@@ -35,12 +35,11 @@
 //! ```
 
 use arrow::array::RecordBatch;
-use arrow::compute::filter_record_batch;
-use arrow::array::BooleanArray;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::file::reader::FileReader;
 use futures::StreamExt;
-use crate::searching::search_results::{KeywordSearchResult, CombinedSearchResult, SearchResult};
+use crate::searching::search_results::{SearchResult, CombinedSearchResult};
 use crate::utils::file_interaction_local_and_cloud::get_object_store;
 use crate::ParquetSource;
 use std::sync::Arc;
@@ -63,10 +62,10 @@ use object_store::path::Path as ObjectPath;
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-///     let result = searcher.search("keyword", None, true)?;
+///     let result = searcher.search("keyword", None, true).await?;
 ///
 ///     let reader = PrunedParquetReader::from_path("data.parquet");
-///     // Use read_search_result for SearchResult or convert to KeywordSearchResult for read_matching_rows
+///     // Use read_search_result for SearchResult or convert to SearchResult for read_matching_rows
 ///     let batches = reader.read_search_result(&result, None).await?;
 ///
 ///     println!("Read {} batches", batches.len());
@@ -219,17 +218,9 @@ impl PrunedParquetReader {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    ///     let search_result = searcher.search("test@example.com", None, true)?;
+    ///     let result = searcher.search("test@example.com", None, true).await?;
     ///
     ///     let reader = PrunedParquetReader::from_path("data.parquet");
-    ///
-    ///     // Convert to KeywordSearchResult for read_matching_rows
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let result = KeywordSearchResult {
-    ///         keyword: search_result.query.clone(),
-    ///         found: search_result.found,
-    ///         data: search_result.verified_matches.clone(),
-    ///     };
     ///
     ///     // Read all columns
     ///     let batches = reader.read_matching_rows(&result, None).await?;
@@ -248,17 +239,9 @@ impl PrunedParquetReader {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ///     let searcher = KeywordSearcher::load("users.parquet", None).await?;
-    ///     let search_result = searcher.search("alice", None, true)?;
+    ///     let result = searcher.search("alice", None, true).await?;
     ///
     ///     let reader = PrunedParquetReader::from_path("users.parquet");
-    ///
-    ///     // Convert to KeywordSearchResult for read_matching_rows
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let result = KeywordSearchResult {
-    ///         keyword: search_result.query.clone(),
-    ///         found: search_result.found,
-    ///         data: search_result.verified_matches.clone(),
-    ///     };
     ///
     ///     // Only read specific columns
     ///     let columns = vec!["user_id".to_string(), "email".to_string()];
@@ -271,14 +254,14 @@ impl PrunedParquetReader {
     /// [`KeywordSearcher::search()`]: crate::searching::keyword_search::KeywordSearcher::search
     pub async fn read_matching_rows(
         &self,
-        search_result: &KeywordSearchResult,
+        search_result: &SearchResult,
         columns: Option<Vec<String>>,
     ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
         if !search_result.found {
             return Ok(Vec::new());
         }
 
-        let data = search_result.data.as_ref()
+        let data = search_result.verified_matches.as_ref()
             .ok_or("Search result has no data")?;
 
         // Collect all row groups that contain the keyword
@@ -404,7 +387,7 @@ impl PrunedParquetReader {
     /// # use keywords::searching::keyword_search::KeywordSearcher;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     /// let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    /// let result = searcher.search("example.com", None, false)?;
+    /// let result = searcher.search("example.com", None, false).await?;
     ///
     /// let reader = PrunedParquetReader::from_path("data.parquet");
     /// let batches = reader.read_search_result(&result, None).await?;
@@ -498,15 +481,13 @@ impl PrunedParquetReader {
     ///     let searcher = KeywordSearcher::load("logs.parquet", None).await?;
     ///
     ///     // Find rows containing ALL keywords
-    ///     let search1 = searcher.search("error", None, true)?;
-    ///     let search2 = searcher.search("database", None, true)?;
-    ///     let search3 = searcher.search("connection", None, true)?;
+    ///     let search1 = searcher.search("error", None, true).await?;
+    ///     let search2 = searcher.search("database", None, true).await?;
+    ///     let search3 = searcher.search("connection", None, true).await?;
     ///
-    ///     // Convert to KeywordSearchResult for combine_and
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let r1 = KeywordSearchResult { keyword: search1.query.clone(), found: search1.found, data: search1.verified_matches.clone() };
-    ///     let r2 = KeywordSearchResult { keyword: search2.query.clone(), found: search2.found, data: search2.verified_matches.clone() };
-    ///     let r3 = KeywordSearchResult { keyword: search3.query.clone(), found: search3.found, data: search3.verified_matches.clone() };
+    ///     let r1 = search1;
+    ///     let r2 = search2;
+    ///     let r3 = search3;
     ///
     ///     let combined = KeywordSearcher::combine_and(&[r1, r2, r3]);
     ///
@@ -533,15 +514,13 @@ impl PrunedParquetReader {
     ///     let searcher = KeywordSearcher::load("logs.parquet", None).await?;
     ///
     ///     // Find rows containing ANY keyword
-    ///     let search_error = searcher.search("error", None, true)?;
-    ///     let search_warning = searcher.search("warning", None, true)?;
-    ///     let search_critical = searcher.search("critical", None, true)?;
+    ///     let search_error = searcher.search("error", None, true).await?;
+    ///     let search_warning = searcher.search("warning", None, true).await?;
+    ///     let search_critical = searcher.search("critical", None, true).await?;
     ///
-    ///     // Convert to KeywordSearchResult for combine_or
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let error = KeywordSearchResult { keyword: search_error.query.clone(), found: search_error.found, data: search_error.verified_matches.clone() };
-    ///     let warning = KeywordSearchResult { keyword: search_warning.query.clone(), found: search_warning.found, data: search_warning.verified_matches.clone() };
-    ///     let critical = KeywordSearchResult { keyword: search_critical.query.clone(), found: search_critical.found, data: search_critical.verified_matches.clone() };
+    ///     let error = search_error;
+    ///     let warning = search_warning;
+    ///     let critical = search_critical;
     ///
     ///     let combined = KeywordSearcher::combine_or(&[error, warning, critical]);
     ///
@@ -563,6 +542,26 @@ impl PrunedParquetReader {
         &self,
         combined_result: &CombinedSearchResult,
         columns: Option<Vec<String>>,
+    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+        self.read_combined_rows_with_metadata(combined_result, columns, None).await
+    }
+
+    /// Read rows from a combined search result with optional metadata caching.
+    ///
+    /// This is the internal implementation that supports metadata caching for performance.
+    /// When metadata offset/length are provided, the Parquet metadata is read once
+    /// and reused for all row groups, avoiding redundant metadata reads.
+    ///
+    /// # Arguments
+    ///
+    /// * `combined_result` - Combined search result from `combine_and()` or `combine_or()`
+    /// * `columns` - Optional column projection (None = all columns)
+    /// * `metadata_cache` - Optional tuple of (metadata_offset, metadata_length) for caching
+    pub async fn read_combined_rows_with_metadata(
+        &self,
+        combined_result: &CombinedSearchResult,
+        columns: Option<Vec<String>>,
+        metadata_cache: Option<(u64, u64)>,
     ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
         if combined_result.row_groups.is_empty() {
             return Ok(Vec::new());
@@ -589,12 +588,159 @@ impl PrunedParquetReader {
         let row_groups_vec: Vec<usize> = row_groups_to_read.into_iter().collect();
         let mut all_batches = Vec::with_capacity(row_groups_vec.len());
 
-        for &rg_idx in &row_groups_vec {
-            // Create async stream builder
+        // If metadata cache is provided, read metadata once and reuse for all row groups
+        if let Some((metadata_offset, metadata_length)) = metadata_cache {
+            use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+
+            // Read metadata once using stored offset/length
+            let (store, path) = match &self.source {
+                ParquetSource::Path(p) => {
+                    use crate::utils::file_interaction_local_and_cloud::get_object_store;
+                    get_object_store(p).await?
+                },
+                ParquetSource::Bytes(_) => {
+                    // For in-memory bytes, metadata is already in memory, no benefit to caching
+                    // Fall through to non-cached path
+                    return self.read_combined_rows_non_cached(
+                        &row_groups_vec,
+                        &row_group_ranges,
+                        &columns,
+                        object_reader
+                    ).await;
+                }
+            };
+
+            let range = metadata_offset..(metadata_offset + metadata_length);
+            let metadata_bytes = store.get_range(&path, range).await?;
+
+            // Parse Parquet metadata from bytes using SerializedFileReader
+            // The metadata_bytes contain: [FileMetaData][4-byte footer length][4-byte "PAR1"]
+            use parquet::file::reader::SerializedFileReader;
+            use parquet::arrow::arrow_reader::ArrowReaderOptions;
+
+            let reader = SerializedFileReader::new(metadata_bytes)?;
+            let parquet_metadata = reader.metadata().clone();
+
+            // Create ArrowReaderMetadata for reuse
+            let arrow_metadata = ArrowReaderMetadata::try_new(
+                Arc::new(parquet_metadata),
+                ArrowReaderOptions::new()
+            )?;
+
+            // Now iterate through row groups using cached metadata
+            for &rg_idx in &row_groups_vec {
+                let row_group_size = arrow_metadata.metadata()
+                    .row_group(rg_idx)
+                    .num_rows() as usize;
+                let batch_size = row_group_size.min(100_000);
+
+                // Create builder with cached metadata (no redundant metadata reads!)
+                let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+                    object_reader.clone(),
+                    arrow_metadata.clone()
+                );
+
+                // Apply column projection if specified
+                if let Some(ref cols) = columns {
+                    let schema = builder.schema();
+                    let indices: Vec<usize> = cols.iter()
+                        .filter_map(|col_name| {
+                            schema.fields().iter().position(|f| f.name() == col_name)
+                        })
+                        .collect();
+
+                    if !indices.is_empty() {
+                        let mask = ProjectionMask::leaves(
+                            builder.metadata().file_metadata().schema_descr(),
+                            indices
+                        );
+                        builder = builder.with_projection(mask);
+                    }
+                }
+
+                let mut stream = builder
+                    .with_row_groups(vec![rg_idx])
+                    .with_batch_size(batch_size)
+                    .build()?;
+
+                let ranges = row_group_ranges.get(&(rg_idx as u16));
+                let mut row_offset = 0u32;
+
+                while let Some(batch_result) = stream.next().await {
+                    let batch = batch_result?;
+                    let batch_rows = batch.num_rows() as u32;
+
+                    let filtered_batch = if let Some(ranges) = ranges {
+                        let batch_relative_ranges: Vec<(u32, u32)> = ranges
+                            .iter()
+                            .filter_map(|&(start, end)| {
+                                if end < row_offset || start >= row_offset + batch_rows {
+                                    None
+                                } else {
+                                    let batch_start = start.saturating_sub(row_offset);
+                                    let batch_end = (end - row_offset).min(batch_rows - 1);
+                                    Some((batch_start, batch_end))
+                                }
+                            })
+                            .collect();
+
+                        if batch_relative_ranges.is_empty() {
+                            row_offset += batch_rows;
+                            continue;
+                        }
+
+                        filter_batch_to_ranges(&batch, &batch_relative_ranges)?
+                    } else {
+                        batch
+                    };
+
+                    if filtered_batch.num_rows() > 0 {
+                        all_batches.push(filtered_batch);
+                    }
+
+                    row_offset += batch_rows;
+                }
+            }
+        } else {
+            // No metadata cache - use original approach (one builder per row group)
+            all_batches = self.read_combined_rows_non_cached(
+                &row_groups_vec,
+                &row_group_ranges,
+                &columns,
+                object_reader
+            ).await?;
+        }
+
+        Ok(all_batches)
+    }
+
+    /// Non-cached path for reading combined rows (original implementation)
+    async fn read_combined_rows_non_cached(
+        &self,
+        row_groups_vec: &[usize],
+        row_group_ranges: &std::collections::HashMap<u16, Vec<(u32, u32)>>,
+        columns: &Option<Vec<String>>,
+        object_reader: ParquetObjectReader,
+    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut all_batches = Vec::with_capacity(row_groups_vec.len());
+
+        for rg_idx in row_groups_vec {
+            let rg_idx = *rg_idx; // Dereference since we're iterating over &[usize]
+            // Create builder for this row group
+            // Note: object_reader caches metadata, so subsequent creations are faster
             let mut builder = ParquetRecordBatchStreamBuilder::new(object_reader.clone()).await?;
 
+            // Get row group size for adaptive batch sizing
+            let row_group_metadata = builder.metadata().row_group(rg_idx);
+            let row_group_size = row_group_metadata.num_rows() as usize;
+
+            // Adaptive batch size: use row group size but cap at 100K to prevent memory issues
+            // This ensures small row groups are read in one batch (minimizing overhead)
+            // while large row groups are chunked to reasonable sizes
+            let batch_size = row_group_size.min(100_000);
+
             // Apply column projection if specified
-            if let Some(ref cols) = columns {
+            if let Some(cols) = columns {
                 let schema = builder.schema();
                 let indices: Vec<usize> = cols.iter()
                     .filter_map(|col_name| {
@@ -613,28 +759,23 @@ impl PrunedParquetReader {
 
             let mut stream = builder
                 .with_row_groups(vec![rg_idx])
-                .with_batch_size(8192)
+                .with_batch_size(batch_size)
                 .build()?;
 
-            // Get the row ranges for this row group
             let ranges = row_group_ranges.get(&(rg_idx as u16));
-
             let mut row_offset = 0u32;
+
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
                 let batch_rows = batch.num_rows() as u32;
 
-                // Filter to only matching rows
                 let filtered_batch = if let Some(ranges) = ranges {
-                    // Adjust ranges to be relative to this batch
                     let batch_relative_ranges: Vec<(u32, u32)> = ranges
                         .iter()
                         .filter_map(|&(start, end)| {
-                            // Check if this range overlaps with current batch
                             if end < row_offset || start >= row_offset + batch_rows {
-                                None // Range doesn't overlap this batch
+                                None
                             } else {
-                                // Adjust range to be relative to batch start
                                 let batch_start = start.saturating_sub(row_offset);
                                 let batch_end = (end - row_offset).min(batch_rows - 1);
                                 Some((batch_start, batch_end))
@@ -699,15 +840,7 @@ impl PrunedParquetReader {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    ///     let search_result = searcher.search("rare_value", None, true)?;
-    ///
-    ///     // Convert to KeywordSearchResult for get_pruning_stats and read_matching_rows
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let result = KeywordSearchResult {
-    ///         keyword: search_result.query.clone(),
-    ///         found: search_result.found,
-    ///         data: search_result.verified_matches.clone(),
-    ///     };
+    ///     let result = searcher.search("rare_value", None, true).await?;
     ///
     ///     let reader = PrunedParquetReader::from_path("data.parquet");
     ///     let stats = reader.get_pruning_stats(&result).await?;
@@ -736,7 +869,7 @@ impl PrunedParquetReader {
     /// [`KeywordSearcher::search()`]: crate::searching::keyword_search::KeywordSearcher::search
     pub async fn get_pruning_stats(
         &self,
-        search_result: &KeywordSearchResult,
+        search_result: &SearchResult,
     ) -> Result<PruningStats, Box<dyn std::error::Error + Send + Sync>> {
         // Create ParquetObjectReader and builder to access metadata
         let object_reader = self.create_object_reader().await?;
@@ -759,7 +892,7 @@ impl PrunedParquetReader {
             });
         }
 
-        let data = search_result.data.as_ref().unwrap();
+        let data = search_result.verified_matches.as_ref().unwrap();
 
         // Count row groups to read
         let mut row_groups_to_read = std::collections::HashSet::new();
@@ -904,15 +1037,7 @@ impl PrunedParquetReader {
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-///     let search_result = searcher.search("keyword", None, true)?;
-///
-///     // Convert to KeywordSearchResult for get_pruning_stats
-///     use keywords::searching::search_results::KeywordSearchResult;
-///     let result = KeywordSearchResult {
-///         keyword: search_result.query.clone(),
-///         found: search_result.found,
-///         data: search_result.verified_matches.clone(),
-///     };
+///     let result = searcher.search("keyword", None, true).await?;
 ///
 ///     let reader = PrunedParquetReader::from_path("data.parquet");
 ///     let stats = reader.get_pruning_stats(&result).await?;
@@ -954,29 +1079,42 @@ fn filter_batch_to_ranges(
 ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
     let num_rows = batch.num_rows();
 
-    // Special case: single contiguous range starting at 0 - use zero-copy slice
-    if ranges.len() == 1 && ranges[0].0 == 0 {
+    // Special case: single contiguous range - use zero-copy slice
+    if ranges.len() == 1 {
+        let start = ranges[0].0 as usize;
         let end = (ranges[0].1 as usize).min(num_rows - 1);
-        return Ok(batch.slice(0, end + 1));
+        return Ok(batch.slice(start, end - start + 1));
     }
 
-    // Create boolean mask for which rows to keep
-    let mut mask = vec![false; num_rows];
+    // Multiple ranges: collect indices and use take() for direct indexing
+    // This is much more efficient than creating a boolean mask for sparse selections
+    let indices: Vec<u32> = ranges.iter()
+        .flat_map(|&(start, end)| {
+            let end = end.min(num_rows as u32 - 1);
+            start..=end
+        })
+        .collect();
 
-    for &(start, end) in ranges {
-        let start = start as usize;
-        let end = (end as usize).min(num_rows - 1);
-
-        if start < num_rows && end < num_rows {
-            // Use fill() which is more efficient than a loop
-            mask[start..=end].fill(true);
-        }
+    if indices.is_empty() {
+        // No valid indices, return empty batch with same schema
+        return Ok(RecordBatch::new_empty(batch.schema()));
     }
 
-    let mask_array = BooleanArray::from(mask);
-    let filtered = filter_record_batch(batch, &mask_array)?;
+    // Use Arrow's take() for efficient direct indexing
+    use arrow::array::UInt32Array;
+    use arrow::compute::take;
 
-    Ok(filtered)
+    let indices_array = UInt32Array::from(indices);
+
+    // Apply take() to each column
+    let taken_columns: Result<Vec<_>, _> = batch.columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &indices_array, None))
+        .collect();
+
+    // Reconstruct RecordBatch from taken columns
+    let taken_columns = taken_columns?;
+    Ok(RecordBatch::try_new(batch.schema(), taken_columns)?)
 }
 
 
@@ -1099,18 +1237,20 @@ mod tests {
         let parquet_bytes = get_test_parquet().await;
 
         // Search for a keyword that exists in the generated data
-        let search_result = searcher.search("user_0", None, true).unwrap();
+        let search_result = searcher.search("user_0", None, true).await.unwrap();
 
         if !search_result.found {
             println!("Keyword not found - skipping test");
             return;
         }
 
-        // Convert to KeywordSearchResult for compatibility with get_pruning_stats and read_matching_rows
-        let result = KeywordSearchResult {
-            keyword: search_result.query.clone(),
+        // Convert to SearchResult for compatibility with get_pruning_stats and read_matching_rows
+        let result = SearchResult {
+            query: search_result.query.clone(),
             found: search_result.found,
-            data: search_result.verified_matches.clone(),
+            tokens: search_result.tokens.clone(),
+            verified_matches: search_result.verified_matches.clone(),
+            needs_verification: search_result.needs_verification.clone(),
         };
 
         // Create pruned reader from bytes
@@ -1137,19 +1277,23 @@ mod tests {
         let parquet_bytes = get_test_parquet().await;
 
         // Search with AND logic for keywords that exist in generated data
-        let search_result1 = searcher.search("user_0", None, true).unwrap();
-        let search_result2 = searcher.search("active", None, true).unwrap();
+        let search_result1 = searcher.search("user_0", None, true).await.unwrap();
+        let search_result2 = searcher.search("active", None, true).await.unwrap();
 
-        // Convert to KeywordSearchResult for combine_and
-        let result1 = KeywordSearchResult {
-            keyword: search_result1.query.clone(),
+        // Convert to SearchResult for combine_and
+        let result1 = SearchResult {
+            query: search_result1.query.clone(),
             found: search_result1.found,
-            data: search_result1.verified_matches.clone(),
+            tokens: search_result1.tokens.clone(),
+            verified_matches: search_result1.verified_matches.clone(),
+            needs_verification: search_result1.needs_verification.clone(),
         };
-        let result2 = KeywordSearchResult {
-            keyword: search_result2.query.clone(),
+        let result2 = SearchResult {
+            query: search_result2.query.clone(),
             found: search_result2.found,
-            data: search_result2.verified_matches.clone(),
+            tokens: search_result2.tokens.clone(),
+            verified_matches: search_result2.verified_matches.clone(),
+            needs_verification: search_result2.needs_verification.clone(),
         };
 
         let combined = KeywordSearcher::combine_and(&[result1, result2]);
@@ -1170,17 +1314,19 @@ mod tests {
         let searcher = get_searcher().await;
         let parquet_bytes = get_test_parquet().await;
 
-        let search_result = searcher.search("active", None, true).unwrap();
+        let search_result = searcher.search("active", None, true).await.unwrap();
 
         if !search_result.found {
             return;
         }
 
-        // Convert to KeywordSearchResult for read_matching_rows
-        let result = KeywordSearchResult {
-            keyword: search_result.query.clone(),
+        // Convert to SearchResult for read_matching_rows
+        let result = SearchResult {
+            query: search_result.query.clone(),
             found: search_result.found,
-            data: search_result.verified_matches.clone(),
+            tokens: search_result.tokens.clone(),
+            verified_matches: search_result.verified_matches.clone(),
+            needs_verification: search_result.needs_verification.clone(),
         };
 
         let reader = PrunedParquetReader::new(ParquetSource::Bytes(parquet_bytes.clone()));

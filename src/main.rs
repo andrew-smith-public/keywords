@@ -16,10 +16,8 @@
 //! ```text
 //! data.parquet
 //! data.parquet.index/
-//! ├── filters.rkyv       (Bloom filters, metadata, column pool)
-//! ├── metadata.rkyv      (Keyword metadata chunks)
-//! ├── data.bin           (Serialized keyword data)
-//! └── column_keywords.rkyv (Column-to-keyword mappings)
+//! ├── filters.rkyv       (Bloom filters, metadata, column pool, and chunk index)
+//! └── data.bin           (Chunked keyword lists and occurrence data)
 //! ```
 //!
 //! # Usage Examples
@@ -184,10 +182,8 @@ async fn main() {
 /// # Index Output
 ///
 /// Creates `<file_path>.index/` directory containing:
-/// - `filters.rkyv` - Bloom filters, metadata, and validation info
-/// - `metadata.rkyv` - Chunked keyword metadata for efficient lookup
-/// - `data.bin` - Serialized keyword occurrence data
-/// - `column_keywords.rkyv` - Column-to-keyword reverse index
+/// - `filters.rkyv` - Bloom filters, metadata, column pool, and chunk index
+/// - `data.bin` - Chunked keyword lists and occurrence data
 ///
 /// # Exit Codes
 ///
@@ -322,7 +318,7 @@ async fn handle_index(file_path: &str) {
 /// - Search time is independent of Parquet file size
 async fn handle_search(file_path: &str, keyword: &str) {
     // First check if index exists
-    if !keywords::index_exists(file_path) {
+    if !keywords::index_exists(file_path).await {
         eprintln!("Error: No index found for '{}'", file_path);
         eprintln!("Please run 'index' command first to create the index.");
         process::exit(1);
@@ -422,21 +418,12 @@ async fn handle_search(file_path: &str, keyword: &str) {
 /// ------------------
 /// Total Keywords:       15234
 ///
-/// Keywords per Column:
-///   email:              3421 keywords
-///   name:               2156 keywords
-///   description:        6543 keywords
-///   tags:               1987 keywords
-///   metadata:           1127 keywords
-///
 /// INDEX FILE SIZES
 /// ----------------
-/// filters.rkyv:         245760 bytes (240.00 KB)
-/// metadata.rkyv:        458752 bytes (448.00 KB)
+/// filters.rkyv:         704512 bytes (688.00 KB)
 /// data.bin:             1048576 bytes (1.00 MB)
-/// column_keywords.rkyv: 131072 bytes (128.00 KB)
 /// ────────────────────────────────────────
-/// Total Index Size:     1884160 bytes (1.80 MB)
+/// Total Index Size:     1753088 bytes (1.67 MB)
 ///
 /// ================================================================================
 /// ```
@@ -467,7 +454,7 @@ async fn handle_search(file_path: &str, keyword: &str) {
 /// ```
 async fn handle_index_info(file_path: &str) {
     // First check if index exists
-    if !keywords::index_exists(file_path) {
+    if !keywords::index_exists(file_path).await {
         eprintln!("Error: No index found for '{}'", file_path);
         eprintln!("Please run 'index' command first to create the index.");
         process::exit(1);
@@ -486,7 +473,7 @@ async fn handle_index_info(file_path: &str) {
             println!("──────────────");
             println!("Version:              {}", info.version);
             println!("Error Rate:           {} ({:.2}%)", info.error_rate, info.error_rate * 100.0);
-            println!("Chunk Size:           {} keywords", info.chunk_size);
+            println!("Max Chunk Size Bytes: {} keywords", info.max_chunk_size_bytes);
             println!("Number of Chunks:     {}", info.num_chunks);
             println!();
 
@@ -517,16 +504,6 @@ async fn handle_index_info(file_path: &str) {
             println!("──────────────────");
             println!("Total Keywords:       {}", info.total_keywords);
             println!();
-            println!("Keywords per Column:");
-
-            // Sort columns by keyword count (descending)
-            let mut col_counts: Vec<_> = info.keywords_per_column.iter().collect();
-            col_counts.sort_by(|a, b| b.1.cmp(a.1));
-
-            for (column, count) in col_counts {
-                println!("  {:20} {} keywords", format!("{}:", column), count);
-            }
-            println!();
 
             // Index File Sizes
             println!("INDEX FILE SIZES");
@@ -534,15 +511,9 @@ async fn handle_index_info(file_path: &str) {
             println!("filters.rkyv:         {} bytes ({:.2} KB)",
                      info.filters_size,
                      info.filters_size as f64 / 1024.0);
-            println!("metadata.rkyv:        {} bytes ({:.2} KB)",
-                     info.metadata_size,
-                     info.metadata_size as f64 / 1024.0);
             println!("data.bin:             {} bytes ({:.2} KB)",
                      info.data_size,
                      info.data_size as f64 / 1024.0);
-            println!("column_keywords.rkyv: {} bytes ({:.2} KB)",
-                     info.column_keywords_size,
-                     info.column_keywords_size as f64 / 1024.0);
             println!("────────────────────────────────────────");
             println!("Total Index Size:     {} bytes ({:.2} MB)",
                      info.total_size,

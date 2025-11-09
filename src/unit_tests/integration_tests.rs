@@ -1193,7 +1193,7 @@ mod column_filter_integration_tests {
             .expect("Failed to build index");
 
         // Test 1: Search "alice" without column filter (uses index 0)
-        let result_all = searcher.search("alice", None, true).expect("Search failed");
+        let result_all = searcher.search("alice", None, true).await.expect("Search failed");
         assert!(result_all.found, "alice should be found");
 
         let data_all = result_all.verified_matches.as_ref().expect("Should have data");
@@ -1207,7 +1207,7 @@ mod column_filter_integration_tests {
         }
 
         // Test 2: Search "alice" filtered to email column
-        let result_email = searcher.search("alice", Some("email"), true).expect("Search failed");
+        let result_email = searcher.search("alice", Some("email"), true).await.expect("Search failed");
         assert!(result_email.found, "alice should be found in email");
 
         let data_email = result_email.verified_matches.as_ref().expect("Should have data");
@@ -1215,7 +1215,7 @@ mod column_filter_integration_tests {
         assert_eq!(data_email.columns[0], "email", "Should only show email column");
 
         // Test 3: Search "alice" filtered to username column
-        let result_username = searcher.search("alice", Some("username"), true).expect("Search failed");
+        let result_username = searcher.search("alice", Some("username"), true).await.expect("Search failed");
         assert!(result_username.found, "alice should be found in username");
 
         let data_username = result_username.verified_matches.as_ref().expect("Should have data");
@@ -1223,11 +1223,11 @@ mod column_filter_integration_tests {
         assert_eq!(data_username.columns[0], "username");
 
         // Test 4: Search "alice" filtered to notes column (should not find)
-        let result_notes = searcher.search("alice", Some("notes"), true).expect("Search failed");
+        let result_notes = searcher.search("alice", Some("notes"), true).await.expect("Search failed");
         assert!(!result_notes.found, "alice should not be found in notes column");
 
         // Test 5: Search "admin" (only in username)
-        let result_admin = searcher.search("admin", None, true).expect("Search failed");
+        let result_admin = searcher.search("admin", None, true).await.expect("Search failed");
         assert!(result_admin.found, "admin should be found");
 
         let data_admin = result_admin.verified_matches.as_ref().expect("Should have data");
@@ -1235,7 +1235,7 @@ mod column_filter_integration_tests {
         assert_eq!(data_admin.columns[0], "username");
 
         // Test 6: Search "urgent" (only in notes)
-        let result_urgent = searcher.search("urgent", None, true).expect("Search failed");
+        let result_urgent = searcher.search("urgent", None, true).await.expect("Search failed");
         assert!(result_urgent.found, "urgent should be found");
 
         let data_urgent = result_urgent.verified_matches.as_ref().expect("Should have data");
@@ -1255,7 +1255,7 @@ mod column_filter_integration_tests {
             .expect("Failed to build index");
 
         // Search for "target" without column filter (uses index 0 - efficient)
-        let result = searcher.search("target", None, true).expect("Search failed");
+        let result = searcher.search("target", None, true).await.expect("Search failed");
         assert!(result.found, "target should be found");
 
         let data = result.verified_matches.as_ref().expect("Should have data");
@@ -1270,7 +1270,7 @@ mod column_filter_integration_tests {
         assert!(found_columns.contains(&"col_30".to_string()));
 
         // Search with specific column filter
-        let result_col10 = searcher.search("target", Some("col_10"), true).expect("Search failed");
+        let result_col10 = searcher.search("target", Some("col_10"), true).await.expect("Search failed");
         assert!(result_col10.found, "target should be found in col_10");
 
         let data_col10 = result_col10.verified_matches.as_ref().expect("Should have data");
@@ -1278,7 +1278,7 @@ mod column_filter_integration_tests {
         assert_eq!(data_col10.columns[0], "col_10");
 
         // Search for target in a column it doesn't appear in
-        let result_col5 = searcher.search("target", Some("col_5"), true).expect("Search failed");
+        let result_col5 = searcher.search("target", Some("col_5"), true).await.expect("Search failed");
         assert!(!result_col5.found, "target should not be found in col_5");
 
     }
@@ -1294,7 +1294,7 @@ mod column_filter_integration_tests {
             .expect("Failed to build index");
 
         // Test 1: Search for keyword "example.com" - only in email (from "user@example.com")
-        let result_keyword = searcher.search("example.com", None, true).expect("Search failed");
+        let result_keyword = searcher.search("example.com", None, true).await.expect("Search failed");
         assert!(result_keyword.found, "keyword example.com should be found");
 
         let data_keyword = result_keyword.verified_matches.as_ref().expect("Should have data");
@@ -1302,7 +1302,7 @@ mod column_filter_integration_tests {
         assert_eq!(data_keyword.columns[0], "email");
 
         // Test 1b: Search phrase "example.com" - should find in both email and domain
-        let result = searcher.search("example.com", None, false).expect("Search failed");
+        let result = searcher.search("example.com", None, false).await.expect("Search failed");
         assert!(result.found, "phrase example.com should be found");
 
         // With the new API, verified_matches and/or needs_verification contain the results
@@ -1325,7 +1325,7 @@ mod column_filter_integration_tests {
         assert!(!columns_found.is_empty(), "phrase example.com should have matches");
 
         // Test 2: Search phrase "example.com" filtered to email
-        let result_email = searcher.search("example.com", Some("email"), false).expect("Search failed");
+        let result_email = searcher.search("example.com", Some("email"), false).await.expect("Search failed");
         assert!(result_email.found, "phrase example.com should be found in email");
 
         // Check that all matches are in email column
@@ -1341,11 +1341,11 @@ mod column_filter_integration_tests {
         }
 
         // Test 3: Search phrase "example.com" filtered to path (should not find)
-        let result_path = searcher.search("example.com", Some("path"), false).expect("Search failed");
+        let result_path = searcher.search("example.com", Some("path"), false).await.expect("Search failed");
         assert!(!result_path.found, "phrase example.com should not be found in path column");
 
         // Test 4: Search for intermediate token "example" (from hierarchical split)
-        let result_example = searcher.search("example", None, true).expect("Search failed");
+        let result_example = searcher.search("example", None, true).await.expect("Search failed");
         assert!(result_example.found, "example should be found");
 
         let data_example = result_example.verified_matches.as_ref().expect("Should have data");
@@ -1353,11 +1353,11 @@ mod column_filter_integration_tests {
         assert!(data_example.columns.len() >= 2, "example should be in multiple columns");
 
         // Test 5: Search for "/usr/local/bin" in path column
-        let result_path_full = searcher.search("/usr/local/bin", Some("path"), true).expect("Search failed");
+        let result_path_full = searcher.search("/usr/local/bin", Some("path"), true).await.expect("Search failed");
         assert!(result_path_full.found, "/usr/local/bin should be found in path");
 
         // Test 6: Search for "local" (split from "/usr/local/bin")
-        let result_local = searcher.search("local", Some("path"), true).expect("Search failed");
+        let result_local = searcher.search("local", Some("path"), true).await.expect("Search failed");
         assert!(result_local.found, "local should be found in path");
 
     }
@@ -1376,7 +1376,7 @@ mod column_filter_integration_tests {
         let keywords = vec!["alice", "bob", "admin", "urgent", "company"];
 
         for keyword in keywords {
-            let result = searcher.search(keyword, None, true).expect("Search failed");
+            let result = searcher.search(keyword, None, true).await.expect("Search failed");
 
             if result.found {
                 let data = result.verified_matches.as_ref().expect("Should have data");
@@ -1406,7 +1406,7 @@ mod column_filter_integration_tests {
             .expect("Failed to build index");
 
         // Search for existing keyword in non-existent column
-        let result = searcher.search("alice", Some("this_column_does_not_exist"), true).expect("Search failed");
+        let result = searcher.search("alice", Some("this_column_does_not_exist"), true).await.expect("Search failed");
 
         // Should return not found
         assert!(!result.found, "Searching non-existent column should return not found");
@@ -1424,13 +1424,13 @@ mod column_filter_integration_tests {
             .expect("Failed to build index");
 
         // Test search_in_column convenience method
-        let found_email = searcher.search_in_column("alice", "email").expect("Search failed");
+        let found_email = searcher.search_in_column("alice", "email").await.expect("Search failed");
         assert!(found_email, "alice should be found in email column");
 
-        let found_username = searcher.search_in_column("alice", "username").expect("Search failed");
+        let found_username = searcher.search_in_column("alice", "username").await.expect("Search failed");
         assert!(found_username, "alice should be found in username column");
 
-        let found_notes = searcher.search_in_column("alice", "notes").expect("Search failed");
+        let found_notes = searcher.search_in_column("alice", "notes").await.expect("Search failed");
         assert!(!found_notes, "alice should not be found in notes column");
 
     }

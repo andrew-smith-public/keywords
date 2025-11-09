@@ -109,7 +109,7 @@ mod tests {
         let searcher = get_searcher().await;
 
         // Search for keywords that exist in the generated data
-        let result = searcher.search("user_0", None, true).unwrap();
+        let result = searcher.search("user_0", None, true).await.unwrap();
 
         println!("Search result for 'user_0': {:?}", result);
 
@@ -123,7 +123,7 @@ mod tests {
     async fn test_global_filter_rejection() {
         let searcher = get_searcher().await;
 
-        let result = searcher.search("xyzabc123definitely_not_in_file", None, true).unwrap();
+        let result = searcher.search("xyzabc123definitely_not_in_file", None, true).await.unwrap();
 
         assert!(!result.found, "Should not find non-existent keyword");
         println!("Global filter correctly rejected non-existent keyword");
@@ -160,7 +160,7 @@ mod tests {
         let searcher = get_searcher().await;
 
         // Search for a phrase that exists in the generated data (email addresses)
-        let result = searcher.search("test0.com", None, false).unwrap();
+        let result = searcher.search("test0.com", None, false).await.unwrap();
 
         println!("\nPhrase search for 'test0.com':");
         println!("  Tokens: {:?}", result.tokens);

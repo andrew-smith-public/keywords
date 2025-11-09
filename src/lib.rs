@@ -49,16 +49,16 @@ pub mod column_parquet_reader;
 use hashbrown::HashMap;
 use indexmap::IndexSet;
 use std::rc::Rc;
-use std::collections::{HashSet as StdHashSet, HashMap as StdHashMap};
-use std::path::Path;
+use std::collections::HashSet as StdHashSet;
 use bytes::Bytes;
-use crate::index_data::{build_distributed_index, save_distributed_index, ColumnKeywordsFile};
+use crate::index_data::{build_distributed_index, save_distributed_index};
 use crate::utils::column_pool::ColumnPool;
 use crate::index_structure::column_filter::ColumnFilter;
 use crate::column_parquet_reader::process_parquet_file;
 use crate::keyword_shred::KeywordOneFile;
 use crate::searching::keyword_search::KeywordSearcher;
 use crate::searching::search_results::SearchResult;
+use crate::utils::file_interaction_local_and_cloud::get_object_store;
 
 // ============================================================================
 // Public Types
@@ -102,8 +102,8 @@ impl From<Vec<u8>> for ParquetSource {
 // Distributed Index Structures
 // ============================================================================
 
-/// Number of keywords per metadata chunk for partial loading
-const METADATA_CHUNK_SIZE: usize = 1000;
+/// Maximum size per metadata chunk in bytes for partial loading (1MB)
+const MAX_CHUNK_SIZE_BYTES: usize = 1_000_000;
 
 /// Result of processing a Parquet file.
 /// Contains the keyword map, the column name pool, column keywords map, column filters, and global filter.
@@ -153,17 +153,14 @@ pub struct IndexInfo {
 
     /// Keyword statistics
     pub total_keywords: usize,
-    pub keywords_per_column: StdHashMap<String, usize>,
 
     /// Chunk information
     pub num_chunks: usize,
-    pub chunk_size: usize,
+    pub max_chunk_size_bytes: usize,  // Target max size per chunk in bytes
 
     /// Index file sizes (in bytes)
     pub filters_size: u64,
-    pub metadata_size: u64,
     pub data_size: u64,
-    pub column_keywords_size: u64,
     pub total_size: u64,
 }
 
@@ -196,11 +193,9 @@ pub async fn build_and_save_index(
 
     println!("Index created successfully!");
     println!("  filters.rkyv: {} bytes ({:.2} KB)", files.filters.len(), files.filters.len() as f64 / 1024.0);
-    println!("  metadata.rkyv: {} bytes ({:.2} KB)", files.metadata.len(), files.metadata.len() as f64 / 1024.0);
     println!("  data.bin: {} bytes ({:.2} KB)", files.data.len(), files.data.len() as f64 / 1024.0);
-    println!("  column_keywords.rkyv: {} bytes ({:.2} KB)", files.column_keywords.len(), files.column_keywords.len() as f64 / 1024.0);
 
-    let total_size = files.filters.len() + files.metadata.len() + files.data.len() + files.column_keywords.len();
+    let total_size = files.filters.len() + files.data.len();
     println!("  Total: {} bytes ({:.2} MB)", total_size, total_size as f64 / (1024.0 * 1024.0));
 
     Ok(())
@@ -248,33 +243,28 @@ pub async fn build_and_save_index(
 ///     Ok(())
 /// }
 /// ```
-#[must_use = "index information should be used"]
 pub async fn get_index_info(
     parquet_path: &str,
     index_file_prefix: Option<&str>,
 ) -> Result<IndexInfo, Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::fs;
     use crate::index_structure::index_files::{index_filename, IndexFile};
 
-    // Construct index directory path
-    let index_dir = format!("{}.index", parquet_path);
+    // Build paths for index files
+    let filters_path = format!("{}.index/{}", parquet_path,
+                               index_filename(IndexFile::Filters, index_file_prefix));
+    let data_path = format!("{}.index/{}", parquet_path,
+                            index_filename(IndexFile::Data, index_file_prefix));
 
-    // Check if index exists
-    if !Path::new(&index_dir).exists() {
-        return Err(format!("Index directory not found: {}", index_dir).into());
-    }
+    // Get file sizes using object store abstraction
+    let (store, filters_obj_path) = get_object_store(&filters_path).await?;
+    let filters_meta = store.head(&filters_obj_path).await?;
+    let filters_size = filters_meta.size;
 
-    // Get file sizes
-    let filters_path = Path::new(&index_dir).join(index_filename(IndexFile::Filters, index_file_prefix));
-    let metadata_path = Path::new(&index_dir).join(index_filename(IndexFile::Metadata, index_file_prefix));
-    let data_path = Path::new(&index_dir).join(index_filename(IndexFile::Data, index_file_prefix));
-    let column_keywords_path = Path::new(&index_dir).join(index_filename(IndexFile::ColumnKeywords, index_file_prefix));
+    let (store, data_obj_path) = get_object_store(&data_path).await?;
+    let data_meta = store.head(&data_obj_path).await?;
+    let data_size = data_meta.size;
 
-    let filters_size = fs::metadata(&filters_path).await?.len();
-    let metadata_size = fs::metadata(&metadata_path).await?.len();
-    let data_size = fs::metadata(&data_path).await?.len();
-    let column_keywords_size = fs::metadata(&column_keywords_path).await?.len();
-    let total_size = filters_size + metadata_size + data_size + column_keywords_size;
+    let total_size = filters_size + data_size;
 
     // Load the searcher to access index data
     let searcher = KeywordSearcher::load(parquet_path, index_file_prefix).await?;
@@ -295,23 +285,10 @@ pub async fn get_index_info(
         .collect();
     let num_columns = indexed_columns.len();
 
-    // Get total keywords count
-    let total_keywords = searcher.all_keywords.len();
-
-    // Load column keywords file to get keywords per column
-    let column_keywords_bytes = fs::read(&column_keywords_path).await?;
-    let mut column_keywords_aligned = rkyv::util::AlignedVec::<16>::new();
-    column_keywords_aligned.extend_from_slice(&column_keywords_bytes);
-
-    use rkyv::Archived;
-    let column_keywords_archived: &Archived<ColumnKeywordsFile> = rkyv::access(&column_keywords_aligned)
-        .map_err(|e: rkyv::rancor::Error| format!("Failed to access archived column keywords: {}", e))?;
-
-    // Build keywords per column map
-    let mut keywords_per_column = StdHashMap::new();
-    for (col_name, keyword_indices) in column_keywords_archived.columns.iter() {
-        keywords_per_column.insert(col_name.to_string(), keyword_indices.len());
-    }
+    // Get total keywords count by summing all chunks
+    let total_keywords: usize = searcher.filters.chunk_index.iter()
+        .map(|chunk| chunk.count as usize)
+        .sum();
 
     Ok(IndexInfo {
         version,
@@ -322,16 +299,14 @@ pub async fn get_index_info(
         num_columns,
         indexed_columns,
         total_keywords,
-        keywords_per_column,
         num_chunks,
-        chunk_size: METADATA_CHUNK_SIZE,
+        max_chunk_size_bytes: MAX_CHUNK_SIZE_BYTES,
         filters_size,
-        metadata_size,
         data_size,
-        column_keywords_size,
         total_size,
     })
 }
+
 
 /// Search for keywords or phrases in a Parquet file.
 ///
@@ -403,7 +378,6 @@ pub async fn get_index_info(
 /// # Ok(())
 /// # }
 /// ```
-#[must_use = "search results should be examined"]
 pub async fn search(
     parquet_path: &str,
     search_for: &str,
@@ -411,7 +385,7 @@ pub async fn search(
     keyword_only: bool,
 ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
     let searcher = KeywordSearcher::load(parquet_path, None).await?;
-    searcher.search(search_for, in_columns, keyword_only)
+    searcher.search(search_for, in_columns, keyword_only).await
 }
 
 
@@ -443,12 +417,11 @@ pub async fn search(
 /// # Ok(())
 /// # }
 /// ```
-#[must_use = "validation result should be checked"]
 pub async fn validate_index(
     parquet_path: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Check if index exists first
-    if !index_exists(parquet_path) {
+    if !index_exists(parquet_path).await {
         return Ok(false);
     }
 
@@ -472,25 +445,35 @@ pub async fn validate_index(
 /// # Example
 /// ```no_run
 /// # use keywords::index_exists;
-/// if index_exists("data.parquet") {
+/// # #[tokio::main]
+/// # async fn main() {
+/// if index_exists("data.parquet").await {
 ///     println!("Index found");
 /// } else {
 ///     println!("Index not found - needs to be built");
 /// }
+/// # }
 /// ```
-pub fn index_exists(parquet_path: &str) -> bool {
-    let index_dir = format!("{}.index", parquet_path);
-    Path::new(&index_dir).exists()
+pub async fn index_exists(parquet_path: &str) -> bool {
+    // Try to check if filters file exists using object store abstraction
+    let filters_path = format!("{}.index/{}", parquet_path,
+                               crate::index_structure::index_files::index_filename(
+                                   crate::index_structure::index_files::IndexFile::Filters, None));
+
+    match get_object_store(&filters_path).await {
+        Ok((store, path)) => store.head(&path).await.is_ok(),
+        Err(_) => false,
+    }
 }
+
 /// Build index in memory without writing to disk (test-only).
 ///
-/// This function builds the index, serializes it, and deserializes it back
-/// (testing the full serialization round-trip) but skips disk I/O.
-/// Useful for fast tests that don't need to manage filesystem cleanup.
+/// This function builds the index using the memory:// protocol, enabling
+/// fast in-memory indexing for tests without filesystem cleanup.
 ///
 /// # Arguments
 ///
-/// * `parquet_path` - Path to the Parquet file
+/// * `source` - Parquet data source (Path or Bytes)
 /// * `exclude_columns` - Optional set of column names to exclude from indexing
 /// * `error_rate` - Bloom filter false positive rate (default: 0.01)
 ///
@@ -507,6 +490,8 @@ pub async fn build_index_in_memory(
     exclude_columns: Option<StdHashSet<String>>,
     error_rate: Option<f64>,
 ) -> Result<KeywordSearcher, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::utils::file_interaction_local_and_cloud::register_memory_file;
+
     let error_rate = error_rate.unwrap_or(0.01);
 
     if error_rate < 0.0000000001 || error_rate > 0.5 {
@@ -516,10 +501,36 @@ pub async fn build_index_in_memory(
         ).into());
     }
 
-    // Build index
-    let result = process_parquet_file(source.clone(), exclude_columns, Some(error_rate)).await?;
-    let files = build_distributed_index(&result, &source, error_rate).await?;
+    // Convert source to a memory:// path
+    let memory_path = match source {
+        ParquetSource::Path(ref p) if p.starts_with("memory://") => {
+            // Already a memory path
+            p.clone()
+        }
+        ParquetSource::Path(ref p) => {
+            // Regular path, use as-is (will use local filesystem)
+            p.clone()
+        }
+        ParquetSource::Bytes(ref bytes) => {
+            // Auto-register bytes to memory:// with timestamp-based ID
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = format!("memory://temp-{}.parquet", timestamp);
+            register_memory_file(&path, bytes.clone()).await?;
+            path
+        }
+    };
 
-    // Deserialize (tests full serialization round-trip)
-    KeywordSearcher::from_serialized(&files)
+    // Build index using memory path
+    let result = process_parquet_file(source, exclude_columns, Some(error_rate)).await?;
+    let files = build_distributed_index(&result, &ParquetSource::Path(memory_path.clone()), error_rate).await?;
+
+    // Save to memory using the abstraction
+    save_distributed_index(&files, &memory_path, None).await?;
+
+    // Load and return searcher
+    KeywordSearcher::load(&memory_path, None).await
 }

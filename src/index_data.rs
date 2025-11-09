@@ -1,13 +1,12 @@
 use hashbrown::HashMap;
 use std::collections::HashMap as StdHashMap;
-use indexmap::IndexSet;
 use crate::utils::column_pool::ColumnPool;
 use crate::index_structure::column_filter::ColumnFilter;
 use rkyv::{Archive, Serialize as RkyvSerialize, Deserialize as RkyvDeserialize, to_bytes};
 use rkyv::rancor::Error as RkyvError;
 use crate::keyword_shred::SPLIT_CHARS_INCLUSIVE;
 use crate::utils::file_interaction_local_and_cloud::get_object_store;
-use crate::{KeywordOneFile, ParquetSource, ProcessResult, METADATA_CHUNK_SIZE};
+use crate::{KeywordOneFile, ParquetSource, ProcessResult, MAX_CHUNK_SIZE_BYTES};
 use crate::index_structure::index_files::{index_filename, IndexFile};
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug)]
@@ -17,6 +16,12 @@ pub struct IndexFilters {
     pub parquet_etag: String,
     pub parquet_size: u64,
     pub parquet_last_modified: u64,
+
+    // Parquet metadata caching for efficient reads
+    // Store the offset and length of Parquet metadata (footer) in the file
+    // This allows reading metadata once and reusing it for all row groups
+    pub parquet_metadata_offset: u64,
+    pub parquet_metadata_length: u64,
 
     // Configuration
     pub error_rate: f64,
@@ -29,24 +34,29 @@ pub struct IndexFilters {
     pub chunk_index: Vec<ChunkInfo>,
 }
 
-/// Information about a chunk in the metadata file
+/// Information about a chunk in the data file.
+///
+/// Each chunk contains both a keyword list section and a data section.
+/// The keyword list can be read independently for parent lookups without
+/// loading the full occurrence data.
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 pub struct ChunkInfo {
+    /// First keyword in this chunk (for binary search)
     pub start_keyword: String,
-    pub offset: u64,
-    pub length: u32,
-    pub count: u16,
-}
 
-/// Metadata entry for a single keyword in the index
-/// Each chunk in metadata.rkyv contains Vec<MetadataEntry>
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
-pub struct MetadataEntry {
-    pub keyword: String,
+    /// Byte offset in data.bin where this chunk starts
     pub offset: u64,
-    pub length: u32,
-    pub column_ids: Vec<u32>,
-    pub num_occurrences: u32,
+
+    /// Length in bytes of just the keyword list section
+    /// Reading `[offset, offset + keyword_list_length]` gives `Vec<String>`
+    pub keyword_list_length: u32,
+
+    /// Total length in bytes of keyword list + data section
+    /// Reading `[offset, offset + total_length]` gives complete chunk
+    pub total_length: u32,
+
+    /// Number of keywords in this chunk (dynamic, based on ~1MB serialized size target)
+    pub count: u16,
 }
 
 /// Flattened keyword data (stored in data.bin)
@@ -70,53 +80,52 @@ pub struct RowGroupDataFlat {
     pub rows: Vec<FlatRow>,
 }
 
-/// Flattened row information
+/// Flattened row information with chunk-based parent tracking.
+///
+/// Parent tracking uses chunk number + position within chunk instead of global offset.
+/// This eliminates the need for a separate global keyword array and supports the
+/// 2-file index structure where keywords are organized in chunks.
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FlatRow {
     pub row: u32,
     pub additional_rows: u32,
     pub splits_matched: u16,
 
-    // Parent keyword offset for phrase search optimization
-    // After serialization, parent keyword string is converted to u32 offset
-    // pointing to parent keyword in the sorted keyword list
-    // None indicates this is a root token from the original parquet string
-    //
-    // Considered but deferred: token_position (u16/u32) for phrase search optimization
-    // Trade-off: Adding position would cost 2-4 bytes per row but enable early rejection
-    // of non-adjacent tokens during phrase matching. Current approach favors memory
-    // efficiency over search speed. If profiling shows phrase search is a bottleneck,
-    // this could be revisited. For now, parent tracking provides sufficient optimization.
-    pub parent_offset: Option<u32>,
+    /// Parent keyword chunk number (which chunk contains the parent)
+    /// For parent lookup: chunk_index[parent_chunk] gives the chunk location
+    pub parent_chunk: Option<u16>,
+
+    /// Position within the parent chunk (0 to chunk size-1)
+    /// Combined with parent_chunk: keywords[parent_position] in that chunk
+    pub parent_position: Option<u16>,
 }
 
-/// Column keywords file (stored in column_keywords.rkyv)
-#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug)]
-pub struct ColumnKeywordsFile {
-    pub all_keywords: Vec<String>,
-    pub columns: StdHashMap<String, Vec<u32>>,
-    pub num_columns: usize,
-    pub num_unique_keywords: usize,
+/// Location of a keyword within the chunked structure.
+/// Used during index building to track where each keyword ends up.
+#[derive(Debug, Clone, Copy)]
+struct KeywordLocation {
+    chunk_number: u16,
+    position_in_chunk: u16,
 }
 
 /// Converts a KeywordOneFile to a flattened KeywordDataFlat structure for serialization.
 ///
 /// This function transforms the hierarchical keyword data structure into a flat, serializable
 /// format. It processes each column (skipping the global aggregate at index 0), extracts
-/// row group and row information, and converts parent keyword string references to numeric
-/// offsets using the provided keyword-to-offset mapping.
+/// row group and row information, and converts parent keyword string references to
+/// chunk+position pairs using the provided keyword location mapping.
 ///
 /// The flattening process:
 /// 1. Iterates through all columns except the aggregate bucket
 /// 2. For each column, processes all row groups
 /// 3. For each row group, converts all rows to FlatRow format
-/// 4. Converts parent keyword Rc<str> references to u32 offsets
+/// 4. Converts parent keyword Rc<str> references to (chunk, position) pairs
 ///
 /// # Arguments
 ///
 /// * `keyword_data` - Reference to the KeywordOneFile containing the hierarchical keyword data
-/// * `keyword_to_offset` - HashMap mapping keyword strings to their numeric offsets in the
-///   sorted keyword list, used for converting parent keyword references
+/// * `keyword_to_location` - HashMap mapping keyword strings to their chunk locations,
+///   used for converting parent keyword references to chunk+position pairs
 ///
 /// # Returns
 ///
@@ -127,11 +136,11 @@ pub struct ColumnKeywordsFile {
 /// # Notes
 ///
 /// - Skips column index 0 (the aggregate bucket) during iteration
-/// - Parent keyword references are converted from Rc<str> to u32 offsets
-/// - Handles missing data gracefully (uses Option for parent_offset)
+/// - Parent keyword references are converted from Rc<str> to (chunk, position) pairs
+/// - Handles missing data gracefully (uses Option for parent tracking)
 fn convert_to_flat(
     keyword_data: &KeywordOneFile,
-    keyword_to_offset: &HashMap<&str, u32>,
+    keyword_to_location: &HashMap<&str, KeywordLocation>,
 ) -> KeywordDataFlat {
     let mut columns = Vec::new();
 
@@ -150,16 +159,19 @@ fn convert_to_flat(
                     .and_then(|rgs| rgs.get(rg_idx))
                 {
                     for row in row_data {
-                        // Convert parent keyword string to offset
-                        let parent_offset = row.parent_keyword
+                        // Convert parent keyword string to chunk+position
+                        let (parent_chunk, parent_position) = row.parent_keyword
                             .as_ref()
-                            .and_then(|parent_str| keyword_to_offset.get(parent_str.as_ref()).copied());
+                            .and_then(|parent_str| keyword_to_location.get(parent_str.as_ref()))
+                            .map(|loc| (Some(loc.chunk_number), Some(loc.position_in_chunk)))
+                            .unwrap_or((None, None));
 
                         rows.push(FlatRow {
                             row: row.row,
                             additional_rows: row.additional_rows as u32,
                             splits_matched: row.splits_matched,
-                            parent_offset,
+                            parent_chunk,
+                            parent_position,
                         });
                     }
                 }
@@ -185,20 +197,30 @@ fn convert_to_flat(
 
 /// Builds distributed index files from a ProcessResult.
 ///
-/// This function creates a complete distributed index structure from the processed keyword data.
+/// This function creates a 2-file distributed index structure from the processed keyword data.
 /// It performs several key operations:
 /// 1. Retrieves and stores Parquet metadata for validation
 /// 2. Sorts keywords deterministically for consistent layout
-/// 3. Creates a keyword-to-offset mapping for parent reference conversion
-/// 4. Chunks keywords and builds metadata entries
-/// 5. Serializes keyword data to a binary format
-/// 6. Constructs filter, metadata, data, and column keyword files
+/// 3. Assigns keywords to chunks and creates keyword location mapping
+/// 4. For each chunk:
+///    - Serializes keyword list (Vec<String>)
+///    - Serializes keyword data (Vec<KeywordDataFlat>)
+///    - Tracks both section lengths for independent access
+/// 5. Constructs filters file with chunk index pointing to data.bin locations
 ///
-/// The function creates four main output files:
+/// The function creates two output files:
 /// - **Filters file**: Contains Parquet metadata, bloom filters, column pool, and chunk index
-/// - **Metadata file**: Contains keyword metadata entries (offset, length, columns, occurrence count)
-/// - **Data file**: Contains the actual serialized keyword data
-/// - **Column keywords file**: Maps column names to their associated keywords
+/// - **Data file**: Contains chunked keyword lists + occurrence data, enabling range reads
+///
+/// # Chunk Structure in data.bin
+///
+/// Each chunk consists of two consecutive sections:
+/// ```text
+/// [Keyword List: Vec<String>]    ← keyword_list_length bytes
+/// [Data: Vec<KeywordDataFlat>]   ← (total_length - keyword_list_length) bytes
+/// ```
+///
+/// This allows reading just keyword strings for parent lookups without loading full data.
 ///
 /// # Arguments
 ///
@@ -209,7 +231,7 @@ fn convert_to_flat(
 /// # Returns
 ///
 /// Returns `Result<DistributedIndexFiles, Box<dyn std::error::Error + Send + Sync>>`:
-/// - `Ok(DistributedIndexFiles)` - Container with all serialized index file data
+/// - `Ok(DistributedIndexFiles)` - Container with both serialized index files
 /// - `Err` - If object store access fails, serialization fails, or metadata retrieval fails
 ///
 /// # Errors
@@ -222,9 +244,10 @@ fn convert_to_flat(
 /// # Performance Considerations
 ///
 /// - Keywords are sorted once for deterministic layout
-/// - Metadata is chunked (size defined by METADATA_CHUNK_SIZE) to enable efficient partial loading
+/// - Data is chunked (size defined by METADATA_CHUNK_SIZE) to enable efficient partial loading
 /// - Uses rkyv for zero-copy deserialization support
-/// - Parent keyword references are converted to numeric offsets to reduce serialized size
+/// - Parent keyword references converted to chunk+position pairs for efficient lookup
+/// - Keyword lists stored separately from data for lightweight parent resolution
 ///
 /// # Examples
 ///
@@ -243,26 +266,67 @@ fn convert_to_flat(
 ///         0.01
 ///     ).await.unwrap();
 /// # }
-/// // index_files now contains all serialized data ready to be written
+/// // index_files now contains filters and data ready to be written
 /// ```
 pub async fn build_distributed_index(
     result: &ProcessResult,
     source: &ParquetSource,
     error_rate: f64,
 ) -> Result<DistributedIndexFiles, Box<dyn std::error::Error + Send + Sync>> {
-    // Get parquet metadata for validation
-    let (parquet_etag, parquet_size, parquet_last_modified) = match source {
+    // Get parquet metadata for validation and to cache metadata location
+    let (parquet_etag, parquet_size, parquet_last_modified, parquet_metadata_offset, parquet_metadata_length) = match source {
         ParquetSource::Path(path) => {
             let (store, obj_path) = get_object_store(path).await?;
             let head = store.head(&obj_path).await?;
+
+            // Read the last 8 bytes to get footer length
+            // Parquet file structure: [...data...][FileMetaData][4-byte footer length][4-byte "PAR1"]
+            let file_size = head.size;
+            let footer_range = (file_size - 8)..file_size;
+            let footer_bytes = store.get_range(&obj_path, footer_range).await?;
+            let footer_slice = footer_bytes.to_vec();
+
+            // Last 4 bytes are "PAR1", 4 bytes before that are footer length (little endian)
+            let footer_len = u32::from_le_bytes([
+                footer_slice[0],
+                footer_slice[1],
+                footer_slice[2],
+                footer_slice[3],
+            ]) as u64;
+
+            // Metadata includes: FileMetaData + 4 bytes footer_len + 4 bytes "PAR1"
+            let metadata_total_length = footer_len + 8;
+            let metadata_offset = file_size - metadata_total_length;
+
             (
                 head.e_tag.unwrap_or_else(|| "unknown".to_string()),
-                head.size,
+                file_size,
                 head.last_modified.timestamp() as u64,
+                metadata_offset,
+                metadata_total_length,
             )
         }
         ParquetSource::Bytes(vec) => {
-            ("".to_string(), vec.len() as u64, 0)
+            // For in-memory bytes, calculate metadata location
+            let file_size = vec.len() as u64;
+
+            // Read the last 8 bytes to get footer length
+            if file_size < 8 {
+                return Err("Parquet file too small".into());
+            }
+
+            let footer_slice = &vec[(file_size - 8) as usize..];
+            let footer_len = u32::from_le_bytes([
+                footer_slice[0],
+                footer_slice[1],
+                footer_slice[2],
+                footer_slice[3],
+            ]) as u64;
+
+            let metadata_total_length = footer_len + 8;
+            let metadata_offset = file_size - metadata_total_length;
+
+            ("".to_string(), file_size, 0, metadata_offset, metadata_total_length)
         }
     };
 
@@ -270,72 +334,116 @@ pub async fn build_distributed_index(
     let mut sorted_keywords: Vec<_> = result.keyword_map.iter().collect();
     sorted_keywords.sort_by(|a, b| a.0.cmp(b.0));
 
-    // Build keyword → offset mapping for parent reference conversion
-    let keyword_to_offset: HashMap<&str, u32> = sorted_keywords.iter()
-        .enumerate()
-        .map(|(idx, (keyword, _))| (keyword.as_ref(), idx as u32))
-        .collect();
+    // =========================================================================
+    // Pass 1: Determine chunk boundaries based on ~1MB serialized size
+    // =========================================================================
 
-    // Build metadata chunks and data file
-    let mut data_file = Vec::new();
-    let mut chunk_index = Vec::new();
-    let mut all_metadata_chunks = Vec::new();
+    // First, we need to estimate sizes and determine chunk boundaries
+    let mut chunk_boundaries = Vec::new(); // Stores (start_idx, end_idx) for each chunk
+    let mut current_chunk_start = 0;
+    let mut current_chunk_estimated_size = 0;
 
-    for chunk in sorted_keywords.chunks(METADATA_CHUNK_SIZE) {
-        let chunk_start_keyword = chunk[0].0;
-        let mut chunk_entries = Vec::new();
+    for (idx, (_keyword, keyword_data)) in sorted_keywords.iter().enumerate() {
+        // Rough size estimation without full serialization
+        // KeywordOneFile structure: column_references, row_groups, row_group_to_rows
+        let mut estimated_size = 100; // Base overhead per keyword
 
-        for (keyword, keyword_data) in chunk {
-            let data_offset = data_file.len() as u64;
+        estimated_size += keyword_data.column_references.len() * 20; // Column references
 
-            // Convert to flat structure with parent offset mapping
-            let flat_data = convert_to_flat(keyword_data, &keyword_to_offset);
-
-            // Count occurrences
-            let num_occurrences: u32 = flat_data.columns.iter()
-                .flat_map(|col| &col.row_groups)
-                .map(|rg| rg.rows.len() as u32)
-                .sum();
-
-            // Get column IDs
-            let column_ids: Vec<u32> = flat_data.columns.iter()
-                .map(|col| col.column_id)
-                .collect();
-
-            // Serialize keyword data
-            let data_bytes = to_bytes::<RkyvError>(&flat_data)
-                .map_err(|e| format!("Failed to serialize keyword data: {}", e))?;
-
-            let data_length = data_bytes.len() as u32;
-
-            // Append to data file
-            data_file.extend_from_slice(&data_bytes);
-
-            // Create metadata entry
-            chunk_entries.push(MetadataEntry {
-                keyword: keyword.to_string(),
-                offset: data_offset,
-                length: data_length,
-                column_ids,
-                num_occurrences,
-            });
+        // Estimate row group data: row_group_to_rows is Vec<Vec<Vec<Row>>>
+        // Outer Vec = columns, Middle Vec = row groups, Inner Vec = rows
+        for col_rgs in &keyword_data.row_group_to_rows {
+            for rg_rows in col_rgs {
+                estimated_size += 10; // Row group overhead
+                estimated_size += rg_rows.len() * 40; // ~40 bytes per row entry
+            }
         }
 
-        // Serialize this chunk
-        let chunk_bytes = to_bytes::<RkyvError>(&chunk_entries)
-            .map_err(|e| format!("Failed to serialize metadata chunk: {}", e))?;
+        // If adding this keyword would exceed limit and we have at least one keyword, finalize chunk
+        if current_chunk_estimated_size + estimated_size > MAX_CHUNK_SIZE_BYTES && idx > current_chunk_start {
+            chunk_boundaries.push((current_chunk_start, idx));
+            current_chunk_start = idx;
+            current_chunk_estimated_size = 0;
+        }
 
-        let chunk_offset = all_metadata_chunks.len() as u64;
-        let chunk_length = chunk_bytes.len() as u32;
-        let chunk_count = chunk_entries.len() as u16;
+        current_chunk_estimated_size += estimated_size;
+    }
 
-        all_metadata_chunks.extend_from_slice(&chunk_bytes);
+    // Add final chunk
+    chunk_boundaries.push((current_chunk_start, sorted_keywords.len()));
+
+    println!("  Creating {} dynamic chunks (target: ~1MB per chunk)", chunk_boundaries.len());
+
+    // =========================================================================
+    // Pass 2: Build keyword → location mapping based on determined chunks
+    // =========================================================================
+
+    let keyword_to_location: HashMap<&str, KeywordLocation> = sorted_keywords.iter()
+        .enumerate()
+        .map(|(idx, (keyword, _))| {
+            // Find which chunk this keyword belongs to
+            let chunk_number = chunk_boundaries.iter()
+                .position(|(start, end)| idx >= *start && idx < *end)
+                .unwrap() as u16;
+
+            // Position within that chunk
+            let chunk_start = chunk_boundaries[chunk_number as usize].0;
+            let position_in_chunk = (idx - chunk_start) as u16;
+
+            (
+                keyword.as_ref(),
+                KeywordLocation { chunk_number, position_in_chunk }
+            )
+        })
+        .collect();
+
+    // =========================================================================
+    // Pass 3: Build data file with dynamically-sized chunks
+    // =========================================================================
+
+    let mut data_file = Vec::new();
+    let mut chunk_index = Vec::new();
+
+    for (_chunk_idx, (start_idx, end_idx)) in chunk_boundaries.iter().enumerate() {
+        let chunk = &sorted_keywords[*start_idx..*end_idx];
+        let chunk_start_offset = data_file.len() as u64;
+        let chunk_start_keyword = chunk[0].0;
+
+        // Build keyword list for this chunk
+        let keywords_in_chunk: Vec<String> = chunk.iter()
+            .map(|(keyword, _)| keyword.to_string())
+            .collect();
+
+        // Build data list for this chunk
+        let mut data_in_chunk = Vec::new();
+
+        for (_keyword, keyword_data) in chunk {
+            // Convert to flat structure with parent chunk+position mapping
+            let flat_data = convert_to_flat(keyword_data, &keyword_to_location);
+            data_in_chunk.push(flat_data);
+        }
+
+        // Serialize keyword list section
+        let keyword_list_bytes = to_bytes::<RkyvError>(&keywords_in_chunk)
+            .map_err(|e| format!("Failed to serialize keyword list: {}", e))?;
+        let keyword_list_length = keyword_list_bytes.len() as u32;
+        data_file.extend_from_slice(&keyword_list_bytes);
+
+        // Serialize data section
+        let data_bytes = to_bytes::<RkyvError>(&data_in_chunk)
+            .map_err(|e| format!("Failed to serialize chunk data: {}", e))?;
+        let data_length = data_bytes.len() as u32;
+        data_file.extend_from_slice(&data_bytes);
+
+        let total_length = keyword_list_length + data_length;
+        let chunk_count = keywords_in_chunk.len() as u16;
 
         // Add to chunk index
         chunk_index.push(ChunkInfo {
             start_keyword: chunk_start_keyword.to_string(),
-            offset: chunk_offset,
-            length: chunk_length,
+            offset: chunk_start_offset,
+            keyword_list_length,
+            total_length,
             count: chunk_count,
         });
     }
@@ -350,6 +458,8 @@ pub async fn build_distributed_index(
         parquet_etag,
         parquet_size,
         parquet_last_modified,
+        parquet_metadata_offset,
+        parquet_metadata_length,
         error_rate,
         split_chars_inclusive: split_chars_vec,
         column_pool: result.column_pool.clone(),
@@ -363,65 +473,33 @@ pub async fn build_distributed_index(
     let filters_bytes = to_bytes::<RkyvError>(&index_filters)
         .map_err(|e| format!("Failed to serialize filters: {}", e))?;
 
-    // Build column keywords file
-    let mut all_keywords = IndexSet::new();
-    for keywords in result.column_keywords_map.values() {
-        all_keywords.extend(keywords.iter().map(|k| k.to_string()));
-    }
-
-    let all_keywords_vec: Vec<String> = all_keywords.into_iter().collect();
-    let mut keyword_to_idx: StdHashMap<String, u32> = StdHashMap::new();
-    for (idx, keyword) in all_keywords_vec.iter().enumerate() {
-        keyword_to_idx.insert(keyword.clone(), idx as u32);
-    }
-
-    let mut columns_map: StdHashMap<String, Vec<u32>> = StdHashMap::new();
-    for (column_name, keywords) in &result.column_keywords_map {
-        let indices: Vec<u32> = keywords.iter()
-            .filter_map(|k| keyword_to_idx.get(k.as_ref()).copied())
-            .collect();
-        columns_map.insert(column_name.to_string(), indices);
-    }
-
-    let column_keywords = ColumnKeywordsFile {
-        all_keywords: all_keywords_vec,
-        columns: columns_map,
-        num_columns: result.column_keywords_map.len(),
-        num_unique_keywords: keyword_to_idx.len(),
-    };
-
-    let column_keywords_bytes = to_bytes::<RkyvError>(&column_keywords)
-        .map_err(|e| format!("Failed to serialize column keywords: {}", e))?;
-
     Ok(DistributedIndexFiles {
         filters: filters_bytes.to_vec(),
-        metadata: all_metadata_chunks,
         data: data_file,
-        column_keywords: column_keywords_bytes.to_vec(),
     })
 }
 
-/// Container for the distributed index files
+/// Container for the distributed index files.
+///
+/// Contains the two components of the 2-file index structure:
+/// - filters: Bloom filters, metadata, column pool, and chunk index
+/// - data: Chunked keyword lists and occurrence data
 pub struct DistributedIndexFiles {
     pub filters: Vec<u8>,
-    pub metadata: Vec<u8>,
     pub data: Vec<u8>,
-    pub column_keywords: Vec<u8>,
 }
 
 /// Saves distributed index files to a directory structure.
 ///
-/// This function writes all four components of the distributed index to disk in a structured
+/// This function writes both components of the distributed index to disk in a structured
 /// format. It creates an index directory (with `.index` extension) next to the Parquet file
-/// and writes the filters, metadata, data, and column keywords files.
+/// and writes the filters and data files.
 ///
 /// The directory structure created:
 /// ```text
 /// <base_path>.index/
 /// ├── filters.rkyv (or <prefix>_filters.rkyv)
-/// ├── metadata.rkyv (or <prefix>_metadata.rkyv)
-/// ├── data.bin (or <prefix>_data.bin)
-/// └── column_keywords.rkyv (or <prefix>_column_keywords.rkyv)
+/// └── data.bin (or <prefix>_data.bin)
 /// ```
 ///
 /// # Arguments
@@ -442,7 +520,7 @@ pub struct DistributedIndexFiles {
 ///
 /// This function will return an error if:
 /// - The index directory cannot be created (permissions, disk space, etc.)
-/// - Any of the four index files cannot be written
+/// - Either of the two index files cannot be written
 /// - I/O errors occur during the write operations
 ///
 /// # Examples
@@ -462,11 +540,11 @@ pub struct DistributedIndexFiles {
 ///
 ///     // Save without prefix (path can be arbitrary for in-memory sources)
 ///     save_distributed_index(&index_files, "my_data.parquet", None).await.unwrap();
-///     // Creates: my_data.parquet.index/filters.rkyv, metadata.rkyv, data.bin, column_keywords.rkyv
+///     // Creates: my_data.parquet.index/filters.rkyv, data.bin
 ///
 ///     // Save with prefix for versioning
 ///     save_distributed_index(&index_files, "my_data.parquet", Some("v2")).await.unwrap();
-///     // Creates: my_data.parquet.index/v2_filters.rkyv, v2_metadata.rkyv, v2_data.bin, v2_column_keywords.rkyv
+///     // Creates: my_data.parquet.index/v2_filters.rkyv, v2_data.bin
 /// # }
 /// ```
 ///
@@ -478,30 +556,20 @@ pub async fn save_distributed_index(
     base_path: &str,
     prefix: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::path::Path;
-    use tokio::fs;
+    use bytes::Bytes;
+    use object_store::PutPayload;
 
-    // Create index directory
-    let index_dir = format!("{}.index", base_path);
-    fs::create_dir_all(&index_dir).await?;
+    // Build paths for index files
+    let filters_path = format!("{}.index/{}", base_path, index_filename(IndexFile::Filters, prefix));
+    let data_path = format!("{}.index/{}", base_path, index_filename(IndexFile::Data, prefix));
 
-    // Write files with optional prefix
-    fs::write(
-        Path::new(&index_dir).join(index_filename(IndexFile::Filters, prefix)),
-        &files.filters
-    ).await?;
-    fs::write(
-        Path::new(&index_dir).join(index_filename(IndexFile::Metadata, prefix)),
-        &files.metadata
-    ).await?;
-    fs::write(
-        Path::new(&index_dir).join(index_filename(IndexFile::Data, prefix)),
-        &files.data
-    ).await?;
-    fs::write(
-        Path::new(&index_dir).join(index_filename(IndexFile::ColumnKeywords, prefix)),
-        &files.column_keywords
-    ).await?;
+    // Write filters file using object store abstraction
+    let (store, filters_obj_path) = get_object_store(&filters_path).await?;
+    store.put(&filters_obj_path, PutPayload::from_bytes(Bytes::from(files.filters.clone()))).await?;
+
+    // Write data file using object store abstraction
+    let (store, data_obj_path) = get_object_store(&data_path).await?;
+    store.put(&data_obj_path, PutPayload::from_bytes(Bytes::from(files.data.clone()))).await?;
 
     Ok(())
 }

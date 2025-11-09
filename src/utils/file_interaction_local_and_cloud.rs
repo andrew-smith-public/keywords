@@ -2,7 +2,9 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, path::Path as ObjectPath};
+use object_store::memory::InMemory;
 use url::Url;
+use bytes::Bytes;
 
 /// Cache key for S3 stores that distinguishes between authenticated and anonymous access
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -44,6 +46,88 @@ struct S3CacheKey {
 /// configured AWS credentials that support automatic refresh (SSO, assume role, etc.).
 static S3_STORE_CACHE: Lazy<DashMap<S3CacheKey, Arc<dyn ObjectStore>>> =
     Lazy::new(DashMap::new);
+
+/// Global in-memory object store for memory:// protocol.
+///
+/// Uses the object_store crate's built-in InMemory implementation,
+/// which provides a complete, correct ObjectStore implementation.
+static MEMORY_STORE: Lazy<Arc<InMemory>> = Lazy::new(|| Arc::new(InMemory::new()));
+
+/// Register a file in memory storage for use with memory:// protocol.
+///
+/// This is a convenience wrapper around the InMemory store's put method.
+///
+/// # Arguments
+///
+/// * `path` - Full path including "memory://" prefix (e.g., "memory://test.parquet")
+/// * `data` - File contents as Bytes
+///
+/// # Returns
+///
+/// Ok(()) on success, or an error if the write fails
+///
+/// # Examples
+///
+/// ```no_run
+/// use bytes::Bytes;
+/// # use keywords::utils::file_interaction_local_and_cloud::register_memory_file;
+///
+/// # tokio_test::block_on(async {
+/// let data = Bytes::from(vec![1, 2, 3, 4]);
+/// register_memory_file("memory://test.parquet", data).await.unwrap();
+///
+/// // Now can use with any function that takes a path
+/// // build_and_save_index("memory://test.parquet", None, None, None).await?;
+/// # });
+/// ```
+pub async fn register_memory_file(path: &str, data: Bytes) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use object_store::PutPayload;
+
+    let normalized = normalize_memory_path(path);
+    let obj_path = ObjectPath::from(normalized);
+    MEMORY_STORE.put(&obj_path, PutPayload::from_bytes(data)).await?;
+    Ok(())
+}
+
+/// Unregister a file from memory storage.
+///
+/// # Arguments
+///
+/// * `path` - Path including "memory://" prefix
+///
+/// # Returns
+///
+/// Ok(Some(bytes)) if the file existed, Ok(None) if not found, or Err on failure
+pub async fn unregister_memory_file(path: &str) -> Result<Option<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
+    let normalized = normalize_memory_path(path);
+    let obj_path = ObjectPath::from(normalized);
+
+    match MEMORY_STORE.get(&obj_path).await {
+        Ok(result) => {
+            let bytes = result.bytes().await?;
+            MEMORY_STORE.delete(&obj_path).await?;
+            Ok(Some(bytes))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Clear all files from memory storage.
+///
+/// Note: InMemory doesn't expose a clear() method, so files persist until
+/// process restart. Use unique paths per test or restart the process to clear.
+///
+/// Useful for cleanup between tests or when freeing memory.
+pub fn clear_all_memory_files() {
+    // InMemory doesn't provide a clear method
+    // In practice, use unique memory:// paths per test or restart the process
+    // Future: Could track paths and delete them, but that's complex
+}
+
+/// Normalize memory:// paths by stripping the protocol prefix.
+fn normalize_memory_path(path: &str) -> String {
+    path.strip_prefix("memory://").unwrap_or(path).to_string()
+}
 
 /// Gets or creates a cached S3 store for the given bucket.
 ///
@@ -115,15 +199,17 @@ pub fn get_cached_s3_store(
 
 /// Creates an `ObjectStore` and path from a file path string.
 ///
-/// This function provides a unified interface for accessing both local files
-/// and S3 objects. It automatically detects the storage type based on the
-/// file path format and returns an appropriate `ObjectStore` implementation.
+/// This function provides a unified interface for accessing both local files,
+/// S3 objects, and in-memory files. It automatically detects the storage type
+/// based on the file path format and returns an appropriate `ObjectStore` implementation.
 ///
 /// **Performance Note**: S3 stores are automatically cached by bucket name,
-/// so repeated calls with the same S3 bucket are efficient.
+/// so repeated calls with the same S3 bucket are efficient. The memory store
+/// is a single global instance shared across all memory:// paths.
 ///
 /// # Supported Path Formats
 ///
+/// * **Memory**: `"memory://path/to/file"` → Uses in-memory storage (for testing)
 /// * **S3**: `"s3://bucket/key"` or `"s3://bucket/key?anon=true"` → Uses AWS S3 (cached by bucket)
 /// * **Local**: Absolute or relative paths → Uses local filesystem
 ///   - Windows: `"C:\\path\\to\\file"` or relative paths
@@ -131,7 +217,7 @@ pub fn get_cached_s3_store(
 ///
 /// # Arguments
 ///
-/// * `file_path` - A string representing either an S3 URI or a local file path
+/// * `file_path` - A string representing a memory URI, S3 URI, or local file path
 ///
 /// # Returns
 ///
@@ -149,6 +235,7 @@ pub fn get_cached_s3_store(
 ///
 /// # Implementation Notes
 ///
+/// * **Memory**: Uses a global InMemory instance shared across all memory:// paths
 /// * **S3 Caching**: S3 stores are cached globally by (bucket, anonymous) tuple.
 ///   The first access to a bucket creates the store (involves credential fetching
 ///   and potentially querying the EC2 metadata service). Subsequent accesses to
@@ -160,6 +247,22 @@ pub fn get_cached_s3_store(
 ///   and resolves relative paths to absolute paths
 ///
 /// # Examples
+///
+/// ## Memory paths
+///
+/// ```no_run
+/// # use keywords::utils::file_interaction_local_and_cloud::{get_object_store, register_memory_file};
+/// # use bytes::Bytes;
+/// # tokio_test::block_on(async {
+/// // Register in-memory file
+/// let data = Bytes::from(vec![1, 2, 3, 4]);
+/// register_memory_file("memory://test.parquet", data).await.unwrap();
+///
+/// // Access it
+/// let (store, path) = get_object_store("memory://test.parquet").await.unwrap();
+/// let result = store.get(&path).await.unwrap();
+/// # });
+/// ```
 ///
 /// ## Local file paths (testable)
 ///
@@ -184,7 +287,7 @@ pub fn get_cached_s3_store(
 /// # tokio_test::block_on(async {
 /// // S3 path - first call creates and caches store
 /// let (store, path) = get_object_store("s3://globalnightlight/201204/201204_catalog.json?anon=true").await.unwrap();
-/// let bytes = store.get(&path).await.unwrap();
+/// let result = store.get(&path).await.unwrap();
 ///
 /// // S3 path - same bucket and anon flag, reuses cached store (fast!)
 /// let (store2, path2) = get_object_store("s3://globalnightlight/201204/GDNBO_npp_d20120401_t0653006_e0658410_b02212_c20120428182646476060_devl_pop.li.co.tif?anon=true").await.unwrap();
@@ -196,7 +299,13 @@ pub fn get_cached_s3_store(
 pub async fn get_object_store(
     file_path: &str,
 ) -> Result<(Arc<dyn ObjectStore>, ObjectPath), Box<dyn std::error::Error + Send + Sync>> {
-    if file_path.starts_with("s3://") {
+
+    if file_path.starts_with("memory://") {
+        let normalized = normalize_memory_path(file_path);
+        let store = Arc::clone(&MEMORY_STORE) as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from(normalized);
+        Ok((store, path))
+    } else if file_path.starts_with("s3://") {
         let url = Url::parse(file_path)?;
         let bucket = url.host_str()
             .ok_or("Invalid S3 URL - no bucket specified")?;

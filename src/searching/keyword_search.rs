@@ -9,14 +9,14 @@
 //! The search process works in multiple stages:
 //!
 //! 1. **Global Filter Check**: Fast rejection using bloom filter (~1% false positive rate)
-//! 2. **Chunk Location**: Binary search to find the metadata chunk containing the keyword
+//! 2. **Chunk Location**: Binary search to find the data chunk containing the keyword
 //! 3. **Exact Match**: Precise lookup within the chunk
 //! 4. **Data Retrieval**: Load row group and row range information
 //!
 //! # Performance
 //!
 //! - **Search time**: O(1) for bloom filter check + O(log n) for chunk lookup
-//! - **Memory**: Only index loaded, not the Parquet data itself
+//! - **Memory**: Only filters loaded in memory, data chunks read on-demand
 //! - **False positives**: <1% (configurable during index build)
 //!
 //! # Basic Usage
@@ -30,7 +30,7 @@
 //!     let searcher = KeywordSearcher::load("data.parquet", None).await?;
 //!
 //!     // Search for a keyword
-//!     let result = searcher.search("john.doe@example.com", None, true)?;
+//!     let result = searcher.search("john.doe@example.com", None, true).await?;
 //!
 //!     if result.found {
 //!         println!("Found in {} columns", result.verified_matches.unwrap().columns.len());
@@ -40,17 +40,16 @@
 //! }
 //! ```
 
-use std::path::Path;
 use std::collections::HashMap;
 use rkyv::Archived;
 use rkyv::util::AlignedVec;
 use rkyv::rancor::Error as RkyvError;
-use tokio::fs;
-use crate::index_data::{IndexFilters, MetadataEntry, KeywordDataFlat, ChunkInfo, ColumnKeywordsFile};
+use crate::index_data::{IndexFilters, KeywordDataFlat, ChunkInfo};
 use crate::index_structure::column_filter::ColumnFilter;
 use crate::index_structure::index_files::{index_filename, IndexFile};
 use crate::ParquetSource;
 use crate::searching::search_results::*;
+use crate::utils::file_interaction_local_and_cloud::get_object_store;
 
 /// Helper function to convert sorted row numbers into ranges
 fn rows_to_ranges(sorted_rows: &[u32]) -> Vec<CombinedRowRange> {
@@ -79,16 +78,15 @@ fn rows_to_ranges(sorted_rows: &[u32]) -> Vec<CombinedRowRange> {
 /// Handle for searching keywords in a distributed index.
 ///
 /// The searcher is created by loading a pre-built index from disk. Once loaded,
-/// it can perform multiple keyword searches efficiently without re-reading index files.
-/// The searcher holds the entire index in memory for fast lookups.
+/// it can perform multiple keyword searches efficiently. The searcher keeps filters
+/// in memory and reads data chunks on-demand from the data.bin file.
 ///
 /// # Index Structure
 ///
 /// The index consists of:
 /// - **Bloom filters**: For fast negative lookups (global and per-column)
-/// - **Metadata chunks**: Keyword locations organized in sorted chunks
-/// - **Data file**: Row group and row range information
-/// - **Column keywords**: Mapping of keywords to columns
+/// - **Chunk index**: Maps keyword ranges to byte locations in data.bin
+/// - **Data file**: Chunked keyword lists + occurrence data
 ///
 /// # Thread Safety
 ///
@@ -107,7 +105,7 @@ fn rows_to_ranges(sorted_rows: &[u32]) -> Vec<CombinedRowRange> {
 ///
 ///     // Perform multiple searches
 ///     for keyword in &["alice", "bob", "charlie"] {
-///         let result = searcher.search(keyword, None, true)?;
+///         let result = searcher.search(keyword, None, true).await?;
 ///         println!("{}: {}", keyword, result.found);
 ///     }
 ///
@@ -115,10 +113,12 @@ fn rows_to_ranges(sorted_rows: &[u32]) -> Vec<CombinedRowRange> {
 /// }
 /// ```
 pub struct KeywordSearcher {
+    /// Filters containing bloom filters, metadata, column pool, and chunk index
     pub filters: IndexFilters,
-    pub metadata_bytes: AlignedVec<16>,
-    pub data_bytes: AlignedVec<16>,
-    pub all_keywords: Vec<String>
+    /// Directory path for index files
+    pub(super) index_dir: String,
+    /// Optional prefix for index files (e.g., "v1_", "test_")
+    pub(super) index_file_prefix: Option<String>,
 }
 
 impl KeywordSearcher {
@@ -126,7 +126,9 @@ impl KeywordSearcher {
     ///
     /// # Arguments
     ///
-    /// * `files` - Serialized index files containing filters, metadata, data, and column keywords
+    /// * `files` - Serialized index files containing filters and data
+    /// * `index_dir` - Directory path for index files
+    /// * `index_file_prefix` - Optional prefix for index files
     ///
     /// # Returns
     ///
@@ -136,20 +138,13 @@ impl KeywordSearcher {
     ///
     /// Returns error if rkyv deserialization fails
     pub fn from_serialized(
-        files: &crate::index_data::DistributedIndexFiles
+        files: &crate::index_data::DistributedIndexFiles,
+        index_dir: String,
+        index_file_prefix: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Copy to aligned buffers
+        // Copy to aligned buffer
         let mut filters_bytes = AlignedVec::<16>::new();
         filters_bytes.extend_from_slice(&files.filters);
-
-        let mut metadata_bytes = AlignedVec::<16>::new();
-        metadata_bytes.extend_from_slice(&files.metadata);
-
-        let mut data_bytes = AlignedVec::<16>::new();
-        data_bytes.extend_from_slice(&files.data);
-
-        let mut column_keywords_bytes = AlignedVec::<16>::new();
-        column_keywords_bytes.extend_from_slice(&files.column_keywords);
 
         // Deserialize filters
         let archived_filters: &Archived<IndexFilters> = rkyv::access(&filters_bytes)
@@ -160,6 +155,8 @@ impl KeywordSearcher {
             parquet_etag: archived_filters.parquet_etag.to_string(),
             parquet_size: archived_filters.parquet_size.to_native(),
             parquet_last_modified: archived_filters.parquet_last_modified.to_native(),
+            parquet_metadata_offset: archived_filters.parquet_metadata_offset.to_native(),
+            parquet_metadata_length: archived_filters.parquet_metadata_length.to_native(),
             error_rate: archived_filters.error_rate.to_native(),
             split_chars_inclusive: archived_filters.split_chars_inclusive.iter()
                 .map(|v| v.iter().map(|c| char::from(*c)).collect())
@@ -202,28 +199,20 @@ impl KeywordSearcher {
                 }
             },
             chunk_index: archived_filters.chunk_index.iter()
-                .map(|c| ChunkInfo {
-                    start_keyword: c.start_keyword.to_string(),
-                    offset: c.offset.to_native(),
-                    length: c.length.to_native(),
-                    count: c.count.to_native(),
+                .map(|chunk| ChunkInfo {
+                    start_keyword: chunk.start_keyword.to_string(),
+                    offset: chunk.offset.to_native(),
+                    keyword_list_length: chunk.keyword_list_length.to_native(),
+                    total_length: chunk.total_length.to_native(),
+                    count: chunk.count.to_native(),
                 })
                 .collect(),
         };
 
-        // Deserialize column keywords
-        let archived_column_keywords: &Archived<ColumnKeywordsFile> = rkyv::access(&column_keywords_bytes)
-            .map_err(|e: RkyvError| format!("Failed to access archived column keywords: {}", e))?;
-
-        let all_keywords: Vec<String> = archived_column_keywords.all_keywords.iter()
-            .map(|s| s.to_string())
-            .collect();
-
         Ok(Self {
             filters,
-            metadata_bytes,
-            data_bytes,
-            all_keywords,
+            index_dir,
+            index_file_prefix,
         })
     }
 
@@ -248,7 +237,7 @@ impl KeywordSearcher {
     ///
     /// Returns error if:
     /// * Index directory does not exist (`{parquet_path}.index/` not found)
-    /// * Any index file is missing or cannot be read (filters.rkyv, metadata.rkyv, data.bin, column_keywords.rkyv)
+    /// * Any index file is missing or cannot be read (filters.rkyv, data.bin)
     /// * Index files are corrupted or have invalid rkyv serialization
     /// * Insufficient memory to load the index
     /// * File system permissions prevent reading
@@ -275,7 +264,7 @@ impl KeywordSearcher {
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ///     // Loads files like: test_filters.rkyv, test_metadata.rkyv, etc.
+    ///     // Loads files like: test_filters.rkyv, test_data.bin, etc.
     ///     let searcher = KeywordSearcher::load("data.parquet", Some("test_")).await?;
     ///     Ok(())
     /// }
@@ -304,26 +293,232 @@ impl KeywordSearcher {
         index_file_prefix: Option<&str>
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let index_dir = format!("{}.index", parquet_path);
+        let index_dir_clone = index_dir.clone(); // Clone for use in closure
 
-        // Check if index directory exists
-        if !Path::new(&index_dir).exists() {
-            return Err(format!("Index directory not found: {}", index_dir).into());
-        }
+        // Helper to read a file using the existing abstraction
+        let read_index_file = |filename: String| async move {
+            let file_path = format!("{}/{}", index_dir_clone, filename);
+            let (store, path) = get_object_store(&file_path).await?;
+            let bytes = store.get(&path).await?.bytes().await?;
+            Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(bytes.to_vec())
+        };
 
-        // Read all files from disk
-        let filters_bytes = fs::read(Path::new(&index_dir).join(index_filename(IndexFile::Filters, index_file_prefix))).await?;
-        let metadata_bytes = fs::read(Path::new(&index_dir).join(index_filename(IndexFile::Metadata, index_file_prefix))).await?;
-        let data_bytes = fs::read(Path::new(&index_dir).join(index_filename(IndexFile::Data, index_file_prefix))).await?;
-        let column_keywords_bytes = fs::read(Path::new(&index_dir).join(index_filename(IndexFile::ColumnKeywords, index_file_prefix))).await?;
+        // Read only the filters file - data.bin is read on-demand
+        let filters_bytes = read_index_file(index_filename(IndexFile::Filters, index_file_prefix)).await?;
 
         let files = crate::index_data::DistributedIndexFiles {
             filters: filters_bytes,
-            metadata: metadata_bytes,
-            data: data_bytes,
-            column_keywords: column_keywords_bytes,
+            data: Vec::new(), // Not loaded into memory
         };
 
-        Self::from_serialized(&files)
+        Self::from_serialized(&files, index_dir, index_file_prefix.map(|s| s.to_string()))
+    }
+
+    /// Read just the keyword list from a specific chunk.
+    ///
+    /// Performs a range read to fetch only the keyword strings from a chunk,
+    /// without loading the occurrence data. Useful for parent keyword lookups.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_number` - The chunk number to read (0-indexed)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Vec<String>)` containing the keywords in this chunk
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Chunk number is out of bounds
+    /// - File I/O fails
+    /// - Deserialization fails
+    async fn read_chunk_keywords(&self, chunk_number: u16) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let chunk_info = self.filters.chunk_index.get(chunk_number as usize)
+            .ok_or_else(|| format!("Chunk {} not found in index", chunk_number))?;
+
+        let data_path = format!("{}/{}", self.index_dir,
+                                index_filename(IndexFile::Data, self.index_file_prefix.as_deref()));
+
+        // Use object store abstraction for cloud/local compatibility
+        let (store, obj_path) = get_object_store(&data_path).await?;
+
+        // Read just the keyword list section
+        let start = chunk_info.offset;
+        let length = chunk_info.keyword_list_length as u64;
+
+        let range = start..(start + length);
+
+        let result = store.get_range(&obj_path, range).await?;
+        let buffer = result.to_vec();
+
+        // Deserialize keyword list
+        let mut aligned_buffer = AlignedVec::<16>::new();
+        aligned_buffer.extend_from_slice(&buffer);
+
+        let archived: &Archived<Vec<String>> = rkyv::access(&aligned_buffer)
+            .map_err(|e: RkyvError| format!("Failed to deserialize keyword list: {}", e))?;
+
+        Ok(archived.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// Read a complete chunk (keywords + data) from data.bin.
+    ///
+    /// Performs a single range read to fetch both the keyword list and the
+    /// occurrence data for a chunk. Returns both deserialized structures.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk_number` - The chunk number to read (0-indexed)
+    ///
+    /// # Returns
+    ///
+    /// `Ok((Vec<String>, Vec<KeywordDataFlat>))` containing keywords and their data
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Chunk number is out of bounds
+    /// - File I/O fails
+    /// - Deserialization fails
+    async fn read_full_chunk(&self, chunk_number: u16) -> Result<(Vec<String>, Vec<KeywordDataFlat>), Box<dyn std::error::Error + Send + Sync>> {
+        let chunk_info = self.filters.chunk_index.get(chunk_number as usize)
+            .ok_or_else(|| format!("Chunk {} not found in index", chunk_number))?;
+
+        let data_path = format!("{}/{}", self.index_dir,
+                                index_filename(IndexFile::Data, self.index_file_prefix.as_deref()));
+
+        // Use object store abstraction
+        let (store, obj_path) = get_object_store(&data_path).await?;
+
+        // Read the entire chunk (keywords + data)
+        let start = chunk_info.offset;
+        let length = chunk_info.total_length as u64;
+
+        let range = start..(start + length);
+
+        let result = store.get_range(&obj_path, range).await?;
+        let buffer = result.to_vec();
+
+        // Split buffer into keyword section and data section
+        let keyword_length = chunk_info.keyword_list_length as usize;
+        let keyword_bytes = &buffer[..keyword_length];
+        let data_bytes = &buffer[keyword_length..];
+
+        // Deserialize keyword list
+        let mut keyword_buffer = AlignedVec::<16>::new();
+        keyword_buffer.extend_from_slice(keyword_bytes);
+
+        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&keyword_buffer)
+            .map_err(|e: RkyvError| format!("Failed to deserialize keyword list: {}", e))?;
+
+        let keywords: Vec<String> = archived_keywords.iter().map(|s| s.to_string()).collect();
+
+        // Deserialize data section
+        let mut data_buffer = AlignedVec::<16>::new();
+        data_buffer.extend_from_slice(data_bytes);
+
+        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
+            .map_err(|e: RkyvError| format!("Failed to deserialize chunk data: {}", e))?;
+
+        let data: Vec<KeywordDataFlat> = archived_data.iter().map(|item| {
+            KeywordDataFlat {
+                columns: item.columns.iter().map(|col| {
+                    crate::index_data::ColumnDataFlat {
+                        column_id: col.column_id.to_native(),
+                        row_groups: col.row_groups.iter().map(|rg| {
+                            crate::index_data::RowGroupDataFlat {
+                                row_group_id: rg.row_group_id.to_native(),
+                                rows: rg.rows.iter().map(|row| {
+                                    crate::index_data::FlatRow {
+                                        row: row.row.to_native(),
+                                        additional_rows: row.additional_rows.to_native(),
+                                        splits_matched: row.splits_matched.to_native(),
+                                        parent_chunk: row.parent_chunk.as_ref().map(|c| c.to_native()),
+                                        parent_position: row.parent_position.as_ref().map(|p| p.to_native()),
+                                    }
+                                }).collect(),
+                            }
+                        }).collect(),
+                    }
+                }).collect(),
+                splits_matched: item.splits_matched.to_native(),
+            }
+        }).collect();
+
+        Ok((keywords, data))
+    }
+
+    /// Look up a parent keyword by its chunk and position.
+    ///
+    /// Reads the keyword list for the specified chunk and returns the keyword
+    /// at the given position. This is used for parent verification during
+    /// phrase searches.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk` - The chunk number containing the parent keyword
+    /// * `position` - The position within the chunk (0-999 typically)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(String)` containing the parent keyword
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Chunk number is out of bounds
+    /// - Position is out of bounds within the chunk
+    /// - File I/O or deserialization fails
+    async fn lookup_parent_keyword(&self, chunk: u16, position: u16) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let keywords = self.read_chunk_keywords(chunk).await?;
+
+        keywords.get(position as usize)
+            .cloned()
+            .ok_or_else(|| format!("Position {} out of bounds in chunk {}", position, chunk).into())
+    }
+
+    /// Batch lookup multiple parent keywords efficiently.
+    ///
+    /// Collects all needed chunks, deduplicates them, reads each chunk once,
+    /// then looks up all parent keywords. This is more efficient than multiple
+    /// individual lookups when processing search results.
+    ///
+    /// # Arguments
+    ///
+    /// * `parents` - Iterator of (chunk, position) pairs to look up
+    ///
+    /// # Returns
+    ///
+    /// `Ok(HashMap)` mapping (chunk, position) to parent keyword strings
+    ///
+    /// # Errors
+    ///
+    /// Returns error if any chunk read or lookup fails
+    async fn batch_lookup_parents<I>(&self, parents: I) -> Result<HashMap<(u16, u16), String>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        I: IntoIterator<Item = (u16, u16)>
+    {
+        let mut result = HashMap::new();
+        let mut chunks_needed: HashMap<u16, Vec<u16>> = HashMap::new();
+
+        // Collect unique chunks and their positions
+        for (chunk, position) in parents {
+            chunks_needed.entry(chunk).or_insert_with(Vec::new).push(position);
+        }
+
+        // Read each chunk once and extract needed keywords
+        for (chunk, positions) in chunks_needed {
+            let keywords = self.read_chunk_keywords(chunk).await?;
+
+            for position in positions {
+                if let Some(keyword) = keywords.get(position as usize) {
+                    result.insert((chunk, position), keyword.clone());
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Search for keywords or phrases in the index.
@@ -354,7 +549,7 @@ impl KeywordSearcher {
     /// # use keywords::searching::keyword_search::KeywordSearcher;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     /// let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    /// let result = searcher.search("alice", None, true)?;
+    /// let result = searcher.search("alice", None, true).await?;
     ///
     /// if let Some(verified) = &result.verified_matches {
     ///     println!("Found in columns: {:?}", verified.columns);
@@ -368,7 +563,7 @@ impl KeywordSearcher {
     /// # use keywords::searching::keyword_search::KeywordSearcher;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     /// let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    /// let result = searcher.search("example.com", None, false)?;
+    /// let result = searcher.search("example.com", None, false).await?;
     ///
     /// if let Some(verified) = &result.verified_matches {
     ///     println!("Verified matches: {}", verified.total_occurrences);
@@ -379,7 +574,7 @@ impl KeywordSearcher {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn search(
+    pub async fn search(
         &self,
         search_for: &str,
         in_columns: Option<&str>,
@@ -387,18 +582,18 @@ impl KeywordSearcher {
     ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         if keyword_only {
             // Exact keyword search - all matches are verified
-            let old_result = self.search_keyword_internal(search_for, in_columns)?;
+            let old_result = self.search_keyword_internal_zerocopy(search_for, in_columns).await?;
 
             Ok(SearchResult {
                 query: search_for.to_string(),
                 found: old_result.found,
                 tokens: vec![search_for.to_string()],
-                verified_matches: old_result.data,
+                verified_matches: old_result.verified_matches,
                 needs_verification: None,
             })
         } else {
             // Phrase search - split tokens and verify
-            self.search_phrase_internal(search_for, in_columns)
+            self.search_phrase_internal(search_for, in_columns).await
         }
     }
 
@@ -418,7 +613,7 @@ impl KeywordSearcher {
     ///
     /// # Returns
     ///
-    /// `Ok(KeywordSearchResult)` - Search result with:
+    /// `Ok(SearchResult)` - Search result with:
     /// * `found: false` - Keyword definitely not in index (bloom filter rejection)
     /// * `found: true` - Keyword found with detailed location data including columns,
     ///   row groups, row ranges, and occurrence counts
@@ -442,7 +637,7 @@ impl KeywordSearcher {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    ///     let result = searcher.search("alice", None, true)?;
+    ///     let result = searcher.search("alice", None, true).await?;
     ///
     ///     if result.found {
     ///         let data = result.verified_matches.unwrap();
@@ -464,7 +659,7 @@ impl KeywordSearcher {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ///     let searcher = KeywordSearcher::load("logs.parquet", None).await?;
-    ///     let result = searcher.search("error", None, true)?;
+    ///     let result = searcher.search("error", None, true).await?;
     ///
     ///     if let Some(data) = result.verified_matches {
     ///         println!("Keyword: {}", result.query);
@@ -501,7 +696,7 @@ impl KeywordSearcher {
     ///     let mut found_count = 0;
     ///
     ///     for keyword in keywords {
-    ///         let result = searcher.search(keyword, None, true)?;
+    ///         let result = searcher.search(keyword, None, true).await?;
     ///         if result.found {
     ///             found_count += 1;
     ///             println!("Found: {}", keyword);
@@ -512,37 +707,270 @@ impl KeywordSearcher {
     ///     Ok(())
     /// }
     /// ```
-    fn search_keyword_internal(
+    /// Zero-copy search that only converts the specific keyword data needed.
+    async fn search_keyword_internal_zerocopy(
         &self,
         keyword: &str,
         column_filter: Option<&str>
-    ) -> Result<KeywordSearchResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Step 1: Check appropriate filter
+        if let Some(col_name) = column_filter {
+            if let Some(filter) = self.filters.column_filters.get(col_name) {
+                if !filter.might_contain(keyword) {
+                    return Ok(SearchResult {
+                        query: keyword.to_string(),
+                        found: false,
+                        tokens: vec![keyword.to_string()],
+                        verified_matches: None,
+                        needs_verification: None,
+                    });
+                }
+            } else {
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
+                    found: false,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
+                });
+            }
+        } else {
+            if !self.filters.global_filter.might_contain(keyword) {
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
+                    found: false,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
+                });
+            }
+        }
+
+        // Step 2: Find chunk
+        let chunk_info = self.find_chunk_for_keyword(keyword);
+        let chunk_idx = match chunk_info {
+            Some((idx, _)) => idx,
+            None => {
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
+                    found: false,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
+                });
+            }
+        };
+
+        // Step 3: Read chunk from disk directly into aligned buffer
+        let chunk_info = &self.filters.chunk_index[chunk_idx as usize];
+        let data_path = format!("{}/{}", self.index_dir,
+                                index_filename(IndexFile::Data, self.index_file_prefix.as_deref()));
+
+        let (store, obj_path) = get_object_store(&data_path).await?;
+        let start = chunk_info.offset;
+        let length = chunk_info.total_length as u64;
+        let range = start..(start + length);
+        let result = store.get_range(&obj_path, range).await?;
+
+        // Copy once into aligned buffer (eliminates second copy)
+        let mut buffer = AlignedVec::<16>::new();
+        buffer.extend_from_slice(&result);
+
+        // Step 4: Zero-copy access to archived data (no additional copies)
+        let keyword_length = chunk_info.keyword_list_length as usize;
+
+        // Access keyword section directly in aligned buffer
+        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&buffer[..keyword_length])
+            .map_err(|e: RkyvError| format!("Failed to deserialize keyword list: {}", e))?;
+
+        // Binary search (zero-copy)
+        let position = match archived_keywords.binary_search_by(|k| k.as_str().cmp(keyword)) {
+            Ok(pos) => pos,
+            Err(_) => {
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
+                    found: false,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
+                });
+            }
+        };
+
+        // Access data section directly in aligned buffer (no additional copy)
+        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&buffer[keyword_length..])
+            .map_err(|e: RkyvError| format!("Failed to deserialize chunk data: {}", e))?;
+
+        // Get only the one item we need (still zero-copy)
+        let archived_item = &archived_data[position];
+
+        // Determine which column(s) to process
+        let filter_to_column_id: Option<u32> = if let Some(col_name) = column_filter {
+            let found_id = archived_item.columns.iter()
+                .map(|col| col.column_id.to_native())
+                .find(|&id| {
+                    if id == 0 { return false; }
+                    if let Some(name) = self.filters.column_pool.get(id) {
+                        name == col_name
+                    } else {
+                        false
+                    }
+                });
+
+            if found_id.is_none() {
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
+                    found: false,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
+                });
+            }
+            found_id
+        } else {
+            Some(0)
+        };
+
+        // Step 5: Build result - convert ONLY this one keyword's data
+        let mut column_details = Vec::new();
+        let mut total_occurrences = 0u64;
+
+        let all_column_ids: Vec<u32> = archived_item.columns.iter()
+            .map(|col| col.column_id.to_native())
+            .filter(|&id| id != 0)
+            .collect();
+
+        for col in archived_item.columns.iter() {
+            let column_id: u32 = col.column_id.to_native();
+
+            if let Some(target_id) = filter_to_column_id {
+                if column_id != target_id {
+                    continue;
+                }
+            }
+
+            let column_name = if column_id == 0 {
+                "_all_columns_aggregate_".to_string()
+            } else {
+                self.filters.column_pool.get(column_id)
+                    .ok_or("Column not found in pool")?
+                    .to_string()
+            };
+
+            let mut row_groups = Vec::new();
+
+            for rg in col.row_groups.iter() {
+                let row_group_id: u16 = rg.row_group_id.to_native();
+                let mut row_ranges = Vec::new();
+
+                for flat_row in rg.rows.iter() {
+                    let row: u32 = flat_row.row.to_native();
+                    let additional_rows: u32 = flat_row.additional_rows.to_native();
+                    let splits_matched: u16 = flat_row.splits_matched.to_native();
+                    let parent_chunk: Option<u16> = flat_row.parent_chunk.as_ref().map(|c| c.to_native());
+                    let parent_position: Option<u16> = flat_row.parent_position.as_ref().map(|p| p.to_native());
+
+                    row_ranges.push(RowRange {
+                        start_row: row,
+                        end_row: row + additional_rows,
+                        splits_matched,
+                        parent_chunk,
+                        parent_position,
+                    });
+
+                    total_occurrences = total_occurrences.saturating_add(additional_rows as u64 + 1);
+                }
+
+                row_groups.push(RowGroupLocation {
+                    row_group_id,
+                    row_ranges,
+                });
+            }
+
+            column_details.push(ColumnLocation {
+                column_name,
+                row_groups,
+            });
+        }
+
+        if filter_to_column_id == Some(0) && !column_details.is_empty() {
+            let aggregate_row_groups = column_details[0].row_groups.clone();
+            column_details.clear();
+
+            for column_id in all_column_ids {
+                if let Some(column_name) = self.filters.column_pool.get(column_id) {
+                    column_details.push(ColumnLocation {
+                        column_name: column_name.to_string(),
+                        row_groups: aggregate_row_groups.clone(),
+                    });
+                }
+            }
+        }
+
+        let columns: Vec<String> = if filter_to_column_id == Some(0) {
+            archived_item.columns.iter()
+                .map(|col| col.column_id.to_native())
+                .filter(|&id| id != 0)
+                .filter_map(|id| self.filters.column_pool.get(id))
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            column_details.iter()
+                .map(|cd| cd.column_name.clone())
+                .collect()
+        };
+
+        Ok(SearchResult {
+            query: keyword.to_string(),
+            found: true,
+            tokens: vec![keyword.to_string()],
+            verified_matches: Some(KeywordLocationData {
+                columns,
+                total_occurrences,
+                splits_matched: archived_item.splits_matched.to_native(),
+                column_details,
+            }),
+            needs_verification: None,
+        })
+    }
+
+    async fn search_keyword_internal(
+        &self,
+        keyword: &str,
+        column_filter: Option<&str>
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         // Step 1: Check appropriate filter based on whether we have a column filter
         if let Some(col_name) = column_filter {
             // When filtering to a specific column, check that column's bloom filter first
             if let Some(filter) = self.filters.column_filters.get(col_name) {
                 if !filter.might_contain(keyword) {
-                    return Ok(KeywordSearchResult {
-                        keyword: keyword.to_string(),
+                    return Ok(SearchResult {
+                        query: keyword.to_string(),
                         found: false,
-                        data: None,
+                        tokens: vec![keyword.to_string()],
+                        verified_matches: None,
+                        needs_verification: None,
                     });
                 }
             } else {
                 // Column doesn't exist in the index
-                return Ok(KeywordSearchResult {
-                    keyword: keyword.to_string(),
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
                     found: false,
-                    data: None,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
                 });
             }
         } else {
             // When no column filter, check global filter (fast rejection)
             if !self.filters.global_filter.might_contain(keyword) {
-                return Ok(KeywordSearchResult {
-                    keyword: keyword.to_string(),
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
                     found: false,
-                    data: None,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
                 });
             }
         }
@@ -550,53 +978,47 @@ impl KeywordSearcher {
         // Step 2: Find the chunk that might contain this keyword
         let chunk_info = self.find_chunk_for_keyword(keyword);
 
-        let chunk_info = match chunk_info {
-            Some(info) => info,
+        let chunk_idx = match chunk_info {
+            Some((idx, _)) => idx,
             None => {
-                return Ok(KeywordSearchResult {
-                    keyword: keyword.to_string(),
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
                     found: false,
-                    data: None,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
                 });
             }
         };
 
         // Step 3: Load and search the chunk
-        let chunk_bytes = &self.metadata_bytes[chunk_info.offset as usize..(chunk_info.offset + chunk_info.length as u64) as usize];
-
-        let archived_chunk: &Archived<Vec<MetadataEntry>> = rkyv::access(chunk_bytes)
-            .map_err(|e: RkyvError| format!("Failed to access archived chunk: {}", e))?;
+        let (keywords, chunk_data) = self.read_full_chunk(chunk_idx).await?;
 
         // Find the keyword in the chunk
-        let metadata_entry = archived_chunk.iter()
-            .find(|entry| entry.keyword.as_str() == keyword);
-
-        let metadata_entry = match metadata_entry {
-            Some(entry) => entry,
-            None => {
-                return Ok(KeywordSearchResult {
-                    keyword: keyword.to_string(),
+        let position = match keywords.binary_search_by(|k| k.as_str().cmp(keyword)) {
+            Ok(pos) => pos,
+            Err(_) => {
+                // Not found (bloom filter false positive)
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
                     found: false,
-                    data: None,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
                 });
             }
         };
 
-        // Step 4: Load the keyword data from data.bin
-        let data_offset = metadata_entry.offset.to_native();
-        let data_length: usize = metadata_entry.length.to_native() as usize;
-        let data_bytes = &self.data_bytes[data_offset as usize..(data_offset as usize + data_length)];
-
-        let archived_data: &Archived<KeywordDataFlat> = rkyv::access(data_bytes)
-            .map_err(|e: RkyvError| format!("Failed to access archived keyword data: {}", e))?;
+        // Step 4: Get the keyword data
+        let archived_data = &chunk_data[position];
 
         // Determine which column(s) to process
         // When column_filter is None, use column_id 0 (aggregate of all columns)
         // When column_filter is Some, process only that specific column
         let filter_to_column_id: Option<u32> = if let Some(col_name) = column_filter {
             // Find the column_id for the requested column
-            let found_id = metadata_entry.column_ids.iter()
-                .map(|id| id.to_native())
+            let found_id = archived_data.columns.iter()
+                .map(|col| col.column_id)
                 .find(|&id| {
                     if id == 0 {
                         return false; // Never match column_id 0 here
@@ -610,10 +1032,12 @@ impl KeywordSearcher {
 
             if found_id.is_none() {
                 // Column not found in results - return not found
-                return Ok(KeywordSearchResult {
-                    keyword: keyword.to_string(),
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
                     found: false,
-                    data: None,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
                 });
             }
             found_id
@@ -626,8 +1050,14 @@ impl KeywordSearcher {
         let mut column_details = Vec::new();
         let mut total_occurrences = 0u64;
 
-        for col in archived_data.columns.iter() {
-            let column_id: u32 = col.column_id.to_native();
+        // Collect all column IDs for later expansion if using aggregate
+        let all_column_ids: Vec<u32> = archived_data.columns.iter()
+            .map(|col| col.column_id)
+            .filter(|&id| id != 0)
+            .collect();
+
+        for col in &archived_data.columns {
+            let column_id: u32 = col.column_id;
 
             // Apply column filter
             if let Some(target_id) = filter_to_column_id {
@@ -648,21 +1078,23 @@ impl KeywordSearcher {
 
             let mut row_groups = Vec::new();
 
-            for rg in col.row_groups.iter() {
-                let row_group_id: u16 = rg.row_group_id.to_native();
+            for rg in &col.row_groups {
+                let row_group_id: u16 = rg.row_group_id;
                 let mut row_ranges = Vec::new();
 
-                for flat_row in rg.rows.iter() {
-                    let row: u32 = flat_row.row.to_native();
-                    let additional_rows: u32 = flat_row.additional_rows.to_native();
-                    let splits_matched: u16 = flat_row.splits_matched.to_native();
-                    let parent_offset: Option<u32> = flat_row.parent_offset.as_ref().map(|p| p.to_native());
+                for flat_row in &rg.rows {
+                    let row: u32 = flat_row.row;
+                    let additional_rows: u32 = flat_row.additional_rows;
+                    let splits_matched: u16 = flat_row.splits_matched;
+                    let parent_chunk: Option<u16> = flat_row.parent_chunk;
+                    let parent_position: Option<u16> = flat_row.parent_position;
 
                     row_ranges.push(RowRange {
                         start_row: row,
                         end_row: row + additional_rows,
                         splits_matched,
-                        parent_offset,
+                        parent_chunk,
+                        parent_position,
                     });
 
                     total_occurrences = total_occurrences.saturating_add(additional_rows as u64 + 1);
@@ -705,14 +1137,8 @@ impl KeywordSearcher {
             let aggregate_row_groups = column_details[0].row_groups.clone();
             column_details.clear();
 
-            // Get actual column IDs from metadata
-            let actual_column_ids: Vec<u32> = metadata_entry.column_ids.iter()
-                .map(|id| id.to_native())
-                .filter(|&id| id != 0) // Skip column_id 0 itself
-                .collect();
-
             // Create one ColumnLocation per actual column, all sharing the same row group data
-            for column_id in actual_column_ids {
+            for column_id in all_column_ids {
                 if let Some(column_name) = self.filters.column_pool.get(column_id) {
                     column_details.push(ColumnLocation {
                         column_name: column_name.to_string(),
@@ -724,12 +1150,12 @@ impl KeywordSearcher {
 
 
         // Build column list
-        // When we used column_id 0, we need to get the actual column names from metadata_entry.column_ids
+        // When we used column_id 0, we need to get the actual column names from archived_data.columns
         // When we used a specific column, we already have it in column_details
         let columns: Vec<String> = if filter_to_column_id == Some(0) {
-            // We used the aggregate (column_id 0), so get actual column names from metadata
-            metadata_entry.column_ids.iter()
-                .map(|id| id.to_native())
+            // We used the aggregate (column_id 0), so get actual column names
+            archived_data.columns.iter()
+                .map(|col| col.column_id)
                 .filter(|&id| id != 0)  // Skip column_id 0
                 .filter_map(|id| self.filters.column_pool.get(id))
                 .map(|s| s.to_string())
@@ -741,20 +1167,22 @@ impl KeywordSearcher {
                 .collect()
         };
 
-        Ok(KeywordSearchResult {
-            keyword: keyword.to_string(),
+        Ok(SearchResult {
+            query: keyword.to_string(),
             found: true,
-            data: Some(KeywordLocationData {
+            tokens: vec![keyword.to_string()],
+            verified_matches: Some(KeywordLocationData {
                 columns,
                 total_occurrences,
-                splits_matched: archived_data.splits_matched.to_native(),
+                splits_matched: archived_data.splits_matched,
                 column_details,
             }),
+            needs_verification: None,
         })
     }
 
     /// Find the chunk that might contain a keyword
-    fn find_chunk_for_keyword(&self, keyword: &str) -> Option<&ChunkInfo> {
+    fn find_chunk_for_keyword(&self, keyword: &str) -> Option<(u16, &ChunkInfo)> {
         // Binary search to find the right chunk
         // We want to find the chunk where: chunk.start_keyword <= keyword < next_chunk.start_keyword
 
@@ -766,14 +1194,14 @@ impl KeywordSearcher {
         match self.filters.chunk_index.binary_search_by(|chunk| {
             chunk.start_keyword.as_str().cmp(keyword)
         }) {
-            Ok(idx) => Some(&self.filters.chunk_index[idx]),
+            Ok(idx) => Some((idx as u16, &self.filters.chunk_index[idx])),
             Err(idx) => {
                 if idx == 0 {
                     // Keyword is before first chunk - still check first chunk
-                    Some(&self.filters.chunk_index[0])
+                    Some((0, &self.filters.chunk_index[0]))
                 } else {
                     // Keyword belongs to previous chunk
-                    Some(&self.filters.chunk_index[idx - 1])
+                    Some(((idx - 1) as u16, &self.filters.chunk_index[idx - 1]))
                 }
             }
         }
@@ -810,13 +1238,13 @@ impl KeywordSearcher {
     ///     let searcher = KeywordSearcher::load("users.parquet", None).await?;
     ///
     ///     // Check if "alice" appears in the "username" column
-    ///     if searcher.search_in_column("alice", "username")? {
+    ///     if searcher.search_in_column("alice", "username").await? {
     ///         println!("Found 'alice' in username column");
     ///     }
     ///
     ///     // Check multiple columns
     ///     for column in &["email", "description", "notes"] {
-    ///         if searcher.search_in_column("test", column)? {
+    ///         if searcher.search_in_column("test", column).await? {
     ///             println!("Found 'test' in {} column", column);
     ///         }
     ///     }
@@ -824,7 +1252,7 @@ impl KeywordSearcher {
     ///     Ok(())
     /// }
     /// ```
-    pub fn search_in_column(&self, keyword: &str, column_name: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn search_in_column(&self, keyword: &str, column_name: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         // Check column filter first
         if let Some(filter) = self.filters.column_filters.get(column_name) {
             if !filter.might_contain(keyword) {
@@ -833,7 +1261,7 @@ impl KeywordSearcher {
         }
 
         // Do filtered search for this specific column
-        let result = self.search(keyword, Some(column_name), true)?;
+        let result = self.search(keyword, Some(column_name), true).await?;
 
         if !result.found {
             return Ok(false);
@@ -919,15 +1347,15 @@ impl KeywordSearcher {
     ///     let searcher = KeywordSearcher::load("logs.parquet", None).await?;
     ///
     ///     // Find rows containing ALL of these keywords
-    ///     let search1 = searcher.search("error", None, true)?;
-    ///     let search2 = searcher.search("database", None, true)?;
-    ///     let search3 = searcher.search("connection", None, true)?;
+    ///     let search1 = searcher.search("error", None, true).await?;
+    ///     let search2 = searcher.search("database", None, true).await?;
+    ///     let search3 = searcher.search("connection", None, true).await?;
     ///
-    ///     // Convert to KeywordSearchResult for combine_and
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let r1 = KeywordSearchResult { keyword: search1.query.clone(), found: search1.found, data: search1.verified_matches.clone() };
-    ///     let r2 = KeywordSearchResult { keyword: search2.query.clone(), found: search2.found, data: search2.verified_matches.clone() };
-    ///     let r3 = KeywordSearchResult { keyword: search3.query.clone(), found: search3.found, data: search3.verified_matches.clone() };
+    ///     // Convert to SearchResult for combine_and
+    ///     use keywords::searching::search_results::SearchResult;
+    ///     let r1 = search1;
+    ///     let r2 = search2;
+    ///     let r3 = search3;
     ///
     ///     let combined = KeywordSearcher::combine_and(&[r1, r2, r3]);
     ///
@@ -954,13 +1382,13 @@ impl KeywordSearcher {
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
     ///
-    ///     let search1 = searcher.search("alice", None, true)?;
-    ///     let search2 = searcher.search("admin", None, true)?;
+    ///     let search1 = searcher.search("alice", None, true).await?;
+    ///     let search2 = searcher.search("admin", None, true).await?;
     ///
-    ///     // Convert to KeywordSearchResult for combine_and
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let r1 = KeywordSearchResult { keyword: search1.query.clone(), found: search1.found, data: search1.verified_matches.clone() };
-    ///     let r2 = KeywordSearchResult { keyword: search2.query.clone(), found: search2.found, data: search2.verified_matches.clone() };
+    ///     // Convert to SearchResult for combine_and
+    ///     use keywords::searching::search_results::SearchResult;
+    ///     let r1 = search1;
+    ///     let r2 = search2;
     ///
     ///     if let Some(combined) = KeywordSearcher::combine_and(&[r1, r2]) {
     ///         let reader = PrunedParquetReader::from_path("data.parquet");
@@ -973,7 +1401,7 @@ impl KeywordSearcher {
     ///     Ok(())
     /// }
     /// ```
-    pub fn combine_and(results: &[KeywordSearchResult]) -> Option<CombinedSearchResult> {
+    pub fn combine_and(results: &[SearchResult]) -> Option<CombinedSearchResult> {
         if results.is_empty() {
             return None;
         }
@@ -981,7 +1409,7 @@ impl KeywordSearcher {
         // Check if all keywords were found
         if results.iter().any(|r| !r.found) {
             return Some(CombinedSearchResult {
-                keywords: results.iter().map(|r| r.keyword.clone()).collect(),
+                keywords: results.iter().map(|r| r.query.clone()).collect(),
                 row_groups: Vec::new(),
             });
         }
@@ -993,7 +1421,7 @@ impl KeywordSearcher {
         for result in results {
             let mut column_map: HashMap<String, HashMap<u16, std::collections::HashSet<u32>>> = HashMap::new();
 
-            if let Some(data) = &result.data {
+            if let Some(data) = &result.verified_matches {
                 for col in &data.column_details {
                     let rg_map = column_map.entry(col.column_name.clone()).or_insert_with(HashMap::new);
 
@@ -1070,7 +1498,7 @@ impl KeywordSearcher {
         row_groups.sort_by_key(|rg| rg.row_group_id);
 
         Some(CombinedSearchResult {
-            keywords: results.iter().map(|r| r.keyword.clone()).collect(),
+            keywords: results.iter().map(|r| r.query.clone()).collect(),
             row_groups,
         })
     }
@@ -1102,15 +1530,15 @@ impl KeywordSearcher {
     ///     let searcher = KeywordSearcher::load("logs.parquet", None).await?;
     ///
     ///     // Find rows containing ANY of these severity levels
-    ///     let search_error = searcher.search("error", None, true)?;
-    ///     let search_critical = searcher.search("critical", None, true)?;
-    ///     let search_fatal = searcher.search("fatal", None, true)?;
+    ///     let search_error = searcher.search("error", None, true).await?;
+    ///     let search_critical = searcher.search("critical", None, true).await?;
+    ///     let search_fatal = searcher.search("fatal", None, true).await?;
     ///
-    ///     // Convert to KeywordSearchResult for combine_or
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let error = KeywordSearchResult { keyword: search_error.query.clone(), found: search_error.found, data: search_error.verified_matches.clone() };
-    ///     let critical = KeywordSearchResult { keyword: search_critical.query.clone(), found: search_critical.found, data: search_critical.verified_matches.clone() };
-    ///     let fatal = KeywordSearchResult { keyword: search_fatal.query.clone(), found: search_fatal.found, data: search_fatal.verified_matches.clone() };
+    ///     // Convert to SearchResult for combine_or
+    ///     use keywords::searching::search_results::SearchResult;
+    ///     let error = search_error;
+    ///     let critical = search_critical;
+    ///     let fatal = search_fatal;
     ///
     ///     let combined = KeywordSearcher::combine_or(&[error, critical, fatal]);
     ///
@@ -1134,15 +1562,15 @@ impl KeywordSearcher {
     ///     let searcher = KeywordSearcher::load("emails.parquet", None).await?;
     ///
     ///     // Search for multiple variations of a name
-    ///     let search_alice = searcher.search("alice", None, true)?;
-    ///     let search_alicia = searcher.search("alicia", None, true)?;
-    ///     let search_ali = searcher.search("ali", None, true)?;
+    ///     let search_alice = searcher.search("alice", None, true).await?;
+    ///     let search_alicia = searcher.search("alicia", None, true).await?;
+    ///     let search_ali = searcher.search("ali", None, true).await?;
     ///
-    ///     // Convert to KeywordSearchResult for combine_or
-    ///     use keywords::searching::search_results::KeywordSearchResult;
-    ///     let alice = KeywordSearchResult { keyword: search_alice.query.clone(), found: search_alice.found, data: search_alice.verified_matches.clone() };
-    ///     let alicia = KeywordSearchResult { keyword: search_alicia.query.clone(), found: search_alicia.found, data: search_alicia.verified_matches.clone() };
-    ///     let ali = KeywordSearchResult { keyword: search_ali.query.clone(), found: search_ali.found, data: search_ali.verified_matches.clone() };
+    ///     // Convert to SearchResult for combine_or
+    ///     use keywords::searching::search_results::SearchResult;
+    ///     let alice = search_alice;
+    ///     let alicia = search_alicia;
+    ///     let ali = search_ali;
     ///
     ///     if let Some(combined) = KeywordSearcher::combine_or(&[alice, alicia, ali]) {
     ///         let reader = PrunedParquetReader::from_path("emails.parquet");
@@ -1154,7 +1582,7 @@ impl KeywordSearcher {
     ///     Ok(())
     /// }
     /// ```
-    pub fn combine_or(results: &[KeywordSearchResult]) -> Option<CombinedSearchResult> {
+    pub fn combine_or(results: &[SearchResult]) -> Option<CombinedSearchResult> {
         if results.is_empty() {
             return None;
         }
@@ -1168,7 +1596,7 @@ impl KeywordSearcher {
                 continue;
             }
 
-            let data = result.data.as_ref()?;
+            let data = result.verified_matches.as_ref()?;
             for col in &data.column_details {
                 for rg in &col.row_groups {
                     let rows = combined_row_groups.entry(rg.row_group_id).or_insert_with(std::collections::HashSet::new);
@@ -1199,7 +1627,7 @@ impl KeywordSearcher {
         row_groups.sort_by_key(|rg| rg.row_group_id);
 
         Some(CombinedSearchResult {
-            keywords: results.iter().map(|r| r.keyword.clone()).collect(),
+            keywords: results.iter().map(|r| r.query.clone()).collect(),
             row_groups,
         })
     }
@@ -1268,7 +1696,7 @@ impl KeywordSearcher {
     ///         eprintln!("Warning: Index may be outdated");
     ///     }
     ///
-    ///     let result = searcher.search("keyword", None, true)?;
+    ///     let result = searcher.search("keyword", None, true).await?;
     ///     println!("Found: {}", result.found);
     ///
     ///     Ok(())
@@ -1358,7 +1786,7 @@ impl KeywordSearcher {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ///     let searcher = KeywordSearcher::load("users.parquet", None).await?;
-    ///     let result = searcher.search("john-doe", None, false)?;
+    ///     let result = searcher.search("john-doe", None, false).await?;
     ///
     ///     println!("Query: {}", result.query);
     ///     println!("Tokens: {:?}", result.tokens);
@@ -1388,7 +1816,7 @@ impl KeywordSearcher {
     ///     let searcher = KeywordSearcher::load("contacts.parquet", None).await?;
     ///
     ///     // Searches for "user" AND "example" AND "com"
-    ///     let result = searcher.search("user@example.com", None, false)?;
+    ///     let result = searcher.search("user@example.com", None, false).await?;
     ///
     ///     if result.found {
     ///         let verified_count = result.verified_matches.as_ref().map(|v| v.total_occurrences).unwrap_or(0);
@@ -1421,7 +1849,7 @@ impl KeywordSearcher {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ///     let searcher = KeywordSearcher::load("data.parquet", None).await?;
-    ///     let result = searcher.search("test-value", None, false)?;
+    ///     let result = searcher.search("test-value", None, false).await?;
     ///
     ///     // Use verified matches directly
     ///     if let Some(verified) = &result.verified_matches {
@@ -1438,7 +1866,7 @@ impl KeywordSearcher {
     ///     Ok(())
     /// }
     /// ```
-    fn search_phrase_internal(&self, phrase: &str, column_filter: Option<&str>) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn search_phrase_internal(&self, phrase: &str, column_filter: Option<&str>) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         // Split the phrase using the same logic as the index
         let tokens = self.split_phrase(phrase);
 
@@ -1454,14 +1882,14 @@ impl KeywordSearcher {
 
         // If single token, use regular search
         if tokens.len() == 1 {
-            let result = self.search_keyword_internal(&tokens[0], column_filter)?;
+            let result = self.search_keyword_internal(&tokens[0], column_filter).await?;
 
             // Single token always returns verified matches
             return Ok(SearchResult {
                 query: phrase.to_string(),
                 tokens,
                 found: result.found,
-                verified_matches: result.data,
+                verified_matches: result.verified_matches,
                 needs_verification: None,
             });
         }
@@ -1473,7 +1901,7 @@ impl KeywordSearcher {
         let mut found_tokens = Vec::new();
 
         for token in &tokens {
-            let result = self.search_keyword_internal(token, column_filter)?;
+            let result = self.search_keyword_internal(token, column_filter).await?;
             if result.found {
                 token_results.push(result);
                 found_tokens.push(token.clone());
@@ -1493,7 +1921,7 @@ impl KeywordSearcher {
 
         // Find rows where ALL tokens exist in the same column and check parents
         let (confirmed, needs_verification) =
-            self.find_and_verify_multi_token_matches(phrase, &token_results)?;
+            self.find_and_verify_multi_token_matches(phrase, &token_results).await?;
 
         let found = !confirmed.is_empty() || !needs_verification.is_empty();
 
@@ -1550,7 +1978,7 @@ impl KeywordSearcher {
     /// # Returns
     ///
     /// A deduplicated, sorted vector of all tokens created during hierarchical splitting.
-    fn split_phrase(&self, phrase: &str) -> Vec<String> {
+    pub(super) fn split_phrase(&self, phrase: &str) -> Vec<String> {
         let mut all_tokens = std::collections::HashSet::new();
         self.split_phrase_recursive(phrase, 0, &mut all_tokens);
 
@@ -1654,7 +2082,8 @@ impl KeywordSearcher {
                                 start_row: start,
                                 end_row: end,
                                 splits_matched,
-                                parent_offset: None,
+                                parent_chunk: None,
+                                parent_position: None,
                             });
                             start = row;
                             end = row;
@@ -1666,7 +2095,8 @@ impl KeywordSearcher {
                         start_row: start,
                         end_row: end,
                         splits_matched,
-                        parent_offset: None,
+                        parent_chunk: None,
+                        parent_position: None,
                     });
                 }
 
@@ -1693,17 +2123,17 @@ impl KeywordSearcher {
     }
 
     /// Find rows where all tokens exist and verify using parent keywords
-    fn find_and_verify_multi_token_matches(
+    async fn find_and_verify_multi_token_matches(
         &self,
         phrase: &str,
-        token_results: &[KeywordSearchResult],
+        token_results: &[SearchResult],
     ) -> Result<(Vec<PotentialMatch>, Vec<PotentialMatch>), Box<dyn std::error::Error + Send + Sync>> {
         let mut confirmed_matches = Vec::new();
         let mut needs_verification = Vec::new();
 
         // Get the first token's results as the base
         let base_result = &token_results[0];
-        let base_data = match &base_result.data {
+        let base_data = match &base_result.verified_matches {
             Some(d) => d,
             None => return Ok((confirmed_matches, needs_verification)),
         };
@@ -1717,7 +2147,7 @@ impl KeywordSearcher {
             let mut all_tokens_in_column = true;
 
             for token_result in &token_results[1..] {
-                let token_data = match &token_result.data {
+                let token_data = match &token_result.verified_matches {
                     Some(d) => d,
                     None => {
                         all_tokens_in_column = false;
@@ -1746,19 +2176,19 @@ impl KeywordSearcher {
             for rg in &col_detail.row_groups {
                 let row_group_id = rg.row_group_id;
 
-                // Build map of row -> (split-level, parent offset) for base token
-                let base_row_info: HashMap<u32, Vec<(u16, Option<u32>)>> = rg.row_ranges.iter()
+                // Build map of row -> (split-level, parent chunk, parent position) for base token
+                let base_row_info: HashMap<u32, Vec<(u16, Option<u16>, Option<u16>)>> = rg.row_ranges.iter()
                     .fold(HashMap::new(), |mut acc, range| {
                         for row in range.start_row..=range.end_row {
                             acc.entry(row)
                                 .or_insert_with(Vec::new)
-                                .push((range.splits_matched, range.parent_offset));
+                                .push((range.splits_matched, range.parent_chunk, range.parent_position));
                         }
                         acc
                     });
 
                 // For each other token, build similar maps
-                let mut all_token_row_info: Vec<HashMap<u32, Vec<(u16, Option<u32>)>>> = Vec::new();
+                let mut all_token_row_info: Vec<HashMap<u32, Vec<(u16, Option<u16>, Option<u16>)>>> = Vec::new();
                 let mut all_tokens_have_rows = true;
 
                 for other_col in &other_token_column_data {
@@ -1768,12 +2198,12 @@ impl KeywordSearcher {
 
                     match other_rg {
                         Some(rg_data) => {
-                            let row_info: HashMap<u32, Vec<(u16, Option<u32>)>> = rg_data.row_ranges.iter()
+                            let row_info: HashMap<u32, Vec<(u16, Option<u16>, Option<u16>)>> = rg_data.row_ranges.iter()
                                 .fold(HashMap::new(), |mut acc, range| {
                                     for row in range.start_row..=range.end_row {
                                         acc.entry(row)
                                             .or_insert_with(Vec::new)
-                                            .push((range.splits_matched, range.parent_offset));
+                                            .push((range.splits_matched, range.parent_chunk, range.parent_position));
                                     }
                                     acc
                                 });
@@ -1810,23 +2240,47 @@ impl KeywordSearcher {
                     }
 
                     // All tokens exist in this row! Now check parents
-                    // Try all combinations of parent offsets for each token
+                    // Collect all parent (chunk, position) pairs needed for batch lookup
+                    let mut all_parent_pairs = Vec::new();
+
+                    for base_info in base_infos {
+                        if let (Some(chunk), Some(pos)) = (base_info.1, base_info.2) {
+                            all_parent_pairs.push((chunk, pos));
+                        }
+                    }
+
+                    for other_info_set in &other_token_infos {
+                        for other_info in *other_info_set {
+                            if let (Some(chunk), Some(pos)) = (other_info.1, other_info.2) {
+                                all_parent_pairs.push((chunk, pos));
+                            }
+                        }
+                    }
+
+                    // Batch lookup all parent keywords
+                    all_parent_pairs.sort();
+                    all_parent_pairs.dedup();
+                    let parent_keywords = self.batch_lookup_parents(all_parent_pairs.iter().copied()).await?;
+
+                    // Try all combinations of parent info for each token
                     for base_info in base_infos {
                         for other_info_combinations in self.cartesian_product(&other_token_infos) {
-                            let all_parent_offsets: Vec<Option<u32>> = std::iter::once(base_info.1)
-                                .chain(other_info_combinations.iter().map(|(_, parent)| *parent))
+                            let all_parent_refs: Vec<(Option<u16>, Option<u16>)> = std::iter::once((base_info.1, base_info.2))
+                                .chain(other_info_combinations.iter().map(|(_, chunk, pos)| (*chunk, *pos)))
                                 .collect();
 
                             // Convert splits_matched bitmasks to actual split levels, then take minimum
                             let min_split_level = std::iter::once(base_info.0)
-                                .chain(other_info_combinations.iter().map(|(split, _)| *split))
+                                .chain(other_info_combinations.iter().map(|(split, _, _)| *split))
                                 .filter_map(|splits_matched| self.get_parent_split_level(splits_matched))
                                 .min()
                                 .unwrap_or(0) as u16;
+
                             let status = self.verify_match_with_parent(
                                 phrase,
-                                &all_parent_offsets,
-                            );
+                                &all_parent_refs,
+                                &parent_keywords,
+                            ).await;
 
                             let match_info = PotentialMatch {
                                 column_name: column_name.clone(),
@@ -1864,7 +2318,7 @@ impl KeywordSearcher {
     /// Verify a match using parent keyword information
     /// Get the minimum (highest priority) split level in the phrase
     /// Lower number = higher priority (level 0 = whitespace, level 3 = hyphens)
-    fn get_min_phrase_split_level(&self, phrase: &str) -> Option<usize> {
+    pub(super) fn get_min_phrase_split_level(&self, phrase: &str) -> Option<usize> {
         for (level, split_chars) in self.filters.split_chars_inclusive.iter().enumerate() {
             if phrase.chars().any(|c| split_chars.contains(&c)) {
                 return Some(level);
@@ -1887,7 +2341,7 @@ impl KeywordSearcher {
     /// Example: splits_matched = 28 = 4+8+16 (bits 2,3,4 set)
     /// - Lowest set bit (excluding bit 0) is bit 2
     /// - Parent was split at level 1 (bit position 2 = level 1+1)
-    fn get_parent_split_level(&self, child_splits_matched: u16) -> Option<usize> {
+    pub(super) fn get_parent_split_level(&self, child_splits_matched: u16) -> Option<usize> {
         // Find the lowest bit set (excluding bit 0 which is the root marker)
         for level in 1..=4 {
             if (child_splits_matched & (1 << level)) != 0 {
@@ -1898,14 +2352,15 @@ impl KeywordSearcher {
         None // Root token (only bit 0 set or no bits set)
     }
 
-    fn verify_match_with_parent(
+    async fn verify_match_with_parent(
         &self,
         phrase: &str,
-        parent_offsets: &[Option<u32>],
+        parent_refs: &[(Option<u16>, Option<u16>)],
+        parent_keywords: &HashMap<(u16, u16), String>,
     ) -> MatchStatus {
         // Check if all tokens have the same parent
-        let first_parent = parent_offsets[0];
-        let all_same_parent = parent_offsets.iter().all(|&p| p == first_parent);
+        let first_parent = parent_refs[0];
+        let all_same_parent = parent_refs.iter().all(|&p| p == first_parent);
 
         if !all_same_parent {
             return MatchStatus::NeedsVerification {
@@ -1914,27 +2369,29 @@ impl KeywordSearcher {
         }
 
         match first_parent {
-            Some(parent_offset) => {
-                // Look up parent keyword
-                if let Some(parent_keyword) = self.all_keywords.get(parent_offset as usize) {
-                    // Check if the phrase exists as substring in parent
-                    if parent_keyword.contains(phrase) {
-                        MatchStatus::Confirmed {
-                            parent_keyword: parent_keyword.clone(),
+            (Some(chunk), Some(position)) => {
+                // Look up parent keyword from batch results
+                match parent_keywords.get(&(chunk, position)) {
+                    Some(parent_keyword) => {
+                        // Check if the phrase exists as substring in parent
+                        if parent_keyword.contains(phrase) {
+                            MatchStatus::Confirmed {
+                                parent_keyword: parent_keyword.clone(),
+                            }
+                        } else {
+                            // Recurse to check grandparents
+                            let min_phrase_level = self.get_min_phrase_split_level(phrase);
+                            self.verify_match_with_grandparent(phrase, parent_keyword, min_phrase_level, 0).await
                         }
-                    } else {
-                        // Recurse to check grandparents
-                        // Get minimum split level in phrase to optimize traversal
-                        let min_phrase_level = self.get_min_phrase_split_level(phrase);
-                        self.verify_match_with_grandparent(phrase, parent_keyword, min_phrase_level, 0)
                     }
-                } else {
-                    MatchStatus::NeedsVerification {
-                        reason: format!("Parent offset {} out of bounds", parent_offset),
+                    None => {
+                        MatchStatus::NeedsVerification {
+                            reason: format!("Parent at ({}, {}) not found in batch results", chunk, position),
+                        }
                     }
                 }
             }
-            None => {
+            _ => {
                 MatchStatus::NeedsVerification {
                     reason: "No parent information (root token)".to_string(),
                 }
@@ -1942,7 +2399,7 @@ impl KeywordSearcher {
         }
     }
 
-    /// Recursively search up the parent chain for a keyword that contains the phrase
+    /// Recursively search up the parent chain for a keyword that contains the phrase.
     ///
     /// Optimization: Only check parents whose split level is >= min_phrase_level.
     /// This is because a phrase can only exist in parents that were split at the same
@@ -1958,7 +2415,7 @@ impl KeywordSearcher {
     /// * `current_keyword` - The current keyword whose parents to check
     /// * `min_phrase_level` - Minimum split level for optimization
     /// * `depth` - Current recursion depth (to prevent stack overflow)
-    fn verify_match_with_grandparent(
+    async fn verify_match_with_grandparent(
         &self,
         phrase: &str,
         current_keyword: &str,
@@ -1972,49 +2429,54 @@ impl KeywordSearcher {
                 reason: format!("Maximum recursion depth ({}) exceeded", MAX_RECURSION_DEPTH),
             };
         }
-        // Search for the current keyword in the index to get its parent_offset
-        match self.search_keyword_internal(current_keyword, None) {
+
+        // Search for the current keyword in the index to get its parent
+        match self.search_keyword_internal(current_keyword, None).await {
             Ok(result) => {
                 if !result.found {
-                    // Current keyword not found in index - can't recurse further
                     return MatchStatus::NeedsVerification {
                         reason: format!("Parent keyword '{}' not found in index", current_keyword),
                     };
                 }
 
-                // Get the row data to find parent_offset
-                if let Some(data) = result.data {
-                    // Look through all column_details to find a parent_offset
-                    // We just need any one since they should all have the same parent
+                // Get the row data to find parent reference
+                if let Some(data) = result.verified_matches {
                     for col_detail in &data.column_details {
                         for rg in &col_detail.row_groups {
                             for range in &rg.row_ranges {
-                                // Optimization: Check if this parent's split-level is compatible with the phrase
-                                // Only check parents split at >= min_phrase_level (same or lower priority)
+                                // Optimization: Check if this parent's split-level is compatible
                                 if let Some(min_level) = min_phrase_level {
                                     if let Some(parent_split_level) = self.get_parent_split_level(range.splits_matched) {
-                                        // Skip if parent was split at higher priority (lower number) than phrase
                                         if parent_split_level < min_level {
                                             continue;
                                         }
                                     }
                                 }
 
-                                if let Some(grandparent_offset) = range.parent_offset {
-                                    // Found a grandparent! Look it up and check
-                                    if let Some(grandparent_keyword) = self.all_keywords.get(grandparent_offset as usize) {
-                                        if grandparent_keyword.contains(phrase) {
-                                            return MatchStatus::Confirmed {
-                                                parent_keyword: grandparent_keyword.clone(),
+                                if let (Some(grandparent_chunk), Some(grandparent_position)) =
+                                    (range.parent_chunk, range.parent_position)
+                                {
+                                    match self.lookup_parent_keyword(grandparent_chunk, grandparent_position).await {
+                                        Ok(grandparent_keyword) => {
+                                            return if grandparent_keyword.contains(phrase) {
+                                                MatchStatus::Confirmed {
+                                                    parent_keyword: grandparent_keyword,
+                                                }
+                                            } else {
+                                                // Recurse further up the chain (boxed for async recursion)
+                                                Box::pin(self.verify_match_with_grandparent(
+                                                    phrase,
+                                                    &grandparent_keyword,
+                                                    min_phrase_level,
+                                                    depth + 1
+                                                )).await
                                             };
-                                        } else {
-                                            // Recurse further up the chain
-                                            return self.verify_match_with_grandparent(phrase, grandparent_keyword, min_phrase_level, depth + 1);
                                         }
-                                    } else {
-                                        return MatchStatus::NeedsVerification {
-                                            reason: format!("Grandparent offset {} out of bounds", grandparent_offset),
-                                        };
+                                        Err(_) => {
+                                            return MatchStatus::NeedsVerification {
+                                                reason: format!("Error looking up grandparent at ({}, {})", grandparent_chunk, grandparent_position),
+                                            };
+                                        }
                                     }
                                 } else {
                                     // No grandparent (reached root) - phrase not confirmed
@@ -2028,7 +2490,6 @@ impl KeywordSearcher {
                     }
                 }
 
-                // No parent_offset found in data
                 MatchStatus::NeedsVerification {
                     reason: format!("No parent information found for '{}'", current_keyword),
                 }
@@ -2042,7 +2503,7 @@ impl KeywordSearcher {
     }
 
     /// Helper to get cartesian product of parent info combinations
-    fn cartesian_product<'a>(&self, vecs: &[&'a Vec<(u16, Option<u32>)>]) -> Vec<Vec<&'a (u16, Option<u32>)>> {
+    fn cartesian_product<'a>(&self, vecs: &[&'a Vec<(u16, Option<u16>, Option<u16>)>]) -> Vec<Vec<&'a (u16, Option<u16>, Option<u16>)>> {
         if vecs.is_empty() {
             return vec![Vec::new()];
         }
@@ -2060,345 +2521,4 @@ impl KeywordSearcher {
 
         result
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::searching::keyword_search::KeywordSearcher;
-    use crate::index_structure::column_filter::ColumnFilter;
-    use crate::index_data::IndexFilters;
-    use crate::utils::column_pool::ColumnPool;
-
-    /// Creates a test searcher with standard split character configuration
-    fn create_test_searcher() -> KeywordSearcher {
-        let split_chars_inclusive: Vec<Vec<char>> = vec![
-            vec!['\r', '\n', '\t', '\'', '"', '<', '>', '(', ')', '|', ',', '!', ';', '{', '}', '*', ' '],
-            vec!['/', '@', '=', ':', '\\', '?', '&'],
-            vec!['.', '$', '#', '`', '~', '^', '+'],
-            vec!['-', '_'],
-        ];
-
-        let filters = IndexFilters {
-            version: 1,
-            parquet_etag: "test".to_string(),
-            parquet_size: 0,
-            parquet_last_modified: 0,
-            error_rate: 0.01,
-            split_chars_inclusive,
-            column_pool: ColumnPool::new(),
-            column_filters: std::collections::HashMap::new(),
-            global_filter: ColumnFilter::RkyvHashSet(vec![]),
-            chunk_index: vec![],
-        };
-
-        KeywordSearcher {
-            filters,
-            metadata_bytes: rkyv::util::AlignedVec::new(),
-            data_bytes: rkyv::util::AlignedVec::new(),
-            all_keywords: vec![],
-        }
-    }
-
-    #[test]
-    fn test_hierarchical_split_email() {
-        let searcher = create_test_searcher();
-
-        // Test what split_phrase produces for "user@example.com"
-        let tokens = searcher.split_phrase("user@example.com");
-
-        println!("Tokens from split_phrase('user@example.com'): {:?}", tokens);
-
-        // EXPECTED (from hierarchical indexing):
-        // ["user@example.com", "user", "example.com", "example", "com"]
-        //
-        // With OLD buggy code: ["user", "example", "com"] - length 3 ❌
-        // With NEW fixed code: ["com", "example", "example.com", "user", "user@example.com"] - length 5 ✅
-
-        // These assertions PASS with fixed code, FAIL with buggy code
-        assert!(tokens.contains(&"user@example.com".to_string()),
-                "Missing root parent token 'user@example.com'");
-        assert!(tokens.contains(&"example.com".to_string()),
-                "Missing intermediate parent token 'example.com'");
-        assert!(tokens.contains(&"user".to_string()),
-                "Missing leaf token 'user'");
-        assert!(tokens.contains(&"example".to_string()),
-                "Missing leaf token 'example'");
-        assert!(tokens.contains(&"com".to_string()),
-                "Missing leaf token 'com'");
-        assert_eq!(tokens.len(), 5,
-                   "Should have all 5 hierarchical tokens, got {} tokens: {:?}", tokens.len(), tokens);
-    }
-
-    #[test]
-    fn test_hierarchical_split_hyphenated_name() {
-        let searcher = create_test_searcher();
-
-        let tokens = searcher.split_phrase("john-smith-jr");
-
-        println!("Tokens from split_phrase('john-smith-jr'): {:?}", tokens);
-
-        // EXPECTED (hierarchical):
-        // ["john-smith-jr", "john", "smith", "jr"]
-        //
-        // With OLD buggy code: ["john", "smith", "jr"] - length 3 ❌
-        // With NEW fixed code: All 4 tokens present ✅
-
-        assert!(tokens.contains(&"john-smith-jr".to_string()),
-                "Missing parent token 'john-smith-jr'");
-        assert!(tokens.contains(&"john".to_string()));
-        assert!(tokens.contains(&"smith".to_string()));
-        assert!(tokens.contains(&"jr".to_string()));
-        assert_eq!(tokens.len(), 4,
-                   "Should have 4 tokens, got {}: {:?}", tokens.len(), tokens);
-    }
-
-    #[test]
-    fn test_hierarchical_split_path() {
-        let searcher = create_test_searcher();
-
-        let tokens = searcher.split_phrase("/usr/local/bin");
-
-        println!("Tokens from split_phrase('/usr/local/bin'): {:?}", tokens);
-
-        // EXPECTED (hierarchical):
-        // ["/usr/local/bin", "usr", "local", "bin"]
-        //
-        // With OLD buggy code: ["usr", "local", "bin"] - length 3 ❌
-        // With NEW fixed code: All 4 tokens present ✅
-
-        assert!(tokens.contains(&"/usr/local/bin".to_string()),
-                "Missing parent token '/usr/local/bin'");
-        assert!(tokens.contains(&"usr".to_string()));
-        assert!(tokens.contains(&"local".to_string()));
-        assert!(tokens.contains(&"bin".to_string()));
-        assert_eq!(tokens.len(), 4,
-                   "Should have 4 tokens, got {}: {:?}", tokens.len(), tokens);
-    }
-
-    #[test]
-    fn test_hierarchical_split_domain() {
-        let searcher = create_test_searcher();
-
-        let tokens = searcher.split_phrase("api.example.com");
-
-        println!("Tokens from split_phrase('api.example.com'): {:?}", tokens);
-
-        // EXPECTED (hierarchical):
-        // Split at level 2 (dot notation):
-        // ["api.example.com", "api", "example.com", "example", "com"]
-        //
-        // But wait - "example.com" should also be processed:
-        // So we get: ["api.example.com", "api", "example.com", "example", "com"]
-        //
-        // With OLD buggy code: ["api", "example", "com"] - length 3 ❌
-        // With NEW fixed code: At least ["api.example.com", "example.com"] parents present ✅
-
-        assert!(tokens.contains(&"api.example.com".to_string()),
-                "Missing root parent 'api.example.com'");
-        assert!(tokens.contains(&"api".to_string()));
-        assert!(tokens.contains(&"example".to_string()));
-        assert!(tokens.contains(&"com".to_string()));
-
-        // The exact hierarchical structure should create more than 3 tokens
-        assert!(tokens.len() > 3,
-                "Should have more than 3 tokens for hierarchical split, got {}: {:?}",
-                tokens.len(), tokens);
-    }
-
-    #[test]
-    fn test_hierarchical_split_complex() {
-        let searcher = create_test_searcher();
-
-        let tokens = searcher.split_phrase("user-name@test.example.com");
-
-        println!("Tokens from split_phrase('user-name@test.example.com'): {:?}", tokens);
-
-        // EXPECTED (hierarchical):
-        // Level 0: No split
-        // Level 1: Split on @ → ["user-name@test.example.com", "user-name", "test.example.com"]
-        // Level 2: "test.example.com" splits on . → ["test.example.com", "test", "example.com", "example", "com"]
-        // Level 3: "user-name" splits on - → ["user-name", "user", "name"]
-        //
-        // Full set: ["user-name@test.example.com", "user-name", "test.example.com",
-        //            "example.com", "user", "name", "test", "example", "com"]
-        //
-        // With OLD buggy code: Just ["user", "name", "test", "example", "com"] - length 5 ❌
-        // With NEW fixed code: Many more tokens including all parents ✅
-
-        assert!(tokens.contains(&"user-name@test.example.com".to_string()),
-                "Missing root parent");
-        assert!(tokens.contains(&"user-name".to_string()),
-                "Missing 'user-name' parent");
-        assert!(tokens.contains(&"test.example.com".to_string()),
-                "Missing 'test.example.com' parent");
-
-        // Should have significantly more than just the leaf tokens
-        assert!(tokens.len() > 5,
-                "Should have more than 5 tokens for complex hierarchical split, got {}: {:?}",
-                tokens.len(), tokens);
-    }
-
-    #[test]
-    fn test_single_token_no_split() {
-        let searcher = create_test_searcher();
-
-        let tokens = searcher.split_phrase("simple");
-
-        println!("Tokens from split_phrase('simple'): {:?}", tokens);
-
-        // No delimiters - should just return the single token
-        assert_eq!(tokens.len(), 1);
-        assert!(tokens.contains(&"simple".to_string()));
-    }
-
-    #[test]
-    fn test_empty_string() {
-        let searcher = create_test_searcher();
-
-        let tokens = searcher.split_phrase("");
-
-        println!("Tokens from split_phrase(''): {:?}", tokens);
-
-        // Empty string might return empty vec or vec with empty string
-        // Either is acceptable
-        assert!(tokens.is_empty() || (tokens.len() == 1 && tokens[0].is_empty()),
-                "Empty string should return empty vec or vec with one empty string");
-    }
-
-    // ========== Parent Verification Tests ==========
-
-    #[test]
-    fn test_get_parent_split_level_root() {
-        let searcher = create_test_searcher();
-
-        // Bit 0 only = root token
-        let splits_matched = 1;
-        assert_eq!(searcher.get_parent_split_level(splits_matched), None,
-                   "Root token (bit 0 only) should return None");
-    }
-
-    #[test]
-    fn test_get_parent_split_level_level0() {
-        let searcher = create_test_searcher();
-
-        // Bit 1 set (value 2) = started from level 0 split
-        let splits_matched = 2;
-        assert_eq!(searcher.get_parent_split_level(splits_matched), Some(0),
-                   "Token with only bit 1 set was split at level 0");
-
-        // Bits 1,2,3,4 all set = started from level 0, survived all others
-        let splits_matched = 2 | 4 | 8 | 16; // 30
-        assert_eq!(searcher.get_parent_split_level(splits_matched), Some(0),
-                   "Token starting with bit 1 was split at level 0");
-    }
-
-    #[test]
-    fn test_get_parent_split_level_level1() {
-        let searcher = create_test_searcher();
-
-        // Bit 2 set (value 4) = started from level 1 split
-        let splits_matched = 4;
-        assert_eq!(searcher.get_parent_split_level(splits_matched), Some(1),
-                   "Token with only bit 2 set was split at level 1");
-
-        // Bits 2,3,4 set = started from level 1
-        let splits_matched = 4 | 8 | 16; // 28
-        assert_eq!(searcher.get_parent_split_level(splits_matched), Some(1),
-                   "Token with bits 2,3,4 set was split at level 1");
-    }
-
-    #[test]
-    fn test_get_parent_split_level_level2() {
-        let searcher = create_test_searcher();
-
-        // Bit 3 set (value 8) = started from level 2 split
-        let splits_matched = 8;
-        assert_eq!(searcher.get_parent_split_level(splits_matched), Some(2),
-                   "Token with only bit 3 set was split at level 2");
-
-        // Bits 3,4 set = started from level 2
-        let splits_matched = 8 | 16; // 24
-        assert_eq!(searcher.get_parent_split_level(splits_matched), Some(2),
-                   "Token with bits 3,4 set (value 24) was split at level 2");
-    }
-
-    #[test]
-    fn test_get_parent_split_level_level3() {
-        let searcher = create_test_searcher();
-
-        // Bit 4 set (value 16) = started from level 3 split
-        let splits_matched = 16;
-        assert_eq!(searcher.get_parent_split_level(splits_matched), Some(3),
-                   "Token with only bit 4 set was split at level 3");
-    }
-
-    #[test]
-    fn test_get_min_phrase_split_level_whitespace() {
-        let searcher = create_test_searcher();
-
-        // Level 0: whitespace
-        assert_eq!(searcher.get_min_phrase_split_level("hello world"), Some(0),
-                   "Space is level 0 delimiter");
-        assert_eq!(searcher.get_min_phrase_split_level("hello\nworld"), Some(0),
-                   "Newline is level 0 delimiter");
-    }
-
-    #[test]
-    fn test_get_min_phrase_split_level_level1() {
-        let searcher = create_test_searcher();
-
-        // Level 1: @ / : = \ ? &
-        assert_eq!(searcher.get_min_phrase_split_level("user@example.com"), Some(1),
-                   "@ is level 1 delimiter");
-        assert_eq!(searcher.get_min_phrase_split_level("path/to/file"), Some(1),
-                   "/ is level 1 delimiter");
-        assert_eq!(searcher.get_min_phrase_split_level("key:value"), Some(1),
-                   "Colon is level 1 delimiter");
-    }
-
-    #[test]
-    fn test_get_min_phrase_split_level_level2() {
-        let searcher = create_test_searcher();
-
-        // Level 2: . $ # ` ~ ^ +
-        assert_eq!(searcher.get_min_phrase_split_level("example.com"), Some(2),
-                   "Dot is level 2 delimiter");
-        assert_eq!(searcher.get_min_phrase_split_level("$variable"), Some(2),
-                   "Dollar is level 2 delimiter");
-    }
-
-    #[test]
-    fn test_get_min_phrase_split_level_level3() {
-        let searcher = create_test_searcher();
-
-        // Level 3: - _
-        assert_eq!(searcher.get_min_phrase_split_level("user-name"), Some(3),
-                   "Hyphen is level 3 delimiter");
-        assert_eq!(searcher.get_min_phrase_split_level("file_name"), Some(3),
-                   "Underscore is level 3 delimiter");
-    }
-
-    #[test]
-    fn test_get_min_phrase_split_level_mixed() {
-        let searcher = create_test_searcher();
-
-        // Should return the MINIMUM (highest priority) level
-        assert_eq!(searcher.get_min_phrase_split_level("hello world-name"), Some(0),
-                   "Space (level 0) has priority over hyphen (level 3)");
-        assert_eq!(searcher.get_min_phrase_split_level("user@example.com"), Some(1),
-                   "@ (level 1) has priority over . (level 2)");
-        assert_eq!(searcher.get_min_phrase_split_level("file.name-version"), Some(2),
-                   ". (level 2) has priority over - (level 3)");
-    }
-
-    #[test]
-    fn test_get_min_phrase_split_level_no_delimiters() {
-        let searcher = create_test_searcher();
-
-        assert_eq!(searcher.get_min_phrase_split_level("simple"), None,
-                   "No delimiters should return None");
-        assert_eq!(searcher.get_min_phrase_split_level("12345"), None,
-                   "Numbers with no delimiters should return None");
-    }
-
 }

@@ -675,54 +675,54 @@ mod comprehensive_large_file_tests {
         println!("---------------------------------------------------");
 
         // Level 0 delimiter test (space, pipe, semicolon)
-        let result = searcher.search("level0", None, true).expect("Search failed");
+        let result = searcher.search("level0", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'level0' keyword");
         println!("✓ Found 'level0' (split by level 0 delimiters)");
 
-        let result = searcher.search("space", None, true).expect("Search failed");
+        let result = searcher.search("space", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'space' keyword");
         println!("✓ Found 'space' (split by level 0 delimiters)");
 
-        let result = searcher.search("pipe", None, true).expect("Search failed");
+        let result = searcher.search("pipe", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'pipe' keyword");
         println!("✓ Found 'pipe' (split by level 0 delimiters)");
 
         // Level 1 delimiter test (slash, colon, at, equals)
-        let result = searcher.search("level1", None, true).expect("Search failed");
+        let result = searcher.search("level1", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'level1' keyword");
         println!("✓ Found 'level1' (split by level 1 delimiters)");
 
-        let result = searcher.search("slash", None, true).expect("Search failed");
+        let result = searcher.search("slash", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'slash' keyword");
         println!("✓ Found 'slash' (split by level 1 delimiters)");
 
-        let result = searcher.search("at", None, true).expect("Search failed");
+        let result = searcher.search("at", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'at' keyword");
         println!("✓ Found 'at' (split by level 1 delimiters)");
 
         // Level 2 delimiter test (dot, dollar, hash)
-        let result = searcher.search("level2", None, true).expect("Search failed");
+        let result = searcher.search("level2", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'level2' keyword");
         println!("✓ Found 'level2' (split by level 2 delimiters)");
 
-        let result = searcher.search("dot", None, true).expect("Search failed");
+        let result = searcher.search("dot", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'dot' keyword");
         println!("✓ Found 'dot' (split by level 2 delimiters)");
 
-        let result = searcher.search("dollar", None, true).expect("Search failed");
+        let result = searcher.search("dollar", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'dollar' keyword");
         println!("✓ Found 'dollar' (split by level 2 delimiters)");
 
         // Level 3 delimiter test (dash, underscore)
-        let result = searcher.search("level3", None, true).expect("Search failed");
+        let result = searcher.search("level3", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'level3' keyword");
         println!("✓ Found 'level3' (split by level 3 delimiters)");
 
-        let result = searcher.search("dash", None, true).expect("Search failed");
+        let result = searcher.search("dash", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'dash' keyword");
         println!("✓ Found 'dash' (split by level 3 delimiters)");
 
-        let result = searcher.search("underscore", None, true).expect("Search failed");
+        let result = searcher.search("underscore", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'underscore' keyword");
         println!("✓ Found 'underscore' (split by level 3 delimiters)");
 
@@ -735,20 +735,20 @@ mod comprehensive_large_file_tests {
         println!("----------------------------------------------");
 
         // Email components
-        let result = searcher.search("user", None, true).expect("Search failed");
+        let result = searcher.search("user", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'user' from email");
         println!("✓ Found 'user' (from user@example.com)");
 
-        let result = searcher.search("example", None, true).expect("Search failed");
+        let result = searcher.search("example", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'example' from email");
         println!("✓ Found 'example' (from user@example.com)");
 
-        let result = searcher.search("com", None, true).expect("Search failed");
+        let result = searcher.search("com", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'com' from email");
         println!("✓ Found 'com' (from user@example.com)");
 
         // Phrase search for partial email
-        let result = searcher.search("example.com", None, false).expect("Search failed");
+        let result = searcher.search("example.com", None, false).await.expect("Search failed");
         assert!(result.found, "Should find phrase 'example.com'");
         println!("✓ Found phrase 'example.com' (with parent verification)");
 
@@ -766,40 +766,40 @@ mod comprehensive_large_file_tests {
 
         // URL is at row 249,999 (last row of RG0), column 1
         // URL components at various levels
-        let result = searcher.search("https", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("https", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "https", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'https' protocol at row {}, RG 0", ROWS_PER_GROUP - 1);
 
-        let result = searcher.search("api", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("api", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "api", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'api' subdomain at correct position");
 
-        let result = searcher.search("service", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("service", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "service", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'service' subdomain at correct position");
 
-        let result = searcher.search("v1", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("v1", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "v1", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'v1' path component at correct position");
 
-        let result = searcher.search("users", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("users", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "users", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'users' path component at correct position");
 
-        let result = searcher.search("key", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("key", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "key", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'key' query parameter at correct position");
 
-        let result = searcher.search("sort", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("sort", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "sort", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'sort' query parameter at correct position");
 
-        let result = searcher.search("desc", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("desc", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "desc", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'desc' query value at correct position");
 
         // Phrase searches for URL components
-        let result = searcher.search("api.service", Some("col_1"), false).expect("Search failed");
+        let result = searcher.search("api.service", Some("col_1"), false).await.expect("Search failed");
         assert_found_in_row(&result, "api.service", "col_1", ROWS_PER_GROUP - 1, false);
         println!("✓ Found phrase 'api.service' at correct position (hierarchical match)");
 
@@ -816,24 +816,24 @@ mod comprehensive_large_file_tests {
         println!("-------------------------");
 
         // Unix path at row 375,000 (middle of RG1), column 3
-        let result = searcher.search("usr", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("usr", Some("col_3"), true).await.expect("Search failed");
         assert_found_in_row(&result, "usr", "col_3", ROWS_PER_GROUP + 125_000, true);
         println!("✓ Found 'usr' directory at row {}, RG 1", ROWS_PER_GROUP + 125_000);
 
-        let result = searcher.search("local", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("local", Some("col_3"), true).await.expect("Search failed");
         assert_found_in_row(&result, "local", "col_3", ROWS_PER_GROUP + 125_000, true);
         println!("✓ Found 'local' directory at correct position");
 
-        let result = searcher.search("bin", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("bin", Some("col_3"), true).await.expect("Search failed");
         assert_found_in_row(&result, "bin", "col_3", ROWS_PER_GROUP + 125_000, true);
         println!("✓ Found 'bin' directory at correct position");
 
-        let result = searcher.search("python3", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("python3", Some("col_3"), true).await.expect("Search failed");
         assert_found_in_row(&result, "python3", "col_3", ROWS_PER_GROUP + 125_000, true);
         println!("✓ Found 'python3' executable at correct position");
 
         // Phrase search for path
-        let result = searcher.search("/usr/local", Some("col_3"), false).expect("Search failed");
+        let result = searcher.search("/usr/local", Some("col_3"), false).await.expect("Search failed");
         assert_found_in_row(&result, "/usr/local", "col_3", ROWS_PER_GROUP + 125_000, false);
         println!("✓ Found phrase '/usr/local' at correct position (path hierarchy)");
 
@@ -842,19 +842,19 @@ mod comprehensive_large_file_tests {
         println!("✓ Verified '/usr/local' exists in actual parquet data");
 
         // Filename with multiple delimiters at row 250,000 (first row of RG1), column 2
-        let result = searcher.search("data", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("data", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "data", "col_2", ROWS_PER_GROUP, true);
         println!("✓ Found 'data' at row {}, RG 1", ROWS_PER_GROUP);
 
-        let result = searcher.search("pipeline", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("pipeline", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "pipeline", "col_2", ROWS_PER_GROUP, true);
         println!("✓ Found 'pipeline' at correct position");
 
-        let result = searcher.search("config", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("config", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "config", "col_2", ROWS_PER_GROUP, true);
         println!("✓ Found 'config' at correct position");
 
-        let result = searcher.search("json", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("json", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "json", "col_2", ROWS_PER_GROUP, true);
         println!("✓ Found 'json' extension at correct position");
 
@@ -866,7 +866,7 @@ mod comprehensive_large_file_tests {
         println!("TEST 5: Consecutive pattern search (10,000 rows)");
         println!("------------------------------------------------");
 
-        let result = searcher.search("CONSECUTIVE", None, true).expect("Search failed");
+        let result = searcher.search("CONSECUTIVE", None, true).await.expect("Search failed");
         assert!(result.found, "Should find consecutive pattern");
         if let Some(verified) = &result.verified_matches {
             println!("✓ Found 'CONSECUTIVE' pattern");
@@ -895,17 +895,17 @@ mod comprehensive_large_file_tests {
             println!("  ✓ Verified 10,000 consecutive rows in row group 0");
         }
 
-        let result = searcher.search("PATTERN", None, true).expect("Search failed");
+        let result = searcher.search("PATTERN", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'PATTERN' keyword");
         println!("✓ Found 'PATTERN' keyword from consecutive test");
 
-        let result = searcher.search("TEST", None, true).expect("Search failed");
+        let result = searcher.search("TEST", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'TEST' keyword");
         println!("✓ Found 'TEST' keyword from consecutive test");
 
         // Phrase search for full pattern
         let result = searcher.search("CONSECUTIVE_PATTERN_TEST", None, false)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(result.found, "Should find full consecutive pattern phrase");
         println!("✓ Found full phrase 'CONSECUTIVE_PATTERN_TEST'");
 
@@ -921,7 +921,7 @@ mod comprehensive_large_file_tests {
         println!("TEST 6: Non-consecutive pattern search (7,500 sparse rows)");
         println!("----------------------------------------------------------");
 
-        let result = searcher.search("NONCONSECUTIVE", None, true).expect("Search failed");
+        let result = searcher.search("NONCONSECUTIVE", None, true).await.expect("Search failed");
         assert!(result.found, "Should find non-consecutive pattern");
         if let Some(verified) = &result.verified_matches {
             println!("✓ Found 'NONCONSECUTIVE' pattern");
@@ -932,8 +932,7 @@ mod comprehensive_large_file_tests {
 
             // Verify it spans row groups 2, 3, and 4 (rows 500,000-1,249,999)
             let col_detail = verified.column_details.iter()
-                .find(|cd| cd.column_name == "col_5")
-                .expect("Should find col_5");
+                .find(|cd| cd.column_name == "col_5").expect("Should find col_5");
 
             // Row 500,000 is in RG2, rows continue through RG3 and RG4
             assert!(col_detail.row_groups.iter().any(|rg| rg.row_group_id == 2),
@@ -948,7 +947,7 @@ mod comprehensive_large_file_tests {
 
         // Phrase search for full non-consecutive pattern
         let result = searcher.search("NONCONSECUTIVE_PATTERN_TEST", None, false)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(result.found, "Should find full non-consecutive pattern phrase");
         println!("✓ Found full phrase 'NONCONSECUTIVE_PATTERN_TEST'");
 
@@ -966,32 +965,32 @@ mod comprehensive_large_file_tests {
 
         // First row (row 0, row group 0)
         let result = searcher.search("user", Some("col_0"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert_found_in_row(&result, "user", "col_0", 0, true);
         println!("✓ Found 'user' in first row (row 0, row group 0)");
 
         // Last row of file (row 1,249,999, row group 4)
         let result = searcher.search("END", Some("col_3"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert_found_in_row(&result, "END", "col_3", TOTAL_ROWS - 1, true);
         println!("✓ Found 'END' marker in last row (row {}, row group 4)", TOTAL_ROWS - 1);
 
         // Row group boundary tests
         // Last row of row group 0 (row 249,999)
         let result = searcher.search("api", Some("col_1"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert_found_in_row(&result, "api", "col_1", ROWS_PER_GROUP - 1, true);
         println!("✓ Found 'api' at last row of row group 0 (row {})", ROWS_PER_GROUP - 1);
 
         // First row of row group 1 (row 250,000)
         let result = searcher.search("pipeline", Some("col_2"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert_found_in_row(&result, "pipeline", "col_2", ROWS_PER_GROUP, true);
         println!("✓ Found 'pipeline' at first row of row group 1 (row {})", ROWS_PER_GROUP);
 
         // Middle of row group 1 (row 375,000)
         let result = searcher.search("python3", Some("col_3"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert_found_in_row(&result, "python3", "col_3", ROWS_PER_GROUP + 125_000, true);
         println!("✓ Found 'python3' at middle of row group 1 (row {})", ROWS_PER_GROUP + 125_000);
 
@@ -1004,62 +1003,62 @@ mod comprehensive_large_file_tests {
         println!("---------------------------------------");
 
         // SQL query at row 500,001 (RG2), column 5
-        let result = searcher.search("SELECT", Some("col_5"), true).expect("Search failed");
+        let result = searcher.search("SELECT", Some("col_5"), true).await.expect("Search failed");
         assert_found_in_row(&result, "SELECT", "col_5", ROWS_PER_GROUP * 2 + 1, true);
         println!("✓ Found 'SELECT' SQL keyword at row {}, RG 2", ROWS_PER_GROUP * 2 + 1);
 
-        let result = searcher.search("WHERE", Some("col_5"), true).expect("Search failed");
+        let result = searcher.search("WHERE", Some("col_5"), true).await.expect("Search failed");
         assert_found_in_row(&result, "WHERE", "col_5", ROWS_PER_GROUP * 2 + 1, true);
         println!("✓ Found 'WHERE' clause at correct position");
 
-        let result = searcher.search("status", Some("col_5"), true).expect("Search failed");
+        let result = searcher.search("status", Some("col_5"), true).await.expect("Search failed");
         assert_found_in_row(&result, "status", "col_5", ROWS_PER_GROUP * 2 + 1, true);
         println!("✓ Found 'status' column name at correct position");
 
-        let result = searcher.search("active", Some("col_5"), true).expect("Search failed");
+        let result = searcher.search("active", Some("col_5"), true).await.expect("Search failed");
         assert_found_in_row(&result, "active", "col_5", ROWS_PER_GROUP * 2 + 1, true);
         println!("✓ Found 'active' value at correct position");
 
         // JSON structure at row 625,000 (RG2), column 6
-        let result = searcher.search("user", Some("col_6"), true).expect("Search failed");
+        let result = searcher.search("user", Some("col_6"), true).await.expect("Search failed");
         assert_found_in_row(&result, "user", "col_6", ROWS_PER_GROUP * 2 + 125_000, true);
         println!("✓ Found JSON 'user' key at row {}, RG 2", ROWS_PER_GROUP * 2 + 125_000);
 
-        let result = searcher.search("org", Some("col_6"), true).expect("Search failed");
+        let result = searcher.search("org", Some("col_6"), true).await.expect("Search failed");
         assert_found_in_row(&result, "org", "col_6", ROWS_PER_GROUP * 2 + 125_000, true);
         println!("✓ Found 'org' domain at correct position");
 
         // Git URL at row 749,999 (last row RG2), column 7
-        let result = searcher.search("github", Some("col_7"), true).expect("Search failed");
+        let result = searcher.search("github", Some("col_7"), true).await.expect("Search failed");
         assert_found_in_row(&result, "github", "col_7", ROWS_PER_GROUP * 3 - 1, true);
         println!("✓ Found 'github' domain at row {}, RG 2", ROWS_PER_GROUP * 3 - 1);
 
-        let result = searcher.search("repo", Some("col_7"), true).expect("Search failed");
+        let result = searcher.search("repo", Some("col_7"), true).await.expect("Search failed");
         assert_found_in_row(&result, "repo", "col_7", ROWS_PER_GROUP * 3 - 1, true);
         println!("✓ Found 'repo' name at correct position");
 
-        let result = searcher.search("git", Some("col_7"), true).expect("Search failed");
+        let result = searcher.search("git", Some("col_7"), true).await.expect("Search failed");
         assert_found_in_row(&result, "git", "col_7", ROWS_PER_GROUP * 3 - 1, true);
         println!("✓ Found 'git' extension at correct position");
 
         // Rust function signature at row 875,000 (RG3), column 9
-        let result = searcher.search("base64", Some("col_9"), true).expect("Search failed");
+        let result = searcher.search("base64", Some("col_9"), true).await.expect("Search failed");
         assert_found_in_row(&result, "base64", "col_9", ROWS_PER_GROUP * 3 + 125_000, true);
         println!("✓ Found 'base64' module at row {}, RG 3", ROWS_PER_GROUP * 3 + 125_000);
 
-        let result = searcher.search("encode", Some("col_9"), true).expect("Search failed");
+        let result = searcher.search("encode", Some("col_9"), true).await.expect("Search failed");
         assert_found_in_row(&result, "encode", "col_9", ROWS_PER_GROUP * 3 + 125_000, true);
         println!("✓ Found 'encode' function at correct position");
 
-        let result = searcher.search("Result", Some("col_9"), true).expect("Search failed");
+        let result = searcher.search("Result", Some("col_9"), true).await.expect("Search failed");
         assert_found_in_row(&result, "Result", "col_9", ROWS_PER_GROUP * 3 + 125_000, true);
         println!("✓ Found 'Result' type at correct position");
 
-        let result = searcher.search("String", None, true).expect("Search failed");
+        let result = searcher.search("String", None, true).await.expect("Search failed");
         assert!(result.found, "Should find String type");
         println!("✓ Found 'String' type");
 
-        let result = searcher.search("Error", None, true).expect("Search failed");
+        let result = searcher.search("Error", None, true).await.expect("Search failed");
         assert!(result.found, "Should find Error type");
         println!("✓ Found 'Error' type");
 
@@ -1072,36 +1071,36 @@ mod comprehensive_large_file_tests {
         println!("--------------------------------------------");
 
         // ISO timestamp at row 1,125,000 (RG4), column 2
-        let result = searcher.search("2024", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("2024", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "2024", "col_2", ROWS_PER_GROUP * 4 + 125_000, true);
         println!("✓ Found '2024' year at row {}, RG 4", ROWS_PER_GROUP * 4 + 125_000);
 
-        let result = searcher.search("01", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("01", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "01", "col_2", ROWS_PER_GROUP * 4 + 125_000, true);
         println!("✓ Found '01' month at correct position");
 
-        let result = searcher.search("10", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("10", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "10", "col_2", ROWS_PER_GROUP * 4 + 125_000, true);
         println!("✓ Found '10' hour at correct position");
 
-        let result = searcher.search("123Z", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("123Z", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "123Z", "col_2", ROWS_PER_GROUP * 4 + 125_000, true);
         println!("✓ Found '123Z' milliseconds with timezone at correct position");
 
         // IP address with port at row 750,000 (RG3), column 8
-        let result = searcher.search("192", Some("col_8"), true).expect("Search failed");
+        let result = searcher.search("192", Some("col_8"), true).await.expect("Search failed");
         assert_found_in_row(&result, "192", "col_8", ROWS_PER_GROUP * 3, true);
         println!("✓ Found '192' IP octet at row {}, RG 3", ROWS_PER_GROUP * 3);
 
-        let result = searcher.search("168", Some("col_8"), true).expect("Search failed");
+        let result = searcher.search("168", Some("col_8"), true).await.expect("Search failed");
         assert_found_in_row(&result, "168", "col_8", ROWS_PER_GROUP * 3, true);
         println!("✓ Found '168' IP octet at correct position");
 
-        let result = searcher.search("8080", Some("col_8"), true).expect("Search failed");
+        let result = searcher.search("8080", Some("col_8"), true).await.expect("Search failed");
         assert_found_in_row(&result, "8080", "col_8", ROWS_PER_GROUP * 3, true);
         println!("✓ Found '8080' port at correct position");
 
-        let result = searcher.search("endpoint", Some("col_8"), true).expect("Search failed");
+        let result = searcher.search("endpoint", Some("col_8"), true).await.expect("Search failed");
         assert_found_in_row(&result, "endpoint", "col_8", ROWS_PER_GROUP * 3, true);
         println!("✓ Found 'endpoint' path at correct position");
 
@@ -1115,7 +1114,7 @@ mod comprehensive_large_file_tests {
 
         // Test hierarchical parent-child-grandchild
         let result = searcher.search("parent_child_grandchild", Some("col_2"), false)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(result.found, "Should find full hierarchical phrase");
         println!("✓ Found 'parent_child_grandchild' (hierarchical)");
 
@@ -1124,21 +1123,21 @@ mod comprehensive_large_file_tests {
         println!("✓ Verified 'parent_child_grandchild' exists in actual parquet data");
 
         // Search for individual parts
-        let result = searcher.search("parent", None, true).expect("Search failed");
+        let result = searcher.search("parent", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'parent' keyword");
         println!("✓ Found 'parent' keyword");
 
-        let result = searcher.search("child", None, true).expect("Search failed");
+        let result = searcher.search("child", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'child' keyword");
         println!("✓ Found 'child' keyword");
 
-        let result = searcher.search("grandchild", None, true).expect("Search failed");
+        let result = searcher.search("grandchild", None, true).await.expect("Search failed");
         assert!(result.found, "Should find 'grandchild' keyword");
         println!("✓ Found 'grandchild' keyword");
 
         // Phrase search should verify hierarchy
         let result = searcher.search("parent_child", Some("col_2"), false)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(result.found, "Should find 'parent_child' phrase with correct hierarchy");
         println!("✓ Found 'parent_child' phrase (verified hierarchy)");
 
@@ -1147,7 +1146,7 @@ mod comprehensive_large_file_tests {
         println!("✓ Verified 'parent_child' exists in actual parquet data");
 
         let result = searcher.search("child_grandchild", Some("col_2"), false)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(result.found, "Should find 'child_grandchild' phrase");
         println!("✓ Found 'child_grandchild' phrase (verified hierarchy)");
 
@@ -1164,111 +1163,111 @@ mod comprehensive_large_file_tests {
         println!("--------------------------------------------------");
 
         // Chinese characters with email structure (row 350,000, col 3)
-        let result = searcher.search("用户", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("用户", Some("col_3"), true).await.expect("Search failed");
         assert_found_in_row(&result, "用户", "col_3", 350_000, true);
         println!("✓ Found Chinese '用户' (user) at correct position");
 
-        let result = searcher.search("例子", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("例子", Some("col_3"), true).await.expect("Search failed");
         assert_found_in_row(&result, "例子", "col_3", 350_000, true);
         println!("✓ Found Chinese '例子' (example) at correct position");
 
-        let result = searcher.search("路径", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("路径", Some("col_3"), true).await.expect("Search failed");
         assert_found_in_row(&result, "路径", "col_3", 350_000, true);
         println!("✓ Found Chinese '路径' (path) at correct position");
 
         // Emoji (row 350,001, col 4)
-        let result = searcher.search("👋", Some("col_4"), true).expect("Search failed");
+        let result = searcher.search("👋", Some("col_4"), true).await.expect("Search failed");
         assert_found_in_row(&result, "👋", "col_4", 350_001, true);
         println!("✓ Found emoji '👋' (waving hand) at correct position");
 
-        let result = searcher.search("🌍", Some("col_4"), true).expect("Search failed");
+        let result = searcher.search("🌍", Some("col_4"), true).await.expect("Search failed");
         assert_found_in_row(&result, "🌍", "col_4", 350_001, true);
         println!("✓ Found emoji '🌍' (globe) at correct position");
 
-        let result = searcher.search("🔥", Some("col_0"), true).expect("Search failed");
+        let result = searcher.search("🔥", Some("col_0"), true).await.expect("Search failed");
         assert_found_in_row(&result, "🔥", "col_0", 350_007, true);
         println!("✓ Found emoji '🔥' (fire) at correct position");
 
-        let result = searcher.search("🚀", Some("col_0"), true).expect("Search failed");
+        let result = searcher.search("🚀", Some("col_0"), true).await.expect("Search failed");
         assert_found_in_row(&result, "🚀", "col_0", 350_007, true);
         println!("✓ Found emoji '🚀' (rocket) at correct position");
 
         // Arabic (row 350,002, col 5)
-        let result = searcher.search("مرحبا", Some("col_5"), true).expect("Search failed");
+        let result = searcher.search("مرحبا", Some("col_5"), true).await.expect("Search failed");
         assert_found_in_row(&result, "مرحبا", "col_5", 350_002, true);
         println!("✓ Found Arabic 'مرحبا' (hello) at correct position");
 
-        let result = searcher.search("العالم", Some("col_5"), true).expect("Search failed");
+        let result = searcher.search("العالم", Some("col_5"), true).await.expect("Search failed");
         assert_found_in_row(&result, "العالم", "col_5", 350_002, true);
         println!("✓ Found Arabic 'العالم' (world) at correct position");
 
         // Cyrillic (row 350,003, col 6)
-        let result = searcher.search("Привет", Some("col_6"), true).expect("Search failed");
+        let result = searcher.search("Привет", Some("col_6"), true).await.expect("Search failed");
         assert_found_in_row(&result, "Привет", "col_6", 350_003, true);
         println!("✓ Found Cyrillic 'Привет' (hello) at correct position");
 
-        let result = searcher.search("Мир", Some("col_6"), true).expect("Search failed");
+        let result = searcher.search("Мир", Some("col_6"), true).await.expect("Search failed");
         assert_found_in_row(&result, "Мир", "col_6", 350_003, true);
         println!("✓ Found Cyrillic 'Мир' (world) at correct position");
 
-        let result = searcher.search("тест", Some("col_6"), true).expect("Search failed");
+        let result = searcher.search("тест", Some("col_6"), true).await.expect("Search failed");
         assert_found_in_row(&result, "тест", "col_6", 350_003, true);
         println!("✓ Found Cyrillic 'тест' (test) at correct position");
 
         // Japanese (row 350,004, col 7)
-        let result = searcher.search("日本語", Some("col_7"), true).expect("Search failed");
+        let result = searcher.search("日本語", Some("col_7"), true).await.expect("Search failed");
         assert_found_in_row(&result, "日本語", "col_7", 350_004, true);
         println!("✓ Found Japanese '日本語' (Japanese language) at correct position");
 
-        let result = searcher.search("テスト", Some("col_7"), true).expect("Search failed");
+        let result = searcher.search("テスト", Some("col_7"), true).await.expect("Search failed");
         assert_found_in_row(&result, "テスト", "col_7", 350_004, true);
         println!("✓ Found Japanese 'テスト' (test) at correct position");
 
         // Mathematical symbols (row 350,005, col 8) - no delimiters so whole string is one token
-        let result = searcher.search("λ∀x∈ℝ→∞≠π×∑", Some("col_8"), true).expect("Search failed");
+        let result = searcher.search("λ∀x∈ℝ→∞≠π×∑", Some("col_8"), true).await.expect("Search failed");
         assert_found_in_row(&result, "λ∀x∈ℝ→∞≠π×∑", "col_8", 350_005, true);
         println!("✓ Found mathematical symbols as single token at correct position");
 
         // Latin extended (row 350,006, col 9)
-        let result = searcher.search("café", Some("col_9"), true).expect("Search failed");
+        let result = searcher.search("café", Some("col_9"), true).await.expect("Search failed");
         assert_found_in_row(&result, "café", "col_9", 350_006, true);
         println!("✓ Found 'café' with accent at correct position");
 
-        let result = searcher.search("résumé", Some("col_9"), true).expect("Search failed");
+        let result = searcher.search("résumé", Some("col_9"), true).await.expect("Search failed");
         assert_found_in_row(&result, "résumé", "col_9", 350_006, true);
         println!("✓ Found 'résumé' with accents at correct position");
 
-        let result = searcher.search("naïve", Some("col_9"), true).expect("Search failed");
+        let result = searcher.search("naïve", Some("col_9"), true).await.expect("Search failed");
         assert_found_in_row(&result, "naïve", "col_9", 350_006, true);
         println!("✓ Found 'naïve' with diaeresis at correct position");
 
         // Currency symbols (row 350,009, col 2)
-        let result = searcher.search("€100", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("€100", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "€100", "col_2", 350_009, true);
         println!("✓ Found currency symbol '€100' (Euro) at correct position");
 
-        let result = searcher.search("£75", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("£75", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "£75", "col_2", 350_009, true);
         println!("✓ Found currency symbol '£75' (Pound) at correct position");
 
-        let result = searcher.search("¥1000", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("¥1000", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "¥1000", "col_2", 350_009, true);
         println!("✓ Found currency symbol '¥1000' (Yen) at correct position");
 
-        let result = searcher.search("₹500", Some("col_2"), true).expect("Search failed");
+        let result = searcher.search("₹500", Some("col_2"), true).await.expect("Search failed");
         assert_found_in_row(&result, "₹500", "col_2", 350_009, true);
         println!("✓ Found currency symbol '₹500' (Rupee) at correct position");
 
         // Mixed scripts (row 350,008, col 1)
-        let result = searcher.search("Mixed混合", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("Mixed混合", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "Mixed混合", "col_1", 350_008, true);
         println!("✓ Found Chinese 'Mixed混合' from mixed-script string at correct position");
 
-        let result = searcher.search("मिश्रित", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("मिश्रित", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "मिश्रित", "col_1", 350_008, true);
         println!("✓ Found Hindi 'मिश्रित' from mixed-script string at correct position");
 
-        let result = searcher.search("혼합", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("혼합", Some("col_1"), true).await.expect("Search failed");
         assert_found_in_row(&result, "혼합", "col_1", 350_008, true);
         println!("✓ Found Korean '혼합' from mixed-script string at correct position");
 
@@ -1281,18 +1280,18 @@ mod comprehensive_large_file_tests {
         println!("-----------------------------------------------------------");
 
         let result = searcher.search("THISKEYDOESNOTEXIST", None, true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(!result.found, "Should NOT find non-existent keyword");
         println!("✓ Correctly did not find 'THISKEYDOESNOTEXIST'");
 
         let result = searcher.search("zzzzzzzzzzz", None, true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(!result.found, "Should NOT find non-existent keyword");
         println!("✓ Correctly did not find 'zzzzzzzzzzz'");
 
         // Search in wrong column
         let result = searcher.search("END_OF_FILE_MARKER_UNIQUE_STRING_XYZ", Some("col_0"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(!result.found, "Should NOT find keyword in wrong column");
         println!("✓ Correctly did not find end marker in col_0 (it's in col_3)");
 
@@ -1306,7 +1305,7 @@ mod comprehensive_large_file_tests {
 
         // Test that keywords found in specific columns only
         let result = searcher.search("example", Some("col_0"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(result.found, "Should find 'example' in col_0");
         if let Some(verified) = &result.verified_matches {
             assert_eq!(verified.columns.len(), 1, "Should only be in one column");
@@ -1315,7 +1314,7 @@ mod comprehensive_large_file_tests {
         println!("✓ Found 'example' filtered to col_0 only");
 
         let result = searcher.search("github", Some("col_7"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(result.found, "Should find 'github' in col_7");
         if let Some(verified) = &result.verified_matches {
             assert_eq!(verified.columns.len(), 1, "Should only be in one column");
@@ -1324,11 +1323,11 @@ mod comprehensive_large_file_tests {
         println!("✓ Found 'github' filtered to col_7 only");
 
         // Test searching all columns vs specific column
-        let result_all = searcher.search("test", None, true).expect("Search failed");
+        let result_all = searcher.search("test", None, true).await.expect("Search failed");
         assert!(result_all.found, "Should find 'test' in any column");
 
         let result_col6 = searcher.search("test", Some("col_6"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(result_col6.found, "Should find 'test' in col_6");
 
         if let (Some(all), Some(filtered)) = (&result_all.verified_matches, &result_col6.verified_matches) {
@@ -1347,7 +1346,7 @@ mod comprehensive_large_file_tests {
 
         // This tests the case where index says "yes" but parquet verification needed
         let result = searcher.search("example.com is not", Some("col_6"), false)
-            .expect("Search failed");
+            .await.expect("Search failed");
         // The index might say found, but verification should confirm or deny
         println!("  Phrase 'example.com is not' search result: found={}", result.found);
         if result.needs_verification.is_some() {
@@ -1356,7 +1355,7 @@ mod comprehensive_large_file_tests {
 
         // Test partial word boundary
         let result = searcher.search("testcase", Some("col_7"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         // Should NOT find "testcase" as a keyword (only "test" appears)
         assert!(!result.found, "Should NOT find 'testcase' (only 'test' exists)");
         println!("✓ Correctly distinguished 'test' from 'testcase' (word boundary)");
@@ -1373,7 +1372,7 @@ mod comprehensive_large_file_tests {
         let start = std::time::Instant::now();
         for i in 0..100 {
             let result = searcher.search(&format!("nonexistent{}", i), None, true)
-                .expect("Search failed");
+                .await.expect("Search failed");
             assert!(!result.found, "Should not find non-existent keyword");
         }
         let elapsed = start.elapsed();
@@ -1385,7 +1384,7 @@ mod comprehensive_large_file_tests {
         let keywords = vec!["example", "test", "user", "data", "api",
                             "config", "github", "local", "SELECT", "active"];
         for keyword in &keywords {
-            let result = searcher.search(keyword, None, true).expect("Search failed");
+            let result = searcher.search(keyword, None, true).await.expect("Search failed");
             assert!(result.found, "Should find known keyword: {}", keyword);
         }
         let elapsed = start.elapsed();
@@ -1400,45 +1399,45 @@ mod comprehensive_large_file_tests {
         println!("-------------------------------------------------");
 
         // Test 1: CONSECUTIVE pattern is in col_4, search in col_3
-        let result = searcher.search("CONSECUTIVE", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("CONSECUTIVE", Some("col_3"), true).await.expect("Search failed");
         assert!(!result.found, "Should NOT find 'CONSECUTIVE' in col_3 (it's only in col_4)");
         assert!(result.verified_matches.is_none(), "Should have no verified matches in wrong column");
         println!("✓ Correctly rejected 'CONSECUTIVE' in col_3 (exists only in col_4)");
 
         // Test 2: NONCONSECUTIVE pattern is in col_5, search in col_4
-        let result = searcher.search("NONCONSECUTIVE", Some("col_4"), true).expect("Search failed");
+        let result = searcher.search("NONCONSECUTIVE", Some("col_4"), true).await.expect("Search failed");
         assert!(!result.found, "Should NOT find 'NONCONSECUTIVE' in col_4 (it's only in col_5)");
         assert!(result.verified_matches.is_none(), "Should have no verified matches in wrong column");
         println!("✓ Correctly rejected 'NONCONSECUTIVE' in col_4 (exists only in col_5)");
 
         // Test 3: Email at row 0 is in col_0, search in col_1
-        let result = searcher.search("user", Some("col_1"), true).expect("Search failed");
+        let result = searcher.search("user", Some("col_1"), true).await.expect("Search failed");
         assert!(!result.found, "Should NOT find 'user' from email in col_1 (it's in col_0)");
         println!("✓ Correctly rejected 'user' in col_1 (exists in col_0)");
 
         // Test 4: URL subdomain "api" is in col_1, search in col_0
-        let result = searcher.search("api", Some("col_5"), true).expect("Search failed");
+        let result = searcher.search("api", Some("col_5"), true).await.expect("Search failed");
         assert!(!result.found, "Should NOT find 'api' in col_5 (it's in col_1 URL)");
         println!("✓ Correctly rejected 'api' in col_5 (exists in col_1)");
 
         // Test 5: Chinese characters are in specific columns, search in wrong column
-        let result = searcher.search("用户", Some("col_8"), true).expect("Search failed");
+        let result = searcher.search("用户", Some("col_8"), true).await.expect("Search failed");
         assert!(!result.found, "Should NOT find Chinese '用户' in col_8 (it's in col_6)");
         println!("✓ Correctly rejected Chinese '用户' in col_8 (exists in col_6)");
 
         // Test 6: Emoji is in col_4, search in col_7
-        let result = searcher.search("👋", Some("col_7"), true).expect("Search failed");
+        let result = searcher.search("👋", Some("col_7"), true).await.expect("Search failed");
         assert!(!result.found, "Should NOT find emoji '👋' in col_7 (it's in col_4)");
         println!("✓ Correctly rejected emoji '👋' in col_7 (exists in col_4)");
 
         // Test 7: Timestamp components in col_2, search in col_3
-        let result = searcher.search("2024", Some("col_3"), true).expect("Search failed");
+        let result = searcher.search("2024", Some("col_3"), true).await.expect("Search failed");
         assert!(!result.found, "Should NOT find '2024' in col_3 (it's in col_2 timestamp)");
         println!("✓ Correctly rejected '2024' in col_3 (exists in col_2)");
 
         // Test 8: Test filtering when keyword exists in multiple columns but not in searched column
         // (If any keywords exist in multiple columns, use one of those)
-        let result = searcher.search("test", Some("col_9"), true).expect("Search failed");
+        let result = searcher.search("test", Some("col_9"), true).await.expect("Search failed");
         // This might be in col_6 or col_7 from the test data, but should not be in col_9
         if !result.found {
             println!("✓ Correctly filtered 'test' to col_9 only (not found there)");
@@ -1451,14 +1450,14 @@ mod comprehensive_large_file_tests {
 
         // Test 9: END_OF_FILE marker is in col_3, search in col_0
         let result = searcher.search("END_OF_FILE_MARKER_UNIQUE_STRING_XYZ", Some("col_0"), true)
-            .expect("Search failed");
+            .await.expect("Search failed");
         assert!(!result.found, "Should NOT find end marker in col_0 (it's in col_3)");
         println!("✓ Correctly rejected end marker in col_0 (exists in col_3)");
 
         // Test 10: Verify aggregate search vs column-specific search difference
-        let result_all = searcher.search("CONSECUTIVE", None, true).expect("Search failed");
-        let result_col4 = searcher.search("CONSECUTIVE", Some("col_4"), true).expect("Search failed");
-        let result_col3 = searcher.search("CONSECUTIVE", Some("col_3"), true).expect("Search failed");
+        let result_all = searcher.search("CONSECUTIVE", None, true).await.expect("Search failed");
+        let result_col4 = searcher.search("CONSECUTIVE", Some("col_4"), true).await.expect("Search failed");
+        let result_col3 = searcher.search("CONSECUTIVE", Some("col_3"), true).await.expect("Search failed");
 
         assert!(result_all.found, "Should find in aggregate search");
         assert!(result_col4.found, "Should find in correct column (col_4)");

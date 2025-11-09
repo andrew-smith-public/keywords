@@ -30,14 +30,14 @@
 //! # Usage Example
 //!
 //! ```no_run
-//! # use keywords::searching::search_results::KeywordSearchResult;
+//! # use keywords::searching::search_results::SearchResult;
 //! #
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! # let result: KeywordSearchResult = todo!();
+//! # let result: SearchResult = todo!();
 //! // Check if keyword was found
 //! if result.found {
-//!     if let Some(data) = result.data {
-//!         println!("Found '{}' in {} columns", result.keyword, data.columns.len());
+//!     if let Some(data) = result.verified_matches {
+//!         println!("Found '{}' in {} columns", result.query, data.columns.len());
 //!         println!("Total occurrences: {}", data.total_occurrences);
 //!
 //!         // Iterate through each column
@@ -51,74 +51,11 @@
 //! # }
 //! ```
 
-/// Result of searching for a single keyword in the index.
-///
-/// This is the primary return type for keyword searches. It contains the search query,
-/// a boolean indicating whether the keyword was found, and if found, detailed location
-/// information about where the keyword appears in the Parquet file.
-///
-/// # Fields
-///
-/// - `keyword` - The exact keyword that was searched (case-sensitive)
-/// - `found` - `true` if the keyword exists in the index, `false` otherwise
-/// - `data` - Detailed location data, only present when `found` is `true`
-///
-/// # Examples
-///
-/// **Keyword found:**
-/// ```no_run
-/// # use keywords::searching::search_results::{KeywordSearchResult, KeywordLocationData};
-/// # let result = KeywordSearchResult {
-/// #     keyword: "example".to_string(),
-/// #     found: true,
-/// #     data: Some(KeywordLocationData {
-/// #         columns: vec!["email".to_string(), "description".to_string()],
-/// #         total_occurrences: 42,
-/// #         splits_matched: 0b0010,
-/// #         column_details: vec![],
-/// #     }),
-/// # };
-/// assert!(result.found);
-/// assert_eq!(result.keyword, "example");
-/// if let Some(data) = result.data {
-///     println!("Found in {} columns", data.columns.len());
-/// }
-/// ```
-///
-/// **Keyword not found:**
-/// ```
-/// # use keywords::searching::search_results::KeywordSearchResult;
-/// # let result = KeywordSearchResult {
-/// #     keyword: "nonexistent".to_string(),
-/// #     found: false,
-/// #     data: None,
-/// # };
-/// assert!(!result.found);
-/// assert!(result.data.is_none());
-/// ```
-#[derive(Debug, Clone)]
-pub struct KeywordSearchResult {
-    /// The keyword that was searched for (exact, case-sensitive).
-    pub keyword: String,
 
-    /// Whether the keyword was found in the index.
-    ///
-    /// Note: This indicates presence in the index, not necessarily in the actual Parquet data
-    /// due to bloom filter false positives (typically <1% with default settings).
-    pub found: bool,
-
-    /// Detailed information about where the keyword appears.
-    ///
-    /// Only `Some` when `found` is `true`. Contains column names, occurrence counts,
-    /// and detailed location information for retrieving the actual data from Parquet.
-    pub data: Option<KeywordLocationData>,
-}
-
-
-/// Unified search result for both keyword and phrase searches.
+/// Unified search result for all search operations.
 ///
-/// This structure provides a consistent interface for all search operations,
-/// whether searching for exact keywords or phrases that need token splitting.
+/// This is the primary return type for all search operations in the keyword index,
+/// whether searching for exact keywords or multi-token phrases.
 ///
 /// # Fields
 ///
@@ -126,7 +63,19 @@ pub struct KeywordSearchResult {
 /// - `found` - Whether any matches were found
 /// - `tokens` - The tokens that were searched (single token for keyword_only searches)
 /// - `verified_matches` - Matches guaranteed correct, can be used directly
-/// - `needs_verification` - Potential matches requiring Parquet file verification
+/// - `needs_verification` - Potential matches requiring Parquet file verification (None for keyword-only searches)
+///
+/// # Search Types
+///
+/// **Keyword-only searches** (`keyword_only = true`):
+/// - `tokens` contains single element: the search query
+/// - All matches are in `verified_matches` (100% accurate)
+/// - `needs_verification` is always `None`
+///
+/// **Phrase searches** (`keyword_only = false`):
+/// - `tokens` contains multiple elements from hierarchical splitting
+/// - `verified_matches` contains confirmed phrase locations
+/// - `needs_verification` may contain locations requiring Parquet read
 ///
 /// # Verification Status
 ///
@@ -136,6 +85,7 @@ pub struct KeywordSearchResult {
 /// - Can answer queries directly without reading Parquet
 ///
 /// **Needs Verification** (requires Parquet read):
+/// - Only present for phrase searches
 /// - Phrase matches where parent verification is inconclusive
 /// - Must read actual Parquet data to confirm
 ///
@@ -146,7 +96,7 @@ pub struct KeywordSearchResult {
 /// # use keywords::searching::search_results::SearchResult;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// let searcher = KeywordSearcher::load("data.parquet", None).await?;
-/// let result = searcher.search("example.com", None, false)?;
+/// let result = searcher.search("example.com", None, false).await?;
 ///
 /// if result.found {
 ///     // Use verified matches directly
@@ -358,7 +308,8 @@ pub struct RowGroupLocation {
 /// - `start_row` - First row in the range (0-indexed within row group)
 /// - `end_row` - Last row in the range, inclusive
 /// - `splits_matched` - Which split levels matched in this range
-/// - `parent_offset` - Optional parent keyword offset for phrase search
+/// - `parent_chunk` - Optional parent keyword chunk ID
+/// - `parent_position` - Optional parent keyword position within chunk
 ///
 /// # Row Range Compression
 ///
@@ -374,7 +325,8 @@ pub struct RowGroupLocation {
 /// #     start_row: 100,
 /// #     end_row: 103,
 /// #     splits_matched: 0b0010,
-/// #     parent_offset: None,
+/// #     parent_chunk: None,
+/// #     parent_position: None,
 /// # };
 /// // A range covering 4 rows
 /// let num_rows = range.end_row - range.start_row + 1;
@@ -405,15 +357,22 @@ pub struct RowRange {
     /// range have the same split pattern.
     pub splits_matched: u16,
 
-    /// Offset to the parent keyword in the sorted keyword list.
+    /// Parent keyword chunk number (0-indexed).
     ///
     /// Used for phrase search optimization:
     /// - `None` - This is a root token from the original Parquet string
     /// - `Some(offset)` - Points to the parent keyword that contained this token
     ///
-    /// This enables efficient phrase matching by checking parent containment
+    /// Combined with `parent_position`, this enables efficient phrase matching by checking parent containment
     /// without reading the Parquet file.
-    pub parent_offset: Option<u32>,
+    pub parent_chunk: Option<u16>,
+
+    /// Position of parent keyword within its chunk (0-999 typically).
+    ///
+    /// Used in combination with `parent_chunk` to look up the parent keyword.
+    /// - `None` - This is a root token from the original Parquet string
+    /// - `Some(position)` - Index within the parent chunk's keyword list
+    pub parent_position: Option<u16>,
 }
 
 /// Result of combining multiple keyword searches with set operations.
