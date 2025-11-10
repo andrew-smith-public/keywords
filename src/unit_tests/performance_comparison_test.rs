@@ -89,6 +89,10 @@ mod performance_tests {
         FalsePositive,
         /// Bloom miss: search values don't exist at all (tests bloom filter rejection)
         BloomMiss,
+        /// Targeted search: specific number of rows with known values (consecutive placement)
+        TargetedConsecutive(usize),
+        /// Targeted search: specific number of rows with known values (random placement)
+        TargetedRandom(usize),
     }
 
     /// Results from a single performance test run
@@ -311,6 +315,68 @@ mod performance_tests {
                     })
                     .collect();
             }
+
+            DataScenario::TargetedConsecutive(target_rows) | DataScenario::TargetedRandom(target_rows) => {
+                // Pick 3 random values from the string pool as search values
+                let mut available_indices: Vec<usize> = (0..string_pool.len()).collect();
+                for _ in 0..3 {
+                    let pool_idx = rng.random_range(0..available_indices.len());
+                    let string_idx = available_indices.remove(pool_idx);
+                    search_values.push(string_pool[string_idx].clone());
+                }
+
+                // Calculate total rows and determine target row indices
+                let total_rows = config.num_row_groups * config.rows_per_group;
+
+                let target_row_indices: Vec<usize> = match config.scenario {
+                    DataScenario::TargetedConsecutive(_) => {
+                        // Place target rows consecutively in the middle of the dataset
+                        let start_row = (total_rows - target_rows) / 2;
+                        (start_row..start_row + target_rows).collect()
+                    }
+                    DataScenario::TargetedRandom(_) => {
+                        // Place target rows randomly throughout the dataset
+                        let mut indices: Vec<usize> = (0..total_rows).collect();
+                        use rand::seq::SliceRandom;
+                        indices.shuffle(&mut rng);
+                        indices.into_iter().take(target_rows).collect()
+                    }
+                    _ => unreachable!(),
+                };
+
+                // Generate data row by row across all row groups
+                let mut global_row_idx = 0;
+                for _rg in 0..config.num_row_groups {
+                    let mut columns: Vec<ArrayRef> = Vec::new();
+
+                    for col_idx in 0..config.num_columns {
+                        let mut values: Vec<String> = Vec::new();
+
+                        for _local_row_idx in 0..config.rows_per_group {
+                            let is_target_row = target_row_indices.contains(&global_row_idx);
+
+                            let value = if is_target_row && col_idx < 3 {
+                                // This is a target row and one of the first 3 columns
+                                search_values[col_idx].clone()
+                            } else {
+                                // Regular random value from remaining pool
+                                let idx = available_indices[rng.random_range(0..available_indices.len())];
+                                string_pool[idx].clone()
+                            };
+
+                            values.push(value);
+                            global_row_idx += 1;
+                        }
+
+                        global_row_idx -= config.rows_per_group; // Reset for next column
+                        columns.push(Arc::new(StringArray::from(values)) as ArrayRef);
+                    }
+
+                    global_row_idx += config.rows_per_group; // Advance for next row group
+                    let batch = RecordBatch::try_new(schema.clone(), columns)?;
+                    writer.write(&batch)?;
+                }
+            }
         }
 
         writer.close()?;
@@ -500,8 +566,8 @@ mod performance_tests {
     // ============================================================================
     // Test 1: Compression Algorithm Comparison
     // ============================================================================
-
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_compression_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
@@ -562,8 +628,8 @@ mod performance_tests {
     // ============================================================================
     // Test 2: Row Group Count Comparison
     // ============================================================================
-
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_row_group_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
@@ -614,8 +680,8 @@ mod performance_tests {
     // ============================================================================
     // Test 3: String Pool Size (Cardinality) Comparison
     // ============================================================================
-
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_cardinality_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
@@ -666,9 +732,9 @@ mod performance_tests {
     // ============================================================================
     // Test 4: False Positive Scenario (Keywords Exist But Not Together)
     // ============================================================================
-
     #[tokio::test]
-    async fn test_false_positive_scenario() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg_attr(feature = "ci", ignore)]
+    async fn test_false_positive_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
         let mut iteration_results = Vec::new();
@@ -710,9 +776,9 @@ mod performance_tests {
     // ============================================================================
     // Test 5: Bloom Filter Miss Scenario (Keywords Don't Exist)
     // ============================================================================
-
     #[tokio::test]
-    async fn test_bloom_miss_scenario() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg_attr(feature = "ci", ignore)]
+    async fn test_bloom_miss_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
         let mut iteration_results = Vec::new();
@@ -749,6 +815,112 @@ mod performance_tests {
         println!("- Expected rows found: 0 (keywords don't exist)");
         println!("- Speedup demonstrates bloom filter early rejection advantage");
         println!();
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // Test 6: Targeted Search - Consecutive Rows
+    // ============================================================================
+    #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
+    async fn test_consecutive_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let test_config = TestConfig::default();
+
+        let target_row_counts = vec![1, 10, 100, 1_000, 10_000, 100_000];
+
+        let mut results = Vec::new();
+
+        for target_rows in target_row_counts {
+            let mut iteration_results = Vec::new();
+
+            for _ in 0..test_config.iterations {
+                let config = ParquetConfig::default()
+                    .with_scenario(DataScenario::TargetedConsecutive(target_rows));
+                let (file_path, search_values) = generate_parquet_file(config)?;
+
+                let test_result = run_performance_test(&file_path, &search_values).await?;
+                let file_size = get_file_size_mb(&file_path)?;
+
+                cleanup(&file_path)?;
+
+                iteration_results.push((test_result, file_size));
+            }
+
+            let avg_result = TestResult::average(
+                &iteration_results.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
+            );
+            let avg_size = iteration_results.iter().map(|(_, s)| s).sum::<f64>() / iteration_results.len() as f64;
+
+            results.push(ComparisonRow {
+                dimension: format!("{} rows", target_rows),
+                file_size_mb: avg_size,
+                index_build_time: avg_result.index_build_time,
+                keyword_time: avg_result.keyword_time,
+                datafusion_time: avg_result.datafusion_time,
+                naive_time: avg_result.naive_time,
+                rows_found: avg_result.rows_found,
+            });
+        }
+
+        display_comparison_table(
+            &results,
+            "Targeted Search - Consecutive Rows (500k total rows, 5 row groups)",
+            "Target Rows"
+        );
+
+        Ok(())
+    }
+
+    // ============================================================================
+    // Test 7: Targeted Search - Random Rows
+    // ============================================================================
+    #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
+    async fn test_random_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let test_config = TestConfig::default();
+
+        let target_row_counts = vec![1, 10, 100, 1_000, 10_000, 100_000];
+
+        let mut results = Vec::new();
+
+        for target_rows in target_row_counts {
+            let mut iteration_results = Vec::new();
+
+            for _ in 0..test_config.iterations {
+                let config = ParquetConfig::default()
+                    .with_scenario(DataScenario::TargetedRandom(target_rows));
+                let (file_path, search_values) = generate_parquet_file(config)?;
+
+                let test_result = run_performance_test(&file_path, &search_values).await?;
+                let file_size = get_file_size_mb(&file_path)?;
+
+                cleanup(&file_path)?;
+
+                iteration_results.push((test_result, file_size));
+            }
+
+            let avg_result = TestResult::average(
+                &iteration_results.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
+            );
+            let avg_size = iteration_results.iter().map(|(_, s)| s).sum::<f64>() / iteration_results.len() as f64;
+
+            results.push(ComparisonRow {
+                dimension: format!("{} rows", target_rows),
+                file_size_mb: avg_size,
+                index_build_time: avg_result.index_build_time,
+                keyword_time: avg_result.keyword_time,
+                datafusion_time: avg_result.datafusion_time,
+                naive_time: avg_result.naive_time,
+                rows_found: avg_result.rows_found,
+            });
+        }
+
+        display_comparison_table(
+            &results,
+            "Targeted Search - Random Rows (500k total rows, 5 row groups)",
+            "Target Rows"
+        );
 
         Ok(())
     }

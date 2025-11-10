@@ -13,6 +13,7 @@ mod tests {
     use crate::build_and_save_index;
 
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_performance_with_debug() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
         let index_file_prefix = Some("test_performance_comparison_");
@@ -626,6 +627,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_performance_with_debug_1_row_group() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
         let index_file_prefix = Some("test_performance_comparison_");
@@ -1239,6 +1241,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_performance_with_debug_v2_parquet() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
         let index_file_prefix = Some("test_performance_comparison_");
