@@ -1,12 +1,10 @@
 # Keywords - High-Performance Keyword Search for Parquet Files
 
-**A keyword index system POC, currently achieving between 5x and 170x faster searches than Apache DataFusion, with a 7.5x improvement for selective queries on moderate-cardinality data.**
-
-Copyright (c) 2025 Andrew Smith. All rights reserved. See [COPYRIGHT.txt](COPYRIGHT.txt) for full terms.
+**Fast keyword search for Parquet files achieving 5-170x speedups over Apache DataFusion, with 7.5x improvement for selective queries on moderate-cardinality data.**
 
 ## Executive Summary
 
-High-performance Rust library and CLI tool for building keyword indexes on Parquet files and performing fast keyword searches. The system enables searching multi-gigabyte files without loading data into memory, with performance exceeding industry-standard query engines like Apache DataFusion for high-cardinality data where traditional row group statistics provide limited pruning opportunities.
+High-performance Rust library and CLI tool for building keyword indexes on Parquet files and performing fast searches. Enables searching large files without loading data into memory, with performance exceeding Apache DataFusion where traditional row group statistics provide limited pruning.
 
 ## Key Features & Technical Achievements
 
@@ -19,22 +17,22 @@ High-performance Rust library and CLI tool for building keyword indexes on Parqu
 - **Index 0 optimization**: Aggregates keywords across all columns for efficient unfiltered searches on wide tables
 
 **Production-Oriented Patterns**
-- **Cloud and local support**: Seamless operation with S3 and local filesystems via unified interface
 - **Comprehensive testing**: 13 test modules covering edge cases, integration, and performance scenarios
 - **Distributed index structure with dynamic chunk sizing** for efficient partial loading
 - **Centralized configuration**: All tunable parameters in dedicated config module
 
-**Proven Capabilities**
-- Successfully indexes and searches individual Parquet files efficiently
-- Search performance competitive with Apache DataFusion for selective queries on moderate-cardinality data
-- Can index approximately 15 million keywords in 4GB RAM for high cardinality data
-- Optimized indexing with multiple performance enhancements
+**Tested Capabilities**
+- Successfully indexes and searches individual Parquet files
+- 7.5x faster than DataFusion for selective queries on moderate-cardinality data
+- 81.8x faster when keywords exist separately but not together
+- 170x faster when keywords don't exist (bloom filter rejection)
+- Indexes approximately 15 million keywords in 4GB RAM (high-cardinality data)
 
 ## Project Context
 
-This proof-of-concept was developed over approximately 2 weeks to explore the foundational architecture for a fast, low-cost multi-petabyte query system capable of running purely from cloud object storage (e.g., AWS S3) without requiring expensive local NVME storage.
+This proof-of-concept was developed over 2-3 weeks to explore the foundational architecture for a fast, low-cost multi-petabyte query system capable of running purely from cloud object storage (e.g., AWS S3) without requiring expensive local NVMe storage.
 
-**Development approach**: Hands-on implementation with AI-assisted learning for Rust-specific patterns (first Rust project)
+Built as a first Rust project using hands-on implementation combined with AI-assisted learning for Rust-specific patterns.
 
 ### Current Status
 
@@ -129,7 +127,7 @@ data.parquet.index/
 - Processes all string columns from Parquet files
 - Creates bloom filters for fast existence checks
 - Builds distributed index structure
-- Supports both local and cloud (S3) storage
+- Designed for both local and cloud (S3) storage
 
 #### 3. **Search Engine** (`searching/keyword_search.rs`)
 - Global bloom filter for quick rejection
@@ -178,14 +176,13 @@ This hierarchical approach enables:
 ### Performance Characteristics
 
 **Index Building:**
-- Memory: ~15 million keywords in 4GB RAM (high cardinality data, normal length keywords)
-- Lower cardinality data can fit more keywords in same memory
+- Memory: Proportional to unique keyword count (~15 million keywords in 4GB RAM for high-cardinality data)
 - Single-threaded but I/O optimized
 
 **Searching:**
 - Time complexity: O(1) for bloom filter check + O(log n) for binary search
 - Search time independent of Parquet file size
-- Performance competitive with Apache DataFusion, with advantages for higher-cardinality keyword lookups where row group statistics provide limited pruning
+- Performance exceeds Apache DataFusion where row group statistics provide limited pruning
 - Verified matches require no Parquet file access (uses parent tracking)
 
 **Memory Usage:**
@@ -231,7 +228,7 @@ Testing on representative hardware with a 500,000-row Parquet file containing 5,
 
 Full test code available in [performance_comparison_test.rs](src/unit_tests/performance_comparison_test.rs)
 
-**By Parquet Comression Algorithm**
+**By Parquet Compression Algorithm**
 
 | Compression | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |
 |-----------|-----------|-------------|---------------|------------|---------|-------|------|
@@ -261,7 +258,7 @@ Full test code available in [performance_comparison_test.rs](src/unit_tests/perf
 | 40 RG | 39.11 MB | 2.9888384s | 3.5162ms | 52.9785ms | 15.07x | 95.2891ms | 1 |
 | 50 RG | 44.85 MB | 3.1646377s | 3.096ms | 62.1345ms | 20.07x | 103.1466ms | 1 |
 
-**By the number of random strings in the pool to be chosen from in creating the parquet file (cardinality)**
+**By Cardinality (number of random strings in the pool used to build the parquet file)**
 
 | Pool Size | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |
 |---------|-----------|-------------|---------------|------------|---------|-------|------|
@@ -271,7 +268,7 @@ Full test code available in [performance_comparison_test.rs](src/unit_tests/perf
 | 50000 | 46.08 MB | 5.8127867s | 18.4448ms | 92.0191ms | 4.99x | 152.171ms | 1 |
 | 500000 | 87.69 MB | 13.3885345s | 30.5061ms | 174.8759ms | 5.73x | 221.0582ms | 1 |
 
-**Where all the keywords being searched for exist within the columns, but the criteria as a whole does not exist in any row**
+**Where all keywords exist within columns, but not together in any row**
 
 | Method | Time | Rows Found |
 |--------|------|------------|
@@ -281,7 +278,7 @@ Full test code available in [performance_comparison_test.rs](src/unit_tests/perf
 
 An **81.8x** speedup
 
-**Where the keywords do not exist in the data at all (pruned by bloom filter)**
+**Where keywords do not exist in the data at all (bloom filter rejection)**
 
 | Method | Time | Rows Found |
 |--------|------|------------|
@@ -312,9 +309,10 @@ A **170x** speedup
 - Can verify some multi-token matches without reading the Parquet file
 
 ### Cloud Storage Support
-- Works seamlessly with S3 (via `object_store` crate)
+- Architecture designed for cloud storage (S3, Azure, GCP via `object_store` crate)
 - Automatic retry logic for transient failures
 - Efficient range requests for metadata
+- Basic S3 read functions tested; full cloud indexing and searching designed but not extensively tested
 
 ### Validation
 - Index validation checks file size, ETag, and last modified time
@@ -383,7 +381,7 @@ Current implementation has the following constraints (appropriate for POC phase)
 
 - **Case-sensitive**: "Email" and "email" are treated as different keywords
 - **Exact token match**: No wildcard support; searches match tokens as split during indexing
-- **Memory bound during indexing**: Entire index must fit in memory during construction (~15 million keywords in 4GB RAM for high cardinality data). No disk spooling during index build.
+- **Memory bound during indexing**: Entire index must fit in memory during construction. No disk spooling during index build.
 - **Memory bound during searching**: Entire index must fit in memory
 - **Single-threaded indexing**: Indexing is not parallelized (but I/O is optimized)
 - **No incremental updates**: Index must be rebuilt if Parquet file changes
@@ -463,7 +461,7 @@ For the current POC phase, the full-detail approach provides valuable insights i
 
 ### Parent Keyword Tracking
 
-Keywords maintain references to their parent keywords in the split hierarchy. This enables efficient phrase search without reading the Parquet file:
+Keywords maintain references to their parent keywords in the split hierarchy. This enables efficient phrase search without reading the Parquet file.
 
 ### Bloom Filter Configuration
 
@@ -523,29 +521,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ## Parallelization Strategy
 
-While the current implementation is single-threaded, the architecture is designed to support parallelization.
-The strategy includes:
-
-### 1. Column Parallelization
-- For each column in each row groups concurrently build the index (up to a thread limit)
-- Use `Arc<DashMap>` for thread-safe keyword insertion
-- Requires changing `Rc<str>` to `Arc<str>`
-
-### 2. Memory Management
-- Monitor memory usage across threads
-- Implement backpressure mechanisms
-
-### 3. Expected Performance
-- Estimated 3-4x improvement on 4-core systems
-- Sub-linear scaling due to merge overhead
-- Memory bandwidth may become limiting factor, however S3 download rate will also be a limiting factor
-
-### 4. Why Not Implemented
-For the POC phase, single-threaded was chosen to:
-- Reduce complexity for first Rust project
-- Establish baseline performance
-- Keep codebase accessible
-- Prove concept before optimization
+Single-threaded was chosen for the POC phase to reduce complexity while establishing baseline performance and only dealing with single files.
 
 ---
 
@@ -595,28 +571,21 @@ For the POC phase, single-threaded was chosen to:
 
 ## FAQ
 
-**Q: Can I search for partial matches or wildcards?**  
-A: Currently, the system only supports exact token matches as they were split during indexing. Wildcard support is planned for future versions.
-
 **Q: How much memory does searching use?**  
-A: The entire index is loaded into memory. The actual Parquet data is not loaded unless verification is needed.
+A: The entire index is loaded into memory during search. The actual Parquet data is not loaded unless verification is needed.
 
 **Q: Can I update an existing index?**  
-A: Not currently. You must rebuild the entire index if the Parquet file changes. Incremental updates are planned for future versions.
-
-**Q: Does it work with nested/complex Parquet schemas?**  
-A: Currently focuses on string columns. Complex nested structures may need flattening.
-
-**Q: Can I use this with other cloud providers (Azure, GCP)?**  
-A: The code uses the `object_store` crate which supports multiple backends. AWS S3 is configured by default, but Azure and GCP can be configured with minimal changes.
+A: No. You must rebuild the entire index if the Parquet file changes.
 
 **Q: Is the search thread-safe?**  
 A: `KeywordSearcher` is not `Sync` due to internal buffer management. Create one instance per thread or use appropriate synchronization primitives.
 
-**Q: What about transient network failures when accessing S3?**  
-A: The `object_store` library includes built-in retry logic with exponential backoff for handling transient S3 failures automatically.
+**Q: What about transient network failures when accessing cloud storage?**  
+A: The `object_store` library includes built-in retry logic with exponential backoff for handling transient failures automatically.
 
 **Q: How do I validate my index is up-to-date?**  
-A: Use the `validate_index()` function which checks file size, ETag, and last modified time:
+A: Use the `validate_index()` function which checks file size, ETag, and last modified time.
 
 ---
+
+Copyright (c) 2025 Andrew Smith. All rights reserved. See [COPYRIGHT.txt](COPYRIGHT.txt) for full terms.
