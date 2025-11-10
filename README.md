@@ -19,7 +19,6 @@ High-performance Rust library and CLI tool for building keyword indexes on Parqu
 **Production-Oriented Patterns**
 - **Comprehensive testing**: 13 test modules covering edge cases, integration, and performance scenarios
 - **Distributed index structure with dynamic chunk sizing** for efficient partial loading
-- **Centralized configuration**: All tunable parameters in dedicated config module
 
 **Tested Capabilities**
 - Successfully indexes and searches individual Parquet files
@@ -40,7 +39,6 @@ Built as a first Rust project using hands-on implementation combined with AI-ass
 - Index and search individual Parquet files efficiently
 - Optimized indexing with tested performance characteristics
 - Demonstrated concept feasibility for scaling to larger systems
-- Comprehensive configuration management system
 
 **Future Enhancements** (detailed in Roadmap section):
 - **Multi-file index consolidation** - Largest performance improvement potential, pruning thousands of files in 1 index lookup
