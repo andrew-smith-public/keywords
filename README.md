@@ -1,6 +1,6 @@
 # Keywords - High-Performance Keyword Search for Parquet Files
 
-**Fast keyword search for Parquet files achieving 5-170x speedups over Apache DataFusion, with 7.5x improvement for selective queries on moderate-cardinality data.**
+**Fast keyword index and search for Parquet files achieving 5-170x speedups over Apache DataFusion, with 7.5x improvement for selective queries on moderate-cardinality data.**
 
 ## Executive Summary
 
