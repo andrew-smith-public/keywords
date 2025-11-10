@@ -1,6 +1,6 @@
 # Keywords - High-Performance Keyword Search for Parquet Files
 
-**A keyword index system POC, currently achieving 2.5x faster searches than Apache DataFusion for selective queries on high-cardinality data.**
+**A keyword index system POC, currently achieving between 5x and 170x faster searches than Apache DataFusion, with a 7.5x improvement for selective queries on moderate-cardinality data.**
 
 Copyright (c) 2025 Andrew Smith. All rights reserved. See [COPYRIGHT.txt](COPYRIGHT.txt) for full terms.
 
@@ -26,7 +26,7 @@ High-performance Rust library and CLI tool for building keyword indexes on Parqu
 
 **Proven Capabilities**
 - Successfully indexes and searches individual Parquet files efficiently
-- Search performance competitive with Apache DataFusion for selective queries on high-cardinality data
+- Search performance competitive with Apache DataFusion for selective queries on moderate-cardinality data
 - Can index approximately 15 million keywords in 4GB RAM for high cardinality data
 - Optimized indexing with multiple performance enhancements
 
@@ -185,7 +185,7 @@ This hierarchical approach enables:
 **Searching:**
 - Time complexity: O(1) for bloom filter check + O(log n) for binary search
 - Search time independent of Parquet file size
-- Performance competitive with Apache DataFusion, with advantages for high-cardinality keyword lookups where row group statistics provide limited pruning
+- Performance competitive with Apache DataFusion, with advantages for higher-cardinality keyword lookups where row group statistics provide limited pruning
 - Verified matches require no Parquet file access (uses parent tracking)
 
 **Memory Usage:**
@@ -195,24 +195,24 @@ This hierarchical approach enables:
 
 ### Example Performance Results
 
-Testing on representative hardware with a 100,000-row Parquet file containing random high-cardinality data across 10 columns (see [`test_performance_comparison`](src/unit_tests/performance_test.rs) for full test implementation):
+Testing on representative hardware with a 500,000-row Parquet file containing 5,000 random values across 10 columns (see [`test_performance_with_debug`](src/unit_tests/test_performance_with_debug.rs) for full test implementation):
 
 ```
-┌─────────────────────────────────┬──────────────┬──────────┐
-│ Approach                        │ Time         │ Speedup  │
-├─────────────────────────────────┼──────────────┼──────────┤
-│ Keyword Index (this project)    │       7.83ms │ baseline │
-│ DataFusion (pushdown + pruning) │      19.36ms │ 2.47x    │
-│ Naive (read all, filter)        │      20.75ms │ 2.65x    │
-└─────────────────────────────────┴──────────────┴──────────┘
+┌─────────────────────────────────┬──────────────┬──────────────┐
+│ Approach                        │ Time         │ Speedup      │
+├─────────────────────────────────┼──────────────┼──────────────┤
+│ Keyword Index (this project)    │      12.41ms │ baseline     │
+│ DataFusion (pushdown + pruning) │      96.01ms │ 7.74x faster │
+│ Naive (read all, filter)        │      93.37ms │ 7.52x faster │
+└─────────────────────────────────┴──────────────┴──────────────┘
 ```
 
 **Key Observations:**
-- Keyword index: **2.5x faster** than Apache DataFusion for this workload
-- DataFusion and naive approaches show similar performance (19ms vs 21ms), demonstrating that row group statistics provide minimal pruning benefit for high-cardinality random data
+- Keyword index: **7.5x faster** than Apache DataFusion for this workload
+- DataFusion and naive approaches show similar performance (19ms vs 21ms), demonstrating that row group statistics provide minimal pruning benefit for higher-cardinality random data
 - Pre-computed bloom filters eliminate the runtime cost of statistics evaluation
 - Absolute times vary based on hardware, file size, and data characteristics
-- Entire file pruning at the bloom filter stage is much faster
+- Entire file pruning at the bloom filter stage or through row combination (filtering values in multiple columns where values exist, but not in the same row) is much faster
 
 **Test Details:**
 - Comparison includes Apache DataFusion 45.0 (industry-standard query engine with automatic row group pruning)
@@ -225,7 +225,71 @@ Testing on representative hardware with a 100,000-row Parquet file containing ra
 - Selective keyword searches (finding specific values, not aggregations)
 - Scenarios where row group statistics provide limited pruning opportunities
 
-**Note:** These are representative results from development testing. The keyword index advantage is most pronounced for selective queries on high-cardinality, unstructured data where traditional statistics-based pruning is ineffective. Sorted or clustered data may favor traditional query engines.
+**Note:** These are representative results from development testing. The keyword index advantage is most pronounced for selective queries on higher-cardinality, unstructured data where traditional statistics-based pruning is ineffective. Sorted or clustered data may favor traditional query engines.
+
+### Other Performance Results
+
+Full test code available in [performance_comparison_test.rs](src/unit_tests/performance_comparison_test.rs)
+
+**By Parquet Comression Algorithm**
+
+| Compression | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |
+|-----------|-----------|-------------|---------------|------------|---------|-------|------|
+| GZIP-9 | 10.88 MB | 4.3583499s | 13.6222ms | 156.594ms | 11.50x | 90.9093ms | 1 |
+| ZSTD-18 | 10.76 MB | 2.4186176s | 7.0567ms | 85.801ms | 12.16x | 103.8817ms | 1 |
+| SNAPPY | 12.04 MB | 2.8104062s | 4.3517ms | 44.3808ms | 10.20x | 72.8606ms | 1 |
+| LZ4 | 12.24 MB | 2.8064314s | 5.873ms | 135.093ms | 23.00x | 136.323ms | 1 |
+| BROTLI-9 | 10.76 MB | 3.3728874s | 27.9003ms | 464.6475ms | 16.65x | 340.8772ms | 1 |
+| UNCOMPRESSED | 12.31 MB | 3.9386614s | 7.2508ms | 36.9216ms | 5.09x | 66.7026ms | 1 |
+
+**By Number of Row Groups**
+
+| Row Groups | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |
+|----------|-----------|-------------|---------------|------------|---------|-------|------|
+| 1 RG | 8.63 MB | 3.921823s | 44.7161ms | 351.0242ms | 7.85x | 294.6081ms | 1 |
+| 2 RG | 9.48 MB | 2.2785905s | 5.574ms | 55.2946ms | 9.92x | 80.5ms | 1 |
+| 3 RG | 10.34 MB | 2.2239383s | 4.5927ms | 49.5821ms | 10.80x | 75.0611ms | 1 |
+| 4 RG | 11.19 MB | 2.5387176s | 5.355ms | 78.0208ms | 14.57x | 90.2933ms | 1 |
+| 5 RG | 12.05 MB | 2.7668245s | 5.1681ms | 76.8404ms | 14.87x | 104.251ms | 1 |
+| 6 RG | 12.88 MB | 3.0459368s | 8.6993ms | 234.5235ms | 26.96x | 153.8865ms | 1 |
+| 7 RG | 13.72 MB | 3.204549s | 11.4988ms | 510.6157ms | 44.41x | 325.7415ms | 1 |
+| 8 RG | 14.61 MB | 3.8799205s | 6.4055ms | 205.0157ms | 32.01x | 76.0354ms | 1 |
+| 9 RG | 15.47 MB | 2.1264371s | 3.5884ms | 32.9162ms | 9.17x | 68.347ms | 1 |
+| 10 RG | 16.29 MB | 2.1735702s | 3.6252ms | 36.2306ms | 9.99x | 70.1446ms | 1 |
+| 20 RG | 24.70 MB | 2.3807085s | 3.336ms | 45.7805ms | 13.72x | 79.8898ms | 1 |
+| 30 RG | 32.45 MB | 2.6266485s | 3.0417ms | 51.8349ms | 17.04x | 89.0738ms | 1 |
+| 40 RG | 39.11 MB | 2.9888384s | 3.5162ms | 52.9785ms | 15.07x | 95.2891ms | 1 |
+| 50 RG | 44.85 MB | 3.1646377s | 3.096ms | 62.1345ms | 20.07x | 103.1466ms | 1 |
+
+**By the number of random strings in the pool to be chosen from in creating the parquet file (cardinality)**
+
+| Pool Size | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |
+|---------|-----------|-------------|---------------|------------|---------|-------|------|
+| 50 | 3.66 MB | 1.0510112s | 11.4002ms | 88.745ms | 7.78x | 142.8014ms | 3 |
+| 500 | 5.83 MB | 2.9693827s | 5.4315ms | 42.7186ms | 7.86x | 65.1274ms | 1 |
+| 5000 | 12.06 MB | 2.5237372s | 4.4687ms | 35.3959ms | 7.92x | 68.5236ms | 1 |
+| 50000 | 46.08 MB | 5.8127867s | 18.4448ms | 92.0191ms | 4.99x | 152.171ms | 1 |
+| 500000 | 87.69 MB | 13.3885345s | 30.5061ms | 174.8759ms | 5.73x | 221.0582ms | 1 |
+
+**Where all the keywords being searched for exist within the columns, but the criteria as a whole does not exist in any row**
+
+| Method | Time | Rows Found |
+|--------|------|------------|
+| Keyword Index | 2.7821ms | 0 |
+| DataFusion | 227.592ms | 0 |
+| Naive | 340.7123ms | 0 |
+
+An **81.8x** speedup
+
+**Where the keywords do not exist in the data at all (pruned by bloom filter)**
+
+| Method | Time | Rows Found |
+|--------|------|------------|
+| Keyword Index | 1.3479ms | 0 |
+| DataFusion | 229.1298ms | 0 |
+| Naive | 320.7045ms | 0 |
+
+A **170x** speedup
 
 ---
 

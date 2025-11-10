@@ -457,19 +457,21 @@ mod performance_tests {
         println!("\n## {}\n", title);
 
         // Table header
-        println!("| {} | File Size | Index Build | Keyword Index | DataFusion | Naive | Rows |",
+        println!("| {} | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |",
                  dimension_label);
-        println!("|{}|-----------|-------------|---------------|------------|-------|------|",
+        println!("|{}|-----------|-------------|---------------|------------|---------|-------|------|",
                  "-".repeat(dimension_label.len()));
 
         // Table rows
         for row in results {
-            println!("| {} | {:.2} MB | {:?} | {:?} | {:?} | {:?} | {} |",
+            let speedup = row.datafusion_time.as_secs_f64() / row.keyword_time.as_secs_f64();
+            println!("| {} | {:.2} MB | {:?} | {:?} | {:?} | {:.2}x | {:?} | {} |",
                      row.dimension,
                      row.file_size_mb,
                      row.index_build_time,
                      row.keyword_time,
                      row.datafusion_time,
+                     speedup,
                      row.naive_time,
                      row.rows_found);
         }

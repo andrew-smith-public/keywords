@@ -37,6 +37,7 @@
 use arrow::array::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::file::reader::FileReader;
 use futures::StreamExt;
 use crate::searching::search_results::{SearchResult, CombinedSearchResult};
@@ -75,6 +76,93 @@ use object_store::path::Path as ObjectPath;
 pub struct PrunedParquetReader {
     source: ParquetSource,
 }
+
+/// Convert row ranges to a RowSelection for efficient row-level pruning.
+///
+/// This function builds a RowSelection that tells the Parquet reader exactly which rows to read,
+/// enabling page-level skipping for optimal performance. The reader will automatically use
+/// offset indexes (Parquet v2) if available, otherwise falls back to sequential page scanning
+/// with early termination.
+///
+/// # Arguments
+///
+/// * `ranges` - Sorted vector of (start_row, end_row) tuples (inclusive)
+/// * `total_rows` - Total number of rows in the row group
+///
+/// # Returns
+///
+/// A RowSelection that specifies which rows to select/skip, or None if all rows should be read
+fn build_row_selection(
+    ranges: &[(u32, u32)],
+    total_rows: usize,
+) -> Option<RowSelection> {
+    if ranges.is_empty() {
+        // No specific ranges - read all rows (don't use RowSelection)
+        return None;
+    }
+
+    // Sort ranges by start position to ensure correct ordering
+    let mut sorted_ranges = ranges.to_vec();
+    sorted_ranges.sort_by_key(|r| r.0);
+
+    let mut selectors = Vec::new();
+    let mut current_pos = 0u32;
+    let mut total_accounted = 0usize;  // Track total as we build
+
+    for &(start, end) in &sorted_ranges {
+        // Clamp range to valid bounds
+        let start = start.min(total_rows.saturating_sub(1) as u32);
+        let end = end.min(total_rows.saturating_sub(1) as u32);
+
+        // Skip if this range is entirely out of bounds or already covered
+        if start >= total_rows as u32 || end < current_pos {
+            continue;
+        }
+
+        // Skip rows before this range
+        if start > current_pos {
+            let skip_count = (start - current_pos) as usize;
+            selectors.push(RowSelector::skip(skip_count));
+            total_accounted += skip_count;
+            current_pos = start;
+        }
+
+        // Handle overlapping ranges: if start < current_pos, adjust to current_pos
+        let actual_start = current_pos.max(start);
+
+        // Select rows in this range (from actual_start to end, inclusive)
+        if end >= actual_start {
+            let select_count = (end - actual_start + 1) as usize;
+            selectors.push(RowSelector::select(select_count));
+            total_accounted += select_count;
+            current_pos = end + 1;
+        }
+    }
+
+    // Skip remaining rows after last range
+    if (current_pos as usize) < total_rows {
+        let skip_count = total_rows - current_pos as usize;
+        selectors.push(RowSelector::skip(skip_count));
+        total_accounted += skip_count;
+    }
+
+    // CRITICAL VALIDATION: Ensure we account for exactly total_rows
+    if total_accounted != total_rows {
+        // Selection is invalid - fall back to reading all rows
+        eprintln!("WARNING: RowSelection mismatch! Expected {} rows, got {} accounted. Falling back to full read.",
+                  total_rows, total_accounted);
+        eprintln!("  Ranges: {:?}", ranges);
+        eprintln!("  Selectors created: {}", selectors.len());
+        return None;
+    }
+
+    if selectors.is_empty() {
+        return None;
+    }
+
+    Some(RowSelection::from(selectors))
+}
+
 
 impl PrunedParquetReader {
     /// Create a new pruned Parquet reader for the specified source.
@@ -312,52 +400,36 @@ impl PrunedParquetReader {
                 }
             }
 
-            let mut stream = builder
-                .with_row_groups(vec![rg_idx])
-                .with_batch_size(8192)
-                .build()?;
+            // Get row group size and row ranges for this row group
+            let row_group_metadata = builder.metadata().row_group(rg_idx);
+            let row_group_size = row_group_metadata.num_rows() as usize;
+            let ranges = row_group_ranges.get(&(rg_idx as u16))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
 
-            // Get the row ranges for this row group
-            let ranges = row_group_ranges.get(&(rg_idx as u16));
+            // Build RowSelection for efficient row-level pruning (if needed)
+            let selection = build_row_selection(ranges, row_group_size);
 
-            let mut row_offset = 0u32;
+            // Apply row selection if we have specific ranges
+            let builder_with_rg = builder.with_row_groups(vec![rg_idx]);
+            let mut stream = if let Some(sel) = selection {
+                builder_with_rg
+                    .with_row_selection(sel)  // Only read needed rows!
+                    .with_batch_size(8192)
+                    .build()?
+            } else {
+                // No selection - read all rows in row group
+                builder_with_rg
+                    .with_batch_size(8192)
+                    .build()?
+            };
+
+            // Stream the selected rows
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
-                let batch_rows = batch.num_rows() as u32;
-
-                // Filter to only matching rows if we have specific ranges
-                let filtered_batch = if let Some(ranges) = ranges {
-                    // Adjust ranges to be relative to this batch
-                    let batch_relative_ranges: Vec<(u32, u32)> = ranges
-                        .iter()
-                        .filter_map(|&(start, end)| {
-                            // Check if this range overlaps with current batch
-                            if end < row_offset || start >= row_offset + batch_rows {
-                                None // Range doesn't overlap this batch
-                            } else {
-                                // Adjust range to be relative to batch start
-                                let batch_start = start.saturating_sub(row_offset);
-                                let batch_end = (end - row_offset).min(batch_rows - 1);
-                                Some((batch_start, batch_end))
-                            }
-                        })
-                        .collect();
-
-                    if batch_relative_ranges.is_empty() {
-                        row_offset += batch_rows;
-                        continue;
-                    }
-
-                    filter_batch_to_ranges(&batch, &batch_relative_ranges)?
-                } else {
-                    batch
-                };
-
-                if filtered_batch.num_rows() > 0 {
-                    all_batches.push(filtered_batch);
+                if batch.num_rows() > 0 {
+                    all_batches.push(batch);
                 }
-
-                row_offset += batch_rows;
             }
         }
 
@@ -658,47 +730,31 @@ impl PrunedParquetReader {
                     }
                 }
 
-                let mut stream = builder
-                    .with_row_groups(vec![rg_idx])
-                    .with_batch_size(batch_size)
-                    .build()?;
+                // Get row ranges and build RowSelection
+                let ranges = row_group_ranges.get(&(rg_idx as u16))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let selection = build_row_selection(ranges, row_group_size);
 
-                let ranges = row_group_ranges.get(&(rg_idx as u16));
-                let mut row_offset = 0u32;
+                // Apply row selection if we have specific ranges
+                let builder_with_rg = builder.with_row_groups(vec![rg_idx]);
+                let mut stream = if let Some(sel) = selection {
+                    builder_with_rg
+                        .with_row_selection(sel)  // Only read needed rows!
+                        .with_batch_size(batch_size)
+                        .build()?
+                } else {
+                    // No selection - read all rows in row group
+                    builder_with_rg
+                        .with_batch_size(batch_size)
+                        .build()?
+                };
 
                 while let Some(batch_result) = stream.next().await {
                     let batch = batch_result?;
-                    let batch_rows = batch.num_rows() as u32;
-
-                    let filtered_batch = if let Some(ranges) = ranges {
-                        let batch_relative_ranges: Vec<(u32, u32)> = ranges
-                            .iter()
-                            .filter_map(|&(start, end)| {
-                                if end < row_offset || start >= row_offset + batch_rows {
-                                    None
-                                } else {
-                                    let batch_start = start.saturating_sub(row_offset);
-                                    let batch_end = (end - row_offset).min(batch_rows - 1);
-                                    Some((batch_start, batch_end))
-                                }
-                            })
-                            .collect();
-
-                        if batch_relative_ranges.is_empty() {
-                            row_offset += batch_rows;
-                            continue;
-                        }
-
-                        filter_batch_to_ranges(&batch, &batch_relative_ranges)?
-                    } else {
-                        batch
-                    };
-
-                    if filtered_batch.num_rows() > 0 {
-                        all_batches.push(filtered_batch);
+                    if batch.num_rows() > 0 {
+                        all_batches.push(batch);
                     }
-
-                    row_offset += batch_rows;
                 }
             }
         } else {
@@ -757,47 +813,31 @@ impl PrunedParquetReader {
                 }
             }
 
-            let mut stream = builder
-                .with_row_groups(vec![rg_idx])
-                .with_batch_size(batch_size)
-                .build()?;
+            // Get row ranges and build RowSelection
+            let ranges = row_group_ranges.get(&(rg_idx as u16))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let selection = build_row_selection(ranges, row_group_size);
 
-            let ranges = row_group_ranges.get(&(rg_idx as u16));
-            let mut row_offset = 0u32;
+            // Apply row selection if we have specific ranges
+            let builder_with_rg = builder.with_row_groups(vec![rg_idx]);
+            let mut stream = if let Some(sel) = selection {
+                builder_with_rg
+                    .with_row_selection(sel)  // Only read needed rows!
+                    .with_batch_size(batch_size)
+                    .build()?
+            } else {
+                // No selection - read all rows in row group
+                builder_with_rg
+                    .with_batch_size(batch_size)
+                    .build()?
+            };
 
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
-                let batch_rows = batch.num_rows() as u32;
-
-                let filtered_batch = if let Some(ranges) = ranges {
-                    let batch_relative_ranges: Vec<(u32, u32)> = ranges
-                        .iter()
-                        .filter_map(|&(start, end)| {
-                            if end < row_offset || start >= row_offset + batch_rows {
-                                None
-                            } else {
-                                let batch_start = start.saturating_sub(row_offset);
-                                let batch_end = (end - row_offset).min(batch_rows - 1);
-                                Some((batch_start, batch_end))
-                            }
-                        })
-                        .collect();
-
-                    if batch_relative_ranges.is_empty() {
-                        row_offset += batch_rows;
-                        continue;
-                    }
-
-                    filter_batch_to_ranges(&batch, &batch_relative_ranges)?
-                } else {
-                    batch
-                };
-
-                if filtered_batch.num_rows() > 0 {
-                    all_batches.push(filtered_batch);
+                if batch.num_rows() > 0 {
+                    all_batches.push(batch);
                 }
-
-                row_offset += batch_rows;
             }
         }
 
