@@ -6,7 +6,10 @@ mod performance_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
+    #[cfg(not(debug_assertions))]
     use parquet::basic::{Compression, ZstdLevel, BrotliLevel, GzipLevel};
+    #[cfg(debug_assertions)]
+    use parquet::basic::{Compression, GzipLevel};
     use rand::Rng;
     use rand::distr::Alphanumeric;
     use std::fs::File;
@@ -572,12 +575,21 @@ mod performance_tests {
         let test_config = TestConfig::default();
 
         // Define compression algorithms to test (all valid for Parquet)
+
+        #[cfg(not(debug_assertions))]
         let compressions = vec![
             ("GZIP-9", Compression::GZIP(GzipLevel::try_new(9).unwrap())),
             ("ZSTD-18", Compression::ZSTD(ZstdLevel::try_new(18).unwrap())),
             ("SNAPPY", Compression::SNAPPY),
             ("LZ4", Compression::LZ4),
             ("BROTLI-9", Compression::BROTLI(BrotliLevel::try_new(9).unwrap())),
+            ("UNCOMPRESSED", Compression::UNCOMPRESSED),
+        ];
+
+        #[cfg(debug_assertions)]
+        let compressions = vec![
+            ("GZIP-5", Compression::GZIP(GzipLevel::try_new(5).unwrap())),
+            ("LZ4", Compression::LZ4),
             ("UNCOMPRESSED", Compression::UNCOMPRESSED),
         ];
 
@@ -633,7 +645,11 @@ mod performance_tests {
     async fn test_row_group_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
+        #[cfg(not(debug_assertions))]
         let row_group_counts = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50];
+
+        #[cfg(debug_assertions)]
+        let row_group_counts = vec![1, 10];
 
         let mut results = Vec::new();
 
@@ -685,7 +701,11 @@ mod performance_tests {
     async fn test_cardinality_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
+        #[cfg(not(debug_assertions))]
         let pool_sizes = vec![50, 500, 5_000, 50_000, 500_000];
+
+        #[cfg(debug_assertions)]
+        let pool_sizes = vec![50, 5_000];
 
         let mut results = Vec::new();
 
@@ -827,7 +847,11 @@ mod performance_tests {
     async fn test_consecutive_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
+        #[cfg(not(debug_assertions))]
         let target_row_counts = vec![1, 10, 100, 1_000, 10_000, 100_000];
+
+        #[cfg(debug_assertions)]
+        let target_row_counts = vec![10, 100];
 
         let mut results = Vec::new();
 
@@ -880,7 +904,11 @@ mod performance_tests {
     async fn test_random_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
 
+        #[cfg(not(debug_assertions))]
         let target_row_counts = vec![1, 10, 100, 1_000, 10_000, 100_000];
+
+        #[cfg(debug_assertions)]
+        let target_row_counts = vec![10, 100];
 
         let mut results = Vec::new();
 
