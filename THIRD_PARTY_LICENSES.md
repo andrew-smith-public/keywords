@@ -1385,7 +1385,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 The following components are licensed under ISC:
 
-- rustls-webpki 0.103.7
+- rustls-webpki 0.103.8
 
 ### License Text
 ```text
@@ -1632,22 +1632,21 @@ DEALINGS IN THE SOFTWARE.
 
 The following components are licensed under MIT:
 
-- cc 1.2.43
+- cc 1.2.44
 - cfg-if 1.0.4
 - find-msvc-tools 0.1.4
 - jobserver 0.1.34
-- js-sys 0.3.81
+- js-sys 0.3.82
 - openssl-probe 0.1.6
 - pkg-config 0.3.32
 - socket2 0.6.1
 - stacker 0.1.22
-- wasm-bindgen-backend 0.2.104
-- wasm-bindgen-futures 0.4.54
-- wasm-bindgen-macro-support 0.2.104
-- wasm-bindgen-macro 0.2.104
-- wasm-bindgen-shared 0.2.104
-- wasm-bindgen 0.2.104
-- web-sys 0.3.81
+- wasm-bindgen-futures 0.4.55
+- wasm-bindgen-macro-support 0.2.105
+- wasm-bindgen-macro 0.2.105
+- wasm-bindgen-shared 0.2.105
+- wasm-bindgen 0.2.105
+- web-sys 0.3.82
 
 ### License Text
 ```text
@@ -2462,7 +2461,7 @@ The following components are licensed under MIT:
 
 - hyper-rustls 0.27.7
 - rustls-native-certs 0.8.2
-- rustls 0.23.34
+- rustls 0.23.35
 
 ### License Text
 ```text
@@ -3787,7 +3786,7 @@ DEALINGS IN THE SOFTWARE.
 
 The following components are licensed under MIT:
 
-- rustls-pki-types 1.12.0
+- rustls-pki-types 1.13.0
 
 ### License Text
 ```text
@@ -4082,7 +4081,7 @@ DEALINGS IN THE SOFTWARE.
 
 The following components are licensed under MIT:
 
-- iri-string 0.7.8
+- iri-string 0.7.9
 
 ### License Text
 ```text
@@ -4687,7 +4686,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 The following components are licensed under MIT:
 
 - tokio-stream 0.1.17
-- tokio-util 0.7.16
+- tokio-util 0.7.17
 - tokio 1.48.0
 
 ### License Text
@@ -4868,8 +4867,8 @@ The following components are licensed under MIT:
 - once_cell 1.21.3
 - paste 1.0.15
 - pin-project-lite 0.2.16
-- proc-macro2 1.0.101
-- quote 1.0.41
+- proc-macro2 1.0.103
+- quote 1.0.42
 - rustix 1.1.2
 - rustversion 1.0.22
 - semver 1.0.27
@@ -4878,10 +4877,10 @@ The following components are licensed under MIT:
 - serde_core 1.0.228
 - serde_derive 1.0.228
 - serde_json 1.0.145
-- syn 2.0.107
+- syn 2.0.109
 - thiserror-impl 2.0.17
 - thiserror 2.0.17
-- unicode-ident 1.0.19
+- unicode-ident 1.0.22
 - wasi 0.11.1+wasi-snapshot-preview1
 - wasm-streams 0.4.2
 - wit-bindgen 0.46.0
@@ -5085,7 +5084,7 @@ THE SOFTWARE.
 
 The following components are licensed under MIT:
 
-- aho-corasick 1.1.3
+- aho-corasick 1.1.4
 - byteorder 1.5.0
 - csv-core 0.1.13
 - csv 1.4.0
@@ -5428,8 +5427,8 @@ SOFTWARE.
 
 The following components are licensed under MIT:
 
-- zstd-safe 7.2.1
-- zstd-sys 2.0.13+zstd.1.5.6
+- zstd-safe 7.2.4
+- zstd-sys 2.0.16+zstd.1.5.7
 - zstd 0.13.3
 
 ### License Text
@@ -5548,7 +5547,7 @@ THE SOFTWARE.
 
 The following components are licensed under Unicode-3.0:
 
-- unicode-ident 1.0.19
+- unicode-ident 1.0.22
 
 ### License Text
 ```text
@@ -5599,24 +5598,24 @@ authorization of the copyright holder.
 
 The following components are licensed under Unicode-3.0:
 
-- icu_collections 2.0.0
-- icu_locale_core 2.0.0
-- icu_normalizer 2.0.0
-- icu_normalizer_data 2.0.0
-- icu_properties 2.0.1
-- icu_properties_data 2.0.1
-- icu_provider 2.0.0
-- litemap 0.8.0
-- potential_utf 0.1.3
-- tinystr 0.8.1
-- writeable 0.6.1
-- yoke-derive 0.8.0
-- yoke 0.8.0
+- icu_collections 2.1.1
+- icu_locale_core 2.1.1
+- icu_normalizer 2.1.1
+- icu_normalizer_data 2.1.1
+- icu_properties 2.1.1
+- icu_properties_data 2.1.1
+- icu_provider 2.1.1
+- litemap 0.8.1
+- potential_utf 0.1.4
+- tinystr 0.8.2
+- writeable 0.6.2
+- yoke-derive 0.8.1
+- yoke 0.8.1
 - zerofrom-derive 0.1.6
 - zerofrom 0.1.6
-- zerotrie 0.2.2
-- zerovec-derive 0.11.1
-- zerovec 0.11.4
+- zerotrie 0.2.3
+- zerovec-derive 0.11.2
+- zerovec 0.11.5
 
 ### License Text
 ```text
