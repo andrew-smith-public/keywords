@@ -19,8 +19,8 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//!     // Build an index
-//!     build_and_save_index("data.parquet", None, None, None).await?;
+//!     // Build an index with default compression
+//!     build_and_save_index("data.parquet", None, None, None, None, None).await?;
 //!
 //!     // Search for a keyword
 //!     let result = search("data.parquet", "example", None, true).await?;
@@ -51,10 +51,11 @@ use indexmap::IndexSet;
 use std::rc::Rc;
 use std::collections::HashSet as StdHashSet;
 use bytes::Bytes;
-use crate::index_data::{build_distributed_index, save_distributed_index};
+use crate::index_data::{build_distributed_index, save_distributed_index, CompressionAlgorithm};
 use crate::utils::column_pool::ColumnPool;
 use crate::index_structure::column_filter::ColumnFilter;
 use crate::column_parquet_reader::process_parquet_file;
+use crate::index_structure::index_files::{index_filename, IndexFile};
 use crate::keyword_shred::KeywordOneFile;
 use crate::searching::keyword_search::KeywordSearcher;
 use crate::searching::search_results::SearchResult;
@@ -147,6 +148,9 @@ pub struct IndexInfo {
     /// Index configuration
     pub error_rate: f64,
 
+    /// Compression configuration
+    pub keywords_compression: CompressionAlgorithm,
+    pub data_compression: CompressionAlgorithm,
     /// Column information
     pub num_columns: usize,
     pub indexed_columns: Vec<String>,
@@ -169,9 +173,14 @@ pub async fn build_and_save_index(
     parquet_path: &str,
     exclude_columns: Option<StdHashSet<String>>,
     error_rate: Option<f64>,
-    index_file_prefix: Option<&str>
+    index_file_prefix: Option<&str>,
+    keywords_compression: Option<CompressionAlgorithm>,
+    data_compression: Option<CompressionAlgorithm>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let error_rate = error_rate.unwrap_or(0.01);
+    let keywords_compression = keywords_compression.unwrap_or(CompressionAlgorithm::Zstd { level: 8 });
+    let data_compression = data_compression.unwrap_or(CompressionAlgorithm::Zstd { level: 8 });
+
 
     // Validate error_rate is within acceptable range
     if error_rate < 0.0000000001 || error_rate > 0.5 {
@@ -186,7 +195,7 @@ pub async fn build_and_save_index(
     let result = process_parquet_file(source.clone(), exclude_columns, Some(error_rate)).await?;
 
     println!("Building distributed index...");
-    let files = build_distributed_index(&result, &source, error_rate).await?;
+    let files = build_distributed_index(&result, &source, error_rate, keywords_compression, data_compression).await?;
 
     println!("Saving index files...");
     save_distributed_index(&files, parquet_path, index_file_prefix).await?;
@@ -296,6 +305,8 @@ pub async fn get_index_info(
         parquet_size,
         parquet_last_modified,
         error_rate,
+        keywords_compression: searcher.filters.keywords_compression,
+        data_compression: searcher.filters.data_compression,
         num_columns,
         indexed_columns,
         total_keywords,
@@ -456,9 +467,7 @@ pub async fn validate_index(
 /// ```
 pub async fn index_exists(parquet_path: &str) -> bool {
     // Try to check if filters file exists using object store abstraction
-    let filters_path = format!("{}.index/{}", parquet_path,
-                               crate::index_structure::index_files::index_filename(
-                                   crate::index_structure::index_files::IndexFile::Filters, None));
+    let filters_path = format!("{}.index/{}", parquet_path, index_filename(IndexFile::Filters, None));
 
     match get_object_store(&filters_path).await {
         Ok((store, path)) => store.head(&path).await.is_ok(),
@@ -489,10 +498,14 @@ pub async fn build_index_in_memory(
     source: ParquetSource,
     exclude_columns: Option<StdHashSet<String>>,
     error_rate: Option<f64>,
+    keywords_compression: Option<CompressionAlgorithm>,
+    data_compression: Option<CompressionAlgorithm>,
 ) -> Result<KeywordSearcher, Box<dyn std::error::Error + Send + Sync>> {
     use crate::utils::file_interaction_local_and_cloud::register_memory_file;
 
     let error_rate = error_rate.unwrap_or(0.01);
+    let keywords_compression = keywords_compression.unwrap_or(CompressionAlgorithm::Zstd { level: 8 });
+    let data_compression = data_compression.unwrap_or(CompressionAlgorithm::Zstd { level: 8 });
 
     if error_rate < 0.0000000001 || error_rate > 0.5 {
         return Err(format!(
@@ -526,7 +539,7 @@ pub async fn build_index_in_memory(
 
     // Build index using memory path
     let result = process_parquet_file(source, exclude_columns, Some(error_rate)).await?;
-    let files = build_distributed_index(&result, &ParquetSource::Path(memory_path.clone()), error_rate).await?;
+    let files = build_distributed_index(&result, &ParquetSource::Path(memory_path.clone()), error_rate, keywords_compression, data_compression).await?;
 
     // Save to memory using the abstraction
     save_distributed_index(&files, &memory_path, None).await?;

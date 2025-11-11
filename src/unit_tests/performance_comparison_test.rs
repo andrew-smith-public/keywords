@@ -13,6 +13,7 @@ mod performance_tests {
     use rand::Rng;
     use rand::distr::Alphanumeric;
     use std::fs::File;
+    use serial_test::serial;
     use crate::build_and_save_index;
     use crate::searching::keyword_search::KeywordSearcher;
     use crate::searching::pruned_reader::PrunedParquetReader;
@@ -31,6 +32,9 @@ mod performance_tests {
     impl Default for TestConfig {
         fn default() -> Self {
             Self {
+                #[cfg(feature = "perf_multi")]
+                iterations: 25,
+                #[cfg(not(feature = "perf_multi"))]
                 iterations: 1,
             }
         }
@@ -138,6 +142,7 @@ mod performance_tests {
         datafusion_time: Duration,
         naive_time: Duration,
         rows_found: usize,
+        index_size_mb: f64
     }
 
     // ============================================================================
@@ -156,6 +161,19 @@ mod performance_tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Get index file size in MB (specifically the data.bin file)
+    fn get_index_size_mb(file_path: &str) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        let index_dir = format!("{}.index", file_path);
+        let data_bin_path = format!("{}/data.bin", index_dir);
+
+        if std::path::Path::new(&data_bin_path).exists() {
+            let metadata = std::fs::metadata(&data_bin_path)?;
+            Ok(metadata.len() as f64 / (1024.0 * 1024.0))
+        } else {
+            Ok(0.0)
+        }
     }
 
     /// Generate a parquet file with specified configuration
@@ -392,7 +410,14 @@ mod performance_tests {
         file_path: &str,
     ) -> Result<Duration, Box<dyn std::error::Error + Send + Sync>> {
         let start = Instant::now();
-        build_and_save_index(file_path, None, Some(0.01), None).await?;
+        build_and_save_index(
+            file_path,
+            None,
+            Some(0.01),
+            None,
+            None,
+            None
+        ).await?;
         Ok(start.elapsed())
     }
 
@@ -526,17 +551,18 @@ mod performance_tests {
         println!("\n## {}\n", title);
 
         // Table header
-        println!("| {} | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |",
+        println!("| {} | File Size | Index Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |",
                  dimension_label);
-        println!("|{}|-----------|-------------|---------------|------------|---------|-------|------|",
+        println!("|{}|-----------|------------|-------------|---------------|------------|---------|-------|------|",
                  "-".repeat(dimension_label.len()));
 
         // Table rows
         for row in results {
             let speedup = row.datafusion_time.as_secs_f64() / row.keyword_time.as_secs_f64();
-            println!("| {} | {:.2} MB | {:?} | {:?} | {:?} | {:.2}x | {:?} | {} |",
+            println!("| {} | {:.2} MB | {:.2} MB | {:?} | {:?} | {:?} | {:.2}x | {:?} | {} |",
                      row.dimension,
                      row.file_size_mb,
+                     row.index_size_mb,
                      row.index_build_time,
                      row.keyword_time,
                      row.datafusion_time,
@@ -563,6 +589,12 @@ mod performance_tests {
             println!("- Smallest file: `{}` ({:.2} MB)", results[smallest].dimension, results[smallest].file_size_mb);
         }
 
+        if let Some((smallest_idx, _)) = results.iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.index_size_mb.partial_cmp(&b.index_size_mb).unwrap()) {
+            println!("- Smallest index: `{}` ({:.2} MB)", results[smallest_idx].dimension, results[smallest_idx].index_size_mb);
+        }
+
         println!();
     }
 
@@ -570,6 +602,7 @@ mod performance_tests {
     // Test 1: Compression Algorithm Comparison
     // ============================================================================
     #[tokio::test]
+    #[serial]
     #[cfg_attr(feature = "ci", ignore)]
     async fn test_compression_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
@@ -605,21 +638,24 @@ mod performance_tests {
 
                 let test_result = run_performance_test(&file_path, &search_values).await?;
                 let file_size = get_file_size_mb(&file_path)?;
+                let index_size = get_index_size_mb(&file_path)?;
 
                 cleanup(&file_path)?;
 
-                iteration_results.push((test_result, file_size));
+                iteration_results.push((test_result, file_size, index_size));
             }
 
             // Average results
             let avg_result = TestResult::average(
-                &iteration_results.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
+                &iteration_results.iter().map(|(r, _, _)| r.clone()).collect::<Vec<_>>()
             );
-            let avg_size = iteration_results.iter().map(|(_, s)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_size = iteration_results.iter().map(|(_, s, _)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_index_size = iteration_results.iter().map(|(_, _, i)| i).sum::<f64>() / iteration_results.len() as f64;
 
             results.push(ComparisonRow {
                 dimension: name.to_string(),
                 file_size_mb: avg_size,
+                index_size_mb: avg_index_size,
                 index_build_time: avg_result.index_build_time,
                 keyword_time: avg_result.keyword_time,
                 datafusion_time: avg_result.datafusion_time,
@@ -641,6 +677,7 @@ mod performance_tests {
     // Test 2: Row Group Count Comparison
     // ============================================================================
     #[tokio::test]
+    #[serial]
     #[cfg_attr(feature = "ci", ignore)]
     async fn test_row_group_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
@@ -662,20 +699,24 @@ mod performance_tests {
 
                 let test_result = run_performance_test(&file_path, &search_values).await?;
                 let file_size = get_file_size_mb(&file_path)?;
+                let index_size = get_index_size_mb(&file_path)?;
 
                 cleanup(&file_path)?;
 
-                iteration_results.push((test_result, file_size));
+                iteration_results.push((test_result, file_size, index_size));
             }
 
+            // Average results
             let avg_result = TestResult::average(
-                &iteration_results.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
+                &iteration_results.iter().map(|(r, _, _)| r.clone()).collect::<Vec<_>>()
             );
-            let avg_size = iteration_results.iter().map(|(_, s)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_size = iteration_results.iter().map(|(_, s, _)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_index_size = iteration_results.iter().map(|(_, _, i)| i).sum::<f64>() / iteration_results.len() as f64;
 
             results.push(ComparisonRow {
                 dimension: format!("{} RG", num_row_groups),
                 file_size_mb: avg_size,
+                index_size_mb: avg_index_size,
                 index_build_time: avg_result.index_build_time,
                 keyword_time: avg_result.keyword_time,
                 datafusion_time: avg_result.datafusion_time,
@@ -697,6 +738,7 @@ mod performance_tests {
     // Test 3: String Pool Size (Cardinality) Comparison
     // ============================================================================
     #[tokio::test]
+    #[serial]
     #[cfg_attr(feature = "ci", ignore)]
     async fn test_cardinality_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
@@ -718,18 +760,22 @@ mod performance_tests {
 
                 let test_result = run_performance_test(&file_path, &search_values).await?;
                 let file_size = get_file_size_mb(&file_path)?;
+                let index_size = get_index_size_mb(&file_path)?;
 
                 cleanup(&file_path)?;
 
-                iteration_results.push((test_result, file_size));
+                iteration_results.push((test_result, file_size, index_size));
             }
 
+            // Average results
             let avg_result = TestResult::average(
-                &iteration_results.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
+                &iteration_results.iter().map(|(r, _, _)| r.clone()).collect::<Vec<_>>()
             );
-            let avg_size = iteration_results.iter().map(|(_, s)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_size = iteration_results.iter().map(|(_, s, _)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_index_size = iteration_results.iter().map(|(_, _, i)| i).sum::<f64>() / iteration_results.len() as f64;
 
             results.push(ComparisonRow {
+                index_size_mb: avg_index_size,
                 dimension: format!("{}", pool_size),
                 file_size_mb: avg_size,
                 index_build_time: avg_result.index_build_time,
@@ -753,6 +799,7 @@ mod performance_tests {
     // Test 4: False Positive Scenario (Keywords Exist But Not Together)
     // ============================================================================
     #[tokio::test]
+    #[serial]
     #[cfg_attr(feature = "ci", ignore)]
     async fn test_false_positive_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
@@ -797,6 +844,7 @@ mod performance_tests {
     // Test 5: Bloom Filter Miss Scenario (Keywords Don't Exist)
     // ============================================================================
     #[tokio::test]
+    #[serial]
     #[cfg_attr(feature = "ci", ignore)]
     async fn test_bloom_miss_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
@@ -843,6 +891,7 @@ mod performance_tests {
     // Test 6: Targeted Search - Consecutive Rows
     // ============================================================================
     #[tokio::test]
+    #[serial]
     #[cfg_attr(feature = "ci", ignore)]
     async fn test_consecutive_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
@@ -865,18 +914,22 @@ mod performance_tests {
 
                 let test_result = run_performance_test(&file_path, &search_values).await?;
                 let file_size = get_file_size_mb(&file_path)?;
+                let index_size = get_index_size_mb(&file_path)?;
 
                 cleanup(&file_path)?;
 
-                iteration_results.push((test_result, file_size));
+                iteration_results.push((test_result, file_size, index_size));
             }
 
+            // Average results
             let avg_result = TestResult::average(
-                &iteration_results.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
+                &iteration_results.iter().map(|(r, _, _)| r.clone()).collect::<Vec<_>>()
             );
-            let avg_size = iteration_results.iter().map(|(_, s)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_size = iteration_results.iter().map(|(_, s, _)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_index_size = iteration_results.iter().map(|(_, _, i)| i).sum::<f64>() / iteration_results.len() as f64;
 
             results.push(ComparisonRow {
+                index_size_mb: avg_index_size,
                 dimension: format!("{} rows", target_rows),
                 file_size_mb: avg_size,
                 index_build_time: avg_result.index_build_time,
@@ -900,6 +953,7 @@ mod performance_tests {
     // Test 7: Targeted Search - Random Rows
     // ============================================================================
     #[tokio::test]
+    #[serial]
     #[cfg_attr(feature = "ci", ignore)]
     async fn test_random_comparison() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let test_config = TestConfig::default();
@@ -922,18 +976,22 @@ mod performance_tests {
 
                 let test_result = run_performance_test(&file_path, &search_values).await?;
                 let file_size = get_file_size_mb(&file_path)?;
+                let index_size = get_index_size_mb(&file_path)?;
 
                 cleanup(&file_path)?;
 
-                iteration_results.push((test_result, file_size));
+                iteration_results.push((test_result, file_size, index_size));
             }
 
+            // Average results
             let avg_result = TestResult::average(
-                &iteration_results.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
+                &iteration_results.iter().map(|(r, _, _)| r.clone()).collect::<Vec<_>>()
             );
-            let avg_size = iteration_results.iter().map(|(_, s)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_size = iteration_results.iter().map(|(_, s, _)| s).sum::<f64>() / iteration_results.len() as f64;
+            let avg_index_size = iteration_results.iter().map(|(_, _, i)| i).sum::<f64>() / iteration_results.len() as f64;
 
             results.push(ComparisonRow {
+                index_size_mb: avg_index_size,
                 dimension: format!("{} rows", target_rows),
                 file_size_mb: avg_size,
                 index_build_time: avg_result.index_build_time,

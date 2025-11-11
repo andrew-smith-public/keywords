@@ -9,6 +9,66 @@ use crate::utils::file_interaction_local_and_cloud::get_object_store;
 use crate::{KeywordOneFile, ParquetSource, ProcessResult, MAX_CHUNK_SIZE_BYTES};
 use crate::index_structure::index_files::{index_filename, IndexFile};
 
+/// Compression algorithm used for index data.
+///
+/// Determines how keyword lists and data sections are compressed in the index.
+/// Compression reduces disk space and network transfer time at the cost of CPU
+/// during indexing and search operations.
+///
+/// # Variants
+///
+/// * `None` - No compression (faster indexing, larger files)
+/// * `Zstd { level }` - Zstandard compression with configurable level (1-22)
+///   - Level 1-3: Fast compression, lower ratio
+///   - Level 15: Balanced (default)
+///   - Level 20-22: Maximum compression, slower
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[rkyv(derive(Debug))]
+pub enum CompressionAlgorithm {
+    None,
+    Zstd { level: i32 },
+}
+
+impl CompressionAlgorithm {
+    /// Compress data using this algorithm.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Uncompressed data bytes
+    ///
+    /// # Returns
+    ///
+    /// Compressed data bytes, or error if compression fails
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            CompressionAlgorithm::None => Ok(data.to_vec()),
+            CompressionAlgorithm::Zstd { level } => {
+                zstd::encode_all(data, *level)
+                    .map_err(|e| format!("Zstd compression failed: {}", e).into())
+            }
+        }
+    }
+
+    /// Decompress data using this algorithm.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Compressed data bytes
+    ///
+    /// # Returns
+    ///
+    /// Decompressed data bytes, or error if decompression fails
+    pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            CompressionAlgorithm::None => Ok(data.to_vec()),
+            CompressionAlgorithm::Zstd { .. } => {
+                zstd::decode_all(data)
+                    .map_err(|e| format!("Zstd decompression failed: {}", e).into())
+            }
+        }
+    }
+}
+
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug)]
 pub struct IndexFilters {
     // Version & validation
@@ -27,6 +87,10 @@ pub struct IndexFilters {
     pub error_rate: f64,
     pub split_chars_inclusive: Vec<Vec<char>>,
 
+    // Compression configuration
+    pub keywords_compression: CompressionAlgorithm,
+    pub data_compression: CompressionAlgorithm,
+
     // Data structures
     pub column_pool: ColumnPool,
     pub column_filters: StdHashMap<String, ColumnFilter>,
@@ -37,6 +101,14 @@ pub struct IndexFilters {
 /// Information about a chunk in the data file.
 ///
 /// Each chunk contains both a keyword list section and a data section.
+/// Both sections are compressed according to the global compression settings
+/// in IndexFilters. The lengths stored here refer to compressed data only,
+/// not including padding.
+///
+/// Chunks are separated by 16-byte alignment padding to ensure proper
+/// rkyv deserialization after decompression. The padding is not included
+/// in total_length.
+///
 /// The keyword list can be read independently for parent lookups without
 /// loading the full occurrence data.
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
@@ -44,15 +116,16 @@ pub struct ChunkInfo {
     /// First keyword in this chunk (for binary search)
     pub start_keyword: String,
 
-    /// Byte offset in data.bin where this chunk starts
+    /// Byte offset in data.bin where this chunk starts (16-byte aligned)
     pub offset: u64,
 
-    /// Length in bytes of just the keyword list section
-    /// Reading `[offset, offset + keyword_list_length]` gives `Vec<String>`
+    /// Length in bytes of compressed keyword list section
+    /// Reading `[offset, offset + keyword_list_length]` gives compressed Vec<String>
     pub keyword_list_length: u32,
 
-    /// Total length in bytes of keyword list + data section
-    /// Reading `[offset, offset + total_length]` gives complete chunk
+    /// Total length in bytes of compressed keyword list + compressed data section
+    /// Reading `[offset, offset + total_length]` gives complete compressed chunk
+    /// Does not include padding between chunks
     pub total_length: u32,
 
     /// Number of keywords in this chunk (dynamic, based on ~1MB serialized size target)
@@ -204,22 +277,26 @@ fn convert_to_flat(
 /// 3. Assigns keywords to chunks and creates keyword location mapping
 /// 4. For each chunk:
 ///    - Serializes keyword list (Vec<String>)
+///    - Compresses keyword list using specified algorithm
 ///    - Serializes keyword data (Vec<KeywordDataFlat>)
-///    - Tracks both section lengths for independent access
+///    - Compresses keyword data using specified algorithm
+///    - Tracks both compressed section lengths for independent access
 /// 5. Constructs filters file with chunk index pointing to data.bin locations
 ///
 /// The function creates two output files:
-/// - **Filters file**: Contains Parquet metadata, bloom filters, column pool, and chunk index
-/// - **Data file**: Contains chunked keyword lists + occurrence data, enabling range reads
+/// - **Filters file**: Contains Parquet metadata, bloom filters, column pool, chunk index, and compression settings
+/// - **Data file**: Contains compressed chunked keyword lists + occurrence data, enabling range reads
 ///
 /// # Chunk Structure in data.bin
 ///
-/// Each chunk consists of two consecutive sections:
+/// Each chunk consists of two consecutive compressed sections followed by alignment padding:
 /// ```text
-/// [Keyword List: Vec<String>]    ← keyword_list_length bytes
-/// [Data: Vec<KeywordDataFlat>]   ← (total_length - keyword_list_length) bytes
+/// [Compressed Keyword List]    ← keyword_list_length bytes
+/// [Compressed Data]             ← (total_length - keyword_list_length) bytes
+/// [Padding]                     ← 0-15 bytes to align next chunk to 16-byte boundary
 /// ```
 ///
+/// The padding ensures proper rkyv deserialization after decompression.
 /// This allows reading just keyword strings for parent lookups without loading full data.
 ///
 /// # Arguments
@@ -227,24 +304,28 @@ fn convert_to_flat(
 /// * `result` - Reference to the ProcessResult containing keyword maps, filters, and column data
 /// * `parquet_path` - Path to the source Parquet file for metadata retrieval
 /// * `error_rate` - Bloom filter error rate used during index creation
+/// * `keywords_compression` - Compression algorithm for keyword lists (default: Zstd level 15)
+/// * `data_compression` - Compression algorithm for keyword data (default: Zstd level 15)
 ///
 /// # Returns
 ///
 /// Returns `Result<DistributedIndexFiles, Box<dyn std::error::Error + Send + Sync>>`:
 /// - `Ok(DistributedIndexFiles)` - Container with both serialized index files
-/// - `Err` - If object store access fails, serialization fails, or metadata retrieval fails
+/// - `Err` - If object store access fails, serialization fails, compression fails, or metadata retrieval fails
 ///
 /// # Errors
 ///
 /// This function will return an error if:
 /// - The Parquet file cannot be accessed or metadata cannot be retrieved
 /// - Serialization of any index component fails
+/// - Compression of any chunk fails
 /// - Memory allocation fails during data structure construction
 ///
 /// # Performance Considerations
 ///
 /// - Keywords are sorted once for deterministic layout
-/// - Data is chunked (size defined by METADATA_CHUNK_SIZE) to enable efficient partial loading
+/// - Data is chunked (size defined by MAX_CHUNK_SIZE_BYTES) to enable efficient partial loading
+/// - Compression reduces index size significantly (typically 60-80% reduction)
 /// - Uses rkyv for zero-copy deserialization support
 /// - Parent keyword references converted to chunk+position pairs for efficient lookup
 /// - Keyword lists stored separately from data for lightweight parent resolution
@@ -252,26 +333,39 @@ fn convert_to_flat(
 /// # Examples
 ///
 /// ```no_run
-/// # use keywords::index_data::build_distributed_index;
+/// # use keywords::index_data::{build_distributed_index, CompressionAlgorithm};
 /// use keywords::ParquetSource;
 /// use keywords::column_parquet_reader::process_parquet_file;
-/// use keywords::index_data::DistributedIndexFiles;
 /// # async fn example() -> () {
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
 ///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None).await.unwrap();
-///     build_distributed_index(
+///
+///     // Build with default compression
+///     let index_files = build_distributed_index(
+///         &result,
+///         &ParquetSource::from(parquet_bytes.clone()),
+///         0.01,
+///         CompressionAlgorithm::Zstd { level: 8 },
+///         CompressionAlgorithm::Zstd { level: 8 },
+///     ).await.unwrap();
+///
+///     // Build without compression
+///     let index_files_uncompressed = build_distributed_index(
 ///         &result,
 ///         &ParquetSource::from(parquet_bytes),
-///         0.01
+///         0.01,
+///         CompressionAlgorithm::None,
+///         CompressionAlgorithm::None,
 ///     ).await.unwrap();
 /// # }
-/// // index_files now contains filters and data ready to be written
 /// ```
 pub async fn build_distributed_index(
     result: &ProcessResult,
     source: &ParquetSource,
     error_rate: f64,
+    keywords_compression: CompressionAlgorithm,
+    data_compression: CompressionAlgorithm,
 ) -> Result<DistributedIndexFiles, Box<dyn std::error::Error + Send + Sync>> {
     // Get parquet metadata for validation and to cache metadata location
     let (parquet_etag, parquet_size, parquet_last_modified, parquet_metadata_offset, parquet_metadata_length) = match source {
@@ -295,27 +389,28 @@ pub async fn build_distributed_index(
             ]) as u64;
 
             // Metadata includes: FileMetaData + 4 bytes footer_len + 4 bytes "PAR1"
-            let metadata_total_length = footer_len + 8;
-            let metadata_offset = file_size - metadata_total_length;
+            let metadata_length = footer_len + 8;
+            let metadata_offset = file_size - metadata_length;
 
             (
-                head.e_tag.unwrap_or_else(|| "unknown".to_string()),
+                head.e_tag.unwrap_or_default(),
                 file_size,
                 head.last_modified.timestamp() as u64,
                 metadata_offset,
-                metadata_total_length,
+                metadata_length,
             )
         }
-        ParquetSource::Bytes(vec) => {
-            // For in-memory bytes, calculate metadata location
-            let file_size = vec.len() as u64;
+        ParquetSource::Bytes(bytes) => {
+            // For in-memory sources, we don't have real metadata
+            // Use dummy values but include the bytes length
+            let file_size = bytes.len() as u64;
 
-            // Read the last 8 bytes to get footer length
+            // Calculate metadata offset from bytes (read footer)
             if file_size < 8 {
-                return Err("Parquet file too small".into());
+                return Err("Parquet data too small".into());
             }
 
-            let footer_slice = &vec[(file_size - 8) as usize..];
+            let footer_slice = &bytes[(file_size as usize - 8)..];
             let footer_len = u32::from_le_bytes([
                 footer_slice[0],
                 footer_slice[1],
@@ -323,56 +418,74 @@ pub async fn build_distributed_index(
                 footer_slice[3],
             ]) as u64;
 
-            let metadata_total_length = footer_len + 8;
-            let metadata_offset = file_size - metadata_total_length;
+            let metadata_length = footer_len + 8;
+            let metadata_offset = file_size - metadata_length;
 
-            ("".to_string(), file_size, 0, metadata_offset, metadata_total_length)
+            (
+                String::new(), // No etag for in-memory
+                file_size,
+                0, // No timestamp for in-memory
+                metadata_offset,
+                metadata_length,
+            )
         }
     };
 
-    // Sort keywords for deterministic layout
+    // =========================================================================
+    // Pass 1: Serialize keywords to determine actual sizes and chunk boundaries
+    // =========================================================================
+
+    // Collect all keywords and sort for consistent ordering
     let mut sorted_keywords: Vec<_> = result.keyword_map.iter().collect();
-    sorted_keywords.sort_by(|a, b| a.0.cmp(b.0));
+    sorted_keywords.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
 
-    // =========================================================================
-    // Pass 1: Determine chunk boundaries based on ~1MB serialized size
-    // =========================================================================
+    println!("  Total unique keywords: {}", sorted_keywords.len());
+    println!("  Serializing keywords to determine chunk sizes...");
 
-    // First, we need to estimate sizes and determine chunk boundaries
-    let mut chunk_boundaries = Vec::new(); // Stores (start_idx, end_idx) for each chunk
+    // Serialize each keyword without parent mapping to get accurate sizes
+    let empty_map = HashMap::new();
+    let mut chunk_boundaries = Vec::new();
     let mut current_chunk_start = 0;
-    let mut current_chunk_estimated_size = 0;
+    let mut current_chunk_size = 0;
 
-    for (idx, (_keyword, keyword_data)) in sorted_keywords.iter().enumerate() {
-        // Rough size estimation without full serialization
-        // KeywordOneFile structure: column_references, row_groups, row_group_to_rows
-        let mut estimated_size = 100; // Base overhead per keyword
+    for (idx, (keyword, keyword_data)) in sorted_keywords.iter().enumerate() {
+        // Serialize without parent mapping (pass empty map)
+        let flat_data = convert_to_flat(keyword_data, &empty_map);
+        let data_bytes = to_bytes::<RkyvError>(&flat_data)
+            .map_err(|e| format!("Failed to serialize keyword data: {}", e))?;
 
-        estimated_size += keyword_data.column_references.len() * 20; // Column references
+        let keyword_bytes = keyword.as_bytes().len();
+        let this_size = keyword_bytes + data_bytes.len();
 
-        // Estimate row group data: row_group_to_rows is Vec<Vec<Vec<Row>>>
-        // Outer Vec = columns, Middle Vec = row groups, Inner Vec = rows
-        for col_rgs in &keyword_data.row_group_to_rows {
-            for rg_rows in col_rgs {
-                estimated_size += 10; // Row group overhead
-                estimated_size += rg_rows.len() * 40; // ~40 bytes per row entry
+        // Check if we should start a new chunk
+        // Special case: if this single keyword is huge, put it alone in a chunk
+        if this_size > MAX_CHUNK_SIZE_BYTES {
+            // Finalize previous chunk if it has content
+            if idx > current_chunk_start {
+                chunk_boundaries.push((current_chunk_start, idx));
             }
-        }
-
-        // If adding this keyword would exceed limit and we have at least one keyword, finalize chunk
-        if current_chunk_estimated_size + estimated_size > MAX_CHUNK_SIZE_BYTES && idx > current_chunk_start {
+            // This huge keyword gets its own chunk
+            chunk_boundaries.push((idx, idx + 1));
+            current_chunk_start = idx + 1;
+            current_chunk_size = 0;
+            println!("    Warning: Keyword '{}' is {}MB, exceeds target chunk size",
+                     keyword, this_size / 1_048_576);
+        } else if current_chunk_size + this_size > MAX_CHUNK_SIZE_BYTES && idx > current_chunk_start {
+            // Start new chunk
             chunk_boundaries.push((current_chunk_start, idx));
             current_chunk_start = idx;
-            current_chunk_estimated_size = 0;
+            current_chunk_size = this_size;
+        } else {
+            current_chunk_size += this_size;
         }
-
-        current_chunk_estimated_size += estimated_size;
     }
 
     // Add final chunk
-    chunk_boundaries.push((current_chunk_start, sorted_keywords.len()));
+    if current_chunk_start < sorted_keywords.len() {
+        chunk_boundaries.push((current_chunk_start, sorted_keywords.len()));
+    }
 
-    println!("  Creating {} dynamic chunks (target: ~1MB per chunk)", chunk_boundaries.len());
+    println!("  Created {} chunks (target: ~1MB per chunk)", chunk_boundaries.len());
 
     // =========================================================================
     // Pass 2: Build keyword → location mapping based on determined chunks
@@ -398,7 +511,7 @@ pub async fn build_distributed_index(
         .collect();
 
     // =========================================================================
-    // Pass 3: Build data file with dynamically-sized chunks
+    // Pass 3: Re-serialize with parent mapping and build data file chunks
     // =========================================================================
 
     let mut data_file = Vec::new();
@@ -414,7 +527,7 @@ pub async fn build_distributed_index(
             .map(|(keyword, _)| keyword.to_string())
             .collect();
 
-        // Build data list for this chunk
+        // Build data list for this chunk with proper parent mapping
         let mut data_in_chunk = Vec::new();
 
         for (_keyword, keyword_data) in chunk {
@@ -423,17 +536,19 @@ pub async fn build_distributed_index(
             data_in_chunk.push(flat_data);
         }
 
-        // Serialize keyword list section
+        // Serialize and compress keyword list section
         let keyword_list_bytes = to_bytes::<RkyvError>(&keywords_in_chunk)
             .map_err(|e| format!("Failed to serialize keyword list: {}", e))?;
-        let keyword_list_length = keyword_list_bytes.len() as u32;
-        data_file.extend_from_slice(&keyword_list_bytes);
+        let compressed_keyword_list = keywords_compression.compress(&keyword_list_bytes)?;
+        let keyword_list_length = compressed_keyword_list.len() as u32;
+        data_file.extend_from_slice(&compressed_keyword_list);
 
-        // Serialize data section
+        // Serialize and compress data section
         let data_bytes = to_bytes::<RkyvError>(&data_in_chunk)
             .map_err(|e| format!("Failed to serialize chunk data: {}", e))?;
-        let data_length = data_bytes.len() as u32;
-        data_file.extend_from_slice(&data_bytes);
+        let compressed_data = data_compression.compress(&data_bytes)?;
+        let data_length = compressed_data.len() as u32;
+        data_file.extend_from_slice(&compressed_data);
 
         let total_length = keyword_list_length + data_length;
         let chunk_count = keywords_in_chunk.len() as u16;
@@ -446,6 +561,14 @@ pub async fn build_distributed_index(
             total_length,
             count: chunk_count,
         });
+
+        // Add padding to ensure next chunk starts at 16-byte aligned offset
+        let current_position = data_file.len();
+        let alignment = 16;
+        let padding_needed = (alignment - (current_position % alignment)) % alignment;
+        if padding_needed > 0 {
+            data_file.extend_from_slice(&vec![0u8; padding_needed]);
+        }
     }
 
     // Build filters file
@@ -462,6 +585,8 @@ pub async fn build_distributed_index(
         parquet_metadata_length,
         error_rate,
         split_chars_inclusive: split_chars_vec,
+        keywords_compression,
+        data_compression,
         column_pool: result.column_pool.clone(),
         column_filters: result.column_filters.iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
@@ -482,8 +607,8 @@ pub async fn build_distributed_index(
 /// Container for the distributed index files.
 ///
 /// Contains the two components of the 2-file index structure:
-/// - filters: Bloom filters, metadata, column pool, and chunk index
-/// - data: Chunked keyword lists and occurrence data
+/// - filters: Bloom filters, metadata, column pool, chunk index, and compression settings
+/// - data: Compressed chunked keyword lists and occurrence data
 pub struct DistributedIndexFiles {
     pub filters: Vec<u8>,
     pub data: Vec<u8>,
@@ -526,9 +651,8 @@ pub struct DistributedIndexFiles {
 /// # Examples
 ///
 /// ```no_run
-/// # use keywords::index_data::save_distributed_index;
+/// # use keywords::index_data::{save_distributed_index, build_distributed_index, CompressionAlgorithm};
 /// use keywords::ParquetSource;
-/// use keywords::index_data::build_distributed_index;
 /// use keywords::column_parquet_reader::process_parquet_file;
 ///
 /// # async fn example() -> () {
@@ -536,7 +660,13 @@ pub struct DistributedIndexFiles {
 ///     let parquet_bytes = vec![/* generated parquet data */];
 ///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None).await.unwrap();
 ///
-///     let index_files = build_distributed_index(&result, &ParquetSource::from(parquet_bytes), 0.01).await.unwrap();
+///     let index_files = build_distributed_index(
+///         &result,
+///         &ParquetSource::from(parquet_bytes),
+///         0.01,
+///         CompressionAlgorithm::Zstd { level: 8 },
+///         CompressionAlgorithm::Zstd { level: 8 },
+///     ).await.unwrap();
 ///
 ///     // Save without prefix (path can be arbitrary for in-memory sources)
 ///     save_distributed_index(&index_files, "my_data.parquet", None).await.unwrap();

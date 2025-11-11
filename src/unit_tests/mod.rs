@@ -5,3 +5,4 @@ pub mod integration_tests;
 #[cfg(test)]
 pub mod comprehensive_test;
 mod performance_comparison_test;
+mod compression_level_analysis;

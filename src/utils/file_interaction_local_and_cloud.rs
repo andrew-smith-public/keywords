@@ -77,7 +77,7 @@ static MEMORY_STORE: Lazy<Arc<InMemory>> = Lazy::new(|| Arc::new(InMemory::new()
 /// register_memory_file("memory://test.parquet", data).await.unwrap();
 ///
 /// // Now can use with any function that takes a path
-/// // build_and_save_index("memory://test.parquet", None, None, None).await?;
+/// // build_and_save_index("memory://test.parquet", None, None, None, None, None).await?;
 /// # });
 /// ```
 pub async fn register_memory_file(path: &str, data: Bytes) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

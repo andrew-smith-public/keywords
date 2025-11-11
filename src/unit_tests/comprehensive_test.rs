@@ -657,7 +657,9 @@ mod comprehensive_large_file_tests {
         let searcher = build_index_in_memory(
             ParquetSource::Bytes(parquet_bytes),
             None,
-            Some(0.01)
+            Some(0.01),
+            None,
+            None
         ).await.expect("Failed to build index");
         println!("Index building time: {:.2?}\n", start_index.elapsed());
 

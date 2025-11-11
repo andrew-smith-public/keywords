@@ -1,6 +1,6 @@
 # Keywords - High-Performance Keyword Search for Parquet Files
 
-**Fast keyword index and search for Parquet files achieving 5-170x speedups over Apache DataFusion, with 7.5x improvement for selective queries on moderate-cardinality data.**
+**Fast keyword index and search for Parquet files achieving up to 129x speedups over Apache DataFusion, with 4.7x improvement for selective queries on moderate-cardinality data.**
 
 ## Executive Summary
 
@@ -22,9 +22,9 @@ High-performance Rust library and CLI tool for building keyword indexes on Parqu
 
 **Tested Capabilities**
 - Successfully indexes and searches individual Parquet files
-- 7.5x faster than DataFusion for selective queries on moderate-cardinality data
-- 81.8x faster when keywords exist separately but not together
-- 170x faster when keywords don't exist (bloom filter rejection)
+- 4.7x faster than DataFusion for selective queries on moderate-cardinality data
+- 7.4x faster when keywords exist separately but not together
+- 129x faster when keywords don't exist (bloom filter rejection)
 - Indexes approximately 15 million keywords in 4GB RAM (high-cardinality data)
 
 ## Project Context
@@ -110,7 +110,7 @@ The index is stored as a `.index` directory adjacent to the Parquet file:
 data.parquet
 data.parquet.index/
 ├── filters.rkyv          # Bloom filters, metadata, column pool, and chunk index
-└── data.bin              # Chunked keyword lists and occurrence data
+└── data.bin              # Compressed chunked keyword lists and occurrence data
 ```
 
 ### Core Components
@@ -196,14 +196,14 @@ Testing on representative hardware with a 500,000-row Parquet file containing 5,
 ┌─────────────────────────────────┬──────────────┬──────────────┐
 │ Approach                        │ Time         │ Speedup      │
 ├─────────────────────────────────┼──────────────┼──────────────┤
-│ Keyword Index (this project)    │      12.41ms │ baseline     │
-│ DataFusion (pushdown + pruning) │      96.01ms │ 7.74x faster │
-│ Naive (read all, filter)        │      93.37ms │ 7.52x faster │
+│ Keyword Index (this project)    │      10.13ms │ baseline     │
+│ DataFusion (pushdown + pruning) │      47.81ms │ 4.72x faster │
+│ Naive (read all, filter)        │      68.34ms │ 6.75x faster │
 └─────────────────────────────────┴──────────────┴──────────────┘
 ```
 
 **Key Observations:**
-- Keyword index: **7.5x faster** than Apache DataFusion for this workload
+- Keyword index: **4.7x faster** than Apache DataFusion for this workload
 - DataFusion and naive approaches show similar performance (19ms vs 21ms), demonstrating that row group statistics provide minimal pruning benefit for higher-cardinality random data
 - Pre-computed bloom filters eliminate the runtime cost of statistics evaluation
 - Absolute times vary based on hardware, file size, and data characteristics
@@ -230,61 +230,61 @@ Full test code available in [performance_comparison_test.rs](src/unit_tests/perf
 
 | Compression | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |
 |-----------|-----------|-------------|---------------|------------|---------|-------|------|
-| GZIP-9 | 10.88 MB | 4.3583499s | 13.6222ms | 156.594ms | 11.50x | 90.9093ms | 1 |
-| ZSTD-18 | 10.76 MB | 2.4186176s | 7.0567ms | 85.801ms | 12.16x | 103.8817ms | 1 |
-| SNAPPY | 12.04 MB | 2.8104062s | 4.3517ms | 44.3808ms | 10.20x | 72.8606ms | 1 |
-| LZ4 | 12.24 MB | 2.8064314s | 5.873ms | 135.093ms | 23.00x | 136.323ms | 1 |
-| BROTLI-9 | 10.76 MB | 3.3728874s | 27.9003ms | 464.6475ms | 16.65x | 340.8772ms | 1 |
-| UNCOMPRESSED | 12.31 MB | 3.9386614s | 7.2508ms | 36.9216ms | 5.09x | 66.7026ms | 1 |
+| GZIP-9 | 10.88 MB | 3.4199817s | 9.8619ms | 47.1435ms | 4.78x | 81.2882ms | 1 |
+| ZSTD-18 | 10.74 MB | 3.9432419s | 7.897ms | 41.3682ms | 5.24x | 77.215ms | 1 |
+| SNAPPY | 12.06 MB | 3.623418s | 6.1355ms | 29.0629ms | 4.74x | 64.9799ms | 1 |
+| LZ4 | 12.26 MB | 3.4841745s | 5.8859ms | 28.047ms | 4.77x | 64.6821ms | 1 |
+| BROTLI-9 | 10.75 MB | 3.5646943s | 12.0096ms | 89.1047ms | 7.42x | 127.2695ms | 1 |
+| UNCOMPRESSED | 12.32 MB | 3.3711396s | 5.3076ms | 26.863ms | 5.06x | 65.1426ms | 1 |
 
 **By Number of Row Groups**
 
 | Row Groups | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |
 |----------|-----------|-------------|---------------|------------|---------|-------|------|
-| 1 RG | 8.63 MB | 3.921823s | 44.7161ms | 351.0242ms | 7.85x | 294.6081ms | 1 |
-| 2 RG | 9.48 MB | 2.2785905s | 5.574ms | 55.2946ms | 9.92x | 80.5ms | 1 |
-| 3 RG | 10.34 MB | 2.2239383s | 4.5927ms | 49.5821ms | 10.80x | 75.0611ms | 1 |
-| 4 RG | 11.19 MB | 2.5387176s | 5.355ms | 78.0208ms | 14.57x | 90.2933ms | 1 |
-| 5 RG | 12.05 MB | 2.7668245s | 5.1681ms | 76.8404ms | 14.87x | 104.251ms | 1 |
-| 6 RG | 12.88 MB | 3.0459368s | 8.6993ms | 234.5235ms | 26.96x | 153.8865ms | 1 |
-| 7 RG | 13.72 MB | 3.204549s | 11.4988ms | 510.6157ms | 44.41x | 325.7415ms | 1 |
-| 8 RG | 14.61 MB | 3.8799205s | 6.4055ms | 205.0157ms | 32.01x | 76.0354ms | 1 |
-| 9 RG | 15.47 MB | 2.1264371s | 3.5884ms | 32.9162ms | 9.17x | 68.347ms | 1 |
-| 10 RG | 16.29 MB | 2.1735702s | 3.6252ms | 36.2306ms | 9.99x | 70.1446ms | 1 |
-| 20 RG | 24.70 MB | 2.3807085s | 3.336ms | 45.7805ms | 13.72x | 79.8898ms | 1 |
-| 30 RG | 32.45 MB | 2.6266485s | 3.0417ms | 51.8349ms | 17.04x | 89.0738ms | 1 |
-| 40 RG | 39.11 MB | 2.9888384s | 3.5162ms | 52.9785ms | 15.07x | 95.2891ms | 1 |
-| 50 RG | 44.85 MB | 3.1646377s | 3.096ms | 62.1345ms | 20.07x | 103.1466ms | 1 |
+| 1 RG | 8.63 MB | 3.0620407s | 8.1927ms | 37.7718ms | 4.61x | 61.7811ms | 1 |
+| 2 RG | 9.48 MB | 3.1185151s | 6.6753ms | 35.5222ms | 5.32x | 62.5651ms | 1 |
+| 3 RG | 10.32 MB | 3.0907206s | 5.7233ms | 47.5411ms | 8.31x | 65.2361ms | 1 |
+| 4 RG | 11.20 MB | 3.1808725s | 5.4951ms | 28.5979ms | 5.20x | 65.4227ms | 1 |
+| 5 RG | 12.03 MB | 3.2585228s | 5.9572ms | 29.8952ms | 5.02x | 65.9698ms | 1 |
+| 6 RG | 12.87 MB | 3.4324421s | 5.8792ms | 31.4059ms | 5.34x | 66.474ms | 1 |
+| 7 RG | 13.76 MB | 3.5064593s | 5.8601ms | 30.2749ms | 5.17x | 83.5822ms | 1 |
+| 8 RG | 14.61 MB | 3.5183013s | 6.1231ms | 33.9602ms | 5.55x | 68.6671ms | 1 |
+| 9 RG | 15.42 MB | 3.560135s | 6.1496ms | 32.465ms | 5.28x | 69.6454ms | 1 |
+| 10 RG | 16.30 MB | 3.6291479s | 6.2515ms | 33.1341ms | 5.30x | 70.7447ms | 1 |
+| 20 RG | 24.72 MB | 4.114057s | 6.8005ms | 39.8315ms | 5.86x | 79.6355ms | 1 |
+| 30 RG | 32.54 MB | 4.4996789s | 7.1707ms | 47.0762ms | 6.57x | 88.1797ms | 1 |
+| 40 RG | 39.09 MB | 4.8473155s | 7.1574ms | 54.5048ms | 7.62x | 96.4199ms | 1 |
+| 50 RG | 44.54 MB | 5.1684349s | 6.53ms | 60.141ms | 9.21x | 102.7322ms | 1 |
 
 **By Cardinality (number of random strings in the pool used to build the parquet file)**
 
 | Pool Size | File Size | Index Build | Keyword Index | DataFusion | Speedup | Naive | Rows |
 |---------|-----------|-------------|---------------|------------|---------|-------|------|
-| 50 | 3.66 MB | 1.0510112s | 11.4002ms | 88.745ms | 7.78x | 142.8014ms | 3 |
-| 500 | 5.83 MB | 2.9693827s | 5.4315ms | 42.7186ms | 7.86x | 65.1274ms | 1 |
-| 5000 | 12.06 MB | 2.5237372s | 4.4687ms | 35.3959ms | 7.92x | 68.5236ms | 1 |
-| 50000 | 46.08 MB | 5.8127867s | 18.4448ms | 92.0191ms | 4.99x | 152.171ms | 1 |
-| 500000 | 87.69 MB | 13.3885345s | 30.5061ms | 174.8759ms | 5.73x | 221.0582ms | 1 |
+| 50 | 3.66 MB | 1.9747809s | 15.5858ms | 26.1259ms | 1.68x | 62.7014ms | 4 |
+| 500 | 5.82 MB | 2.2467061s | 4.088ms | 23.4609ms | 5.74x | 55.2885ms | 1 |
+| 5000 | 12.05 MB | 3.2037869s | 6.2443ms | 27.7583ms | 4.45x | 63.4311ms | 1 |
+| 50000 | 46.11 MB | 7.0693962s | 16.4559ms | 57.0207ms | 3.47x | 114.8148ms | 1 |
+| 500000 | 87.67 MB | 14.356577s | 28.0444ms | 100.3602ms | 3.58x | 160.536ms | 1 |
 
 **Where all keywords exist within columns, but not together in any row**
 
 | Method | Time | Rows Found |
 |--------|------|------------|
-| Keyword Index | 2.7821ms | 0 |
-| DataFusion | 227.592ms | 0 |
-| Naive | 340.7123ms | 0 |
+| Keyword Index | 4.0108ms | 0 |
+| DataFusion | 29.7844ms | 0 |
+| Naive | 66.1238ms | 0 |
 
-An **81.8x** speedup
+An **7.4x** speedup
 
 **Where keywords do not exist in the data at all (bloom filter rejection)**
 
 | Method | Time | Rows Found |
 |--------|------|------------|
-| Keyword Index | 1.3479ms | 0 |
-| DataFusion | 229.1298ms | 0 |
-| Naive | 320.7045ms | 0 |
+| Keyword Index | 396.3µs | 0 |
+| DataFusion | 51.254ms | 0 |
+| Naive | 81.5495ms | 0 |
 
-A **170x** speedup
+A **129x** speedup
 
 ---
 
@@ -400,6 +400,7 @@ The index currently stores complete row-level detail for every keyword occurrenc
 - Row group mappings
 - Parent keyword relationships for phrase search
 - Split-level metadata
+- Block compression in data.bin
 
 For keywords appearing in a small to moderate number of rows, this provides excellent search performance with minimal overhead. However, for very common keywords appearing across many rows, the index size can grow substantially while providing diminishing returns.
 
@@ -529,7 +530,6 @@ Single-threaded was chosen for the POC phase to reduce complexity while establis
 - Case-insensitive search option (store keywords normalized)
 - Wildcard support (trailing wildcards initially)
 - Metadata caching within index (eliminate additional GET requests)
-- Block compression in data.bin
 - Improved delimiter configuration
 - Row information threshold for high-frequency keywords (see Index Size Management section)
 

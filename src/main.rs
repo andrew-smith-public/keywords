@@ -109,6 +109,49 @@ use std::process;
 /// Parquet Keyword Indexer and Searcher
 /// ...
 /// ```
+/// Parse compression argument from command line.
+///
+/// Accepts formats:
+/// - "none" - No compression
+/// - "zstd:LEVEL" - Zstandard with level (e.g., "zstd:15")
+///
+/// # Arguments
+///
+/// * `arg` - Command line argument string
+///
+/// # Returns
+///
+/// CompressionAlgorithm parsed from argument
+///
+/// # Panics
+///
+/// Panics with helpful error message if format is invalid
+fn parse_compression_arg(arg: &str) -> keywords::index_data::CompressionAlgorithm {
+    if arg == "none" {
+        keywords::index_data::CompressionAlgorithm::None
+    } else if arg.starts_with("zstd:") {
+        let level_str = &arg[5..];
+        match level_str.parse::<i32>() {
+            Ok(level) if level >= 1 && level <= 22 => {
+                keywords::index_data::CompressionAlgorithm::Zstd { level }
+            }
+            Ok(level) => {
+                eprintln!("Error: Zstd compression level must be between 1 and 22, got {}\n", level);
+                process::exit(1);
+            }
+            Err(_) => {
+                eprintln!("Error: Invalid compression level '{}'\n", level_str);
+                print_help();
+                process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("Error: Invalid compression format '{}'. Use 'none' or 'zstd:LEVEL'\n", arg);
+        print_help();
+        process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
@@ -130,13 +173,47 @@ async fn main() {
 
     match command.as_str() {
         "index" => {
-            if args.len() != 3 {
-                eprintln!("Error: 'index' command requires exactly one file path\n");
+            if args.len() < 3 {
+                eprintln!("Error: 'index' command requires at least a file path\n");
                 print_help();
                 process::exit(1);
             }
             let file_path = &args[2];
-            handle_index(file_path).await;
+
+            // Parse optional compression arguments
+            let mut keywords_compression = keywords::index_data::CompressionAlgorithm::Zstd { level: 8 };
+            let mut data_compression = keywords::index_data::CompressionAlgorithm::Zstd { level: 8 };
+
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--keywords-compression" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Error: --keywords-compression requires an argument (none, zstd:LEVEL)\n");
+                            print_help();
+                            process::exit(1);
+                        }
+                        keywords_compression = parse_compression_arg(&args[i + 1]);
+                        i += 2;
+                    }
+                    "--data-compression" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Error: --data-compression requires an argument (none, zstd:LEVEL)\n");
+                            print_help();
+                            process::exit(1);
+                        }
+                        data_compression = parse_compression_arg(&args[i + 1]);
+                        i += 2;
+                    }
+                    _ => {
+                        eprintln!("Error: Unknown argument '{}'\n", args[i]);
+                        print_help();
+                        process::exit(1);
+                    }
+                }
+            }
+
+            handle_index(file_path, keywords_compression, data_compression).await;
         }
         "search" => {
             if args.len() != 4 {
@@ -217,11 +294,11 @@ async fn main() {
 /// - The process is single-threaded but I/O optimized
 /// - Memory usage is proportional to the number of unique keywords
 /// - S3 access requires appropriate AWS credentials
-async fn handle_index(file_path: &str) {
+async fn handle_index(file_path: &str, keywords_compression: keywords::index_data::CompressionAlgorithm, data_compression: keywords::index_data::CompressionAlgorithm) {
     println!("Indexing file: {}", file_path);
     println!("This may take a while for large files...\n");
 
-    match keywords::build_and_save_index(file_path, None, None, None).await {
+    match keywords::build_and_save_index(file_path, None, None, None, Some(keywords_compression), Some(data_compression)).await {
         Ok(()) => {
             println!("\n✓ Indexing completed successfully!");
         }
@@ -452,6 +529,14 @@ async fn handle_search(file_path: &str, keyword: &str) {
 /// Error: No index found for 'data.parquet'
 /// Please run 'index' command first to create the index.
 /// ```
+/// Format compression algorithm for display.
+fn format_compression(compression: &keywords::index_data::CompressionAlgorithm) -> String {
+    match compression {
+        keywords::index_data::CompressionAlgorithm::None => "None".to_string(),
+        keywords::index_data::CompressionAlgorithm::Zstd { level } => format!("Zstd (level {})", level),
+    }
+}
+
 async fn handle_index_info(file_path: &str) {
     // First check if index exists
     if !keywords::index_exists(file_path).await {
@@ -473,6 +558,8 @@ async fn handle_index_info(file_path: &str) {
             println!("──────────────");
             println!("Version:              {}", info.version);
             println!("Error Rate:           {} ({:.2}%)", info.error_rate, info.error_rate * 100.0);
+            println!("Keywords Compression: {}", format_compression(&info.keywords_compression));
+            println!("Data Compression:     {}", format_compression(&info.data_compression));
             println!("Max Chunk Size:       {} bytes ({:.2} MB)",
                      info.max_chunk_size_bytes,
                      info.max_chunk_size_bytes as f64 / (1024.0 * 1024.0));
@@ -587,7 +674,7 @@ fn print_help() {
     println!("Parquet Keyword Indexer and Searcher");
     println!();
     println!("USAGE:");
-    println!("  {} index <file.parquet>", env::args().nth(0).unwrap_or_else(|| "program".to_string()));
+    println!("  {} index <file.parquet> [OPTIONS]", env::args().nth(0).unwrap_or_else(|| "program".to_string()));
     println!("  {} search <file.parquet> <keyword>", env::args().nth(0).unwrap_or_else(|| "program".to_string()));
     println!("  {} index_info <file.parquet>", env::args().nth(0).unwrap_or_else(|| "program".to_string()));
     println!("  {} --help", env::args().nth(0).unwrap_or_else(|| "program".to_string()));
@@ -598,11 +685,23 @@ fn print_help() {
     println!("  index_info         Display detailed information about an index");
     println!();
     println!("OPTIONS:");
-    println!("  --help, -h         Show this help message");
+    println!("  --help, -h                    Show this help message");
+    println!("  --keywords-compression ARG    Compression for keyword lists");
+    println!("                                  none = no compression");
+    println!("                                  zstd:LEVEL = Zstandard (1-22, default: 15)");
+    println!("  --data-compression ARG        Compression for keyword data");
+    println!("                                  none = no compression");
+    println!("                                  zstd:LEVEL = Zstandard (1-22, default: 15)");
     println!();
     println!("EXAMPLES:");
-    println!("  # Create an index");
+    println!("  # Create an index with default compression (Zstd level 15)");
     println!("  {} index data.parquet", env::args().nth(0).unwrap_or_else(|| "program".to_string()));
+    println!();
+    println!("  # Create an index without compression");
+    println!("  {} index data.parquet --keywords-compression none --data-compression none", env::args().nth(0).unwrap_or_else(|| "program".to_string()));
+    println!();
+    println!("  # Create an index with maximum compression");
+    println!("  {} index data.parquet --keywords-compression zstd:22 --data-compression zstd:22", env::args().nth(0).unwrap_or_else(|| "program".to_string()));
     println!();
     println!("  # Search for a keyword");
     println!("  {} search data.parquet \"hello\"", env::args().nth(0).unwrap_or_else(|| "program".to_string()));

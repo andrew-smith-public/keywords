@@ -10,10 +10,13 @@ mod tests {
     use rand::Rng;
     use rand::distr::Alphanumeric;
     use std::fs::File;
+    use rkyv::rancor::Error as RkyvError;
     use crate::build_and_save_index;
+    use serial_test::serial;
 
     #[tokio::test]
     #[cfg_attr(feature = "ci", ignore)]
+    #[serial]
     async fn test_performance_with_debug() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
         let index_file_prefix = Some("test_performance_comparison_");
@@ -113,14 +116,161 @@ mod tests {
         println!("Building keyword index...");
         let index_start = Instant::now();
 
-        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix).await?;
+        build_and_save_index(
+            &file_path,
+            None,
+            Some(0.01),
+            index_file_prefix,
+            None,
+            None
+        ).await?;
 
         let index_time = index_start.elapsed();
         println!("Index built in: {:?}\n", index_time);
 
-        // Step 5.5: Test raw disk I/O performance for data.bin
-        println!("Testing raw disk I/O performance...");
+        // Step 5.5: Analyze chunk sizes from filters.rkyv
+        println!("=== Chunk Size Analysis ===");
         use crate::utils::file_interaction_local_and_cloud::get_object_store;
+        use crate::index_structure::index_files::{index_filename, IndexFile};
+
+        let filters_path = format!("{}.index/{}", file_path,
+                                   if let Some(prefix) = index_file_prefix {
+                                       format!("{}filters.rkyv", prefix)
+                                   } else {
+                                       "filters.rkyv".to_string()
+                                   }
+        );
+
+        // Read and deserialize filters
+        let (store, path) = get_object_store(&filters_path).await?;
+        let filters_bytes = store.get(&path).await?.bytes().await?;
+
+        use rkyv::util::AlignedVec;
+        use rkyv::Archived;
+        use crate::index_data::IndexFilters;
+
+        let mut aligned = AlignedVec::<16>::new();
+        aligned.extend_from_slice(&filters_bytes);
+        let archived_filters: &Archived<IndexFilters> = rkyv::access(&aligned)
+            .map_err(|e: RkyvError| format!("Failed to access filters: {}", e))?;
+
+        let num_chunks = archived_filters.chunk_index.len();
+        println!("Total chunks: {}", num_chunks);
+        println!("Compression: keywords={:?}, data={:?}",
+                 archived_filters.keywords_compression,
+                 archived_filters.data_compression);
+        println!();
+
+        // Analyze chunk sizes
+        let mut total_compressed_keywords = 0u64;
+        let mut total_compressed_data = 0u64;
+        let mut total_compressed = 0u64;
+
+        for (idx, chunk) in archived_filters.chunk_index.iter().enumerate().take(5) {
+            let keyword_len = chunk.keyword_list_length.to_native();
+            let total_len = chunk.total_length.to_native();
+            let data_len = total_len - keyword_len;
+
+            println!("Chunk {} (compressed):", idx);
+            println!("  Keywords: {} bytes ({:.2} KB)", keyword_len, keyword_len as f64 / 1024.0);
+            println!("  Data:     {} bytes ({:.2} KB)", data_len, data_len as f64 / 1024.0);
+            println!("  Total:    {} bytes ({:.2} KB)", total_len, total_len as f64 / 1024.0);
+
+            total_compressed_keywords += keyword_len as u64;
+            total_compressed_data += data_len as u64;
+            total_compressed += total_len as u64;
+        }
+
+        if num_chunks > 5 {
+            println!("... ({} more chunks)", num_chunks - 5);
+
+            // Sum all chunks
+            for chunk in archived_filters.chunk_index.iter() {
+                let keyword_len = chunk.keyword_list_length.to_native() as u64;
+                let total_len = chunk.total_length.to_native() as u64;
+                let data_len = total_len - keyword_len;
+
+                total_compressed_keywords += keyword_len;
+                total_compressed_data += data_len;
+                total_compressed += total_len;
+            }
+        }
+
+        println!();
+        println!("Summary (compressed):");
+        println!("  Total keywords: {} bytes ({:.2} MB)", total_compressed_keywords, total_compressed_keywords as f64 / (1024.0 * 1024.0));
+        println!("  Total data:     {} bytes ({:.2} MB)", total_compressed_data, total_compressed_data as f64 / (1024.0 * 1024.0));
+        println!("  Total:          {} bytes ({:.2} MB)", total_compressed, total_compressed as f64 / (1024.0 * 1024.0));
+        println!();
+
+        // Now decompress a few chunks to see actual uncompressed sizes
+        println!("Analyzing uncompressed sizes (first 5 chunks)...");
+
+        let data_bin_path = format!("{}.index/{}", file_path,
+                                    if let Some(prefix) = index_file_prefix {
+                                        format!("{}data.bin", prefix)
+                                    } else {
+                                        "data.bin".to_string()
+                                    }
+        );
+
+        let (data_store, data_path) = get_object_store(&data_bin_path).await?;
+
+        let mut total_uncompressed_keywords = 0u64;
+        let mut total_uncompressed_data = 0u64;
+
+        for (idx, chunk) in archived_filters.chunk_index.iter().enumerate().take(5) {
+            let offset = chunk.offset.to_native();
+            let keyword_len = chunk.keyword_list_length.to_native() as u64;
+            let total_len = chunk.total_length.to_native() as u64;
+
+            // Read compressed chunk
+            let range = offset..(offset + total_len);
+            let compressed_bytes = data_store.get_range(&data_path, range).await?.to_vec();
+
+            let compressed_keyword_bytes = &compressed_bytes[..keyword_len as usize];
+            let compressed_data_bytes = &compressed_bytes[keyword_len as usize..];
+
+            // Decompress
+            use crate::index_data::CompressionAlgorithm;
+            let keywords_compression = match &archived_filters.keywords_compression {
+                Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
+                Archived::<CompressionAlgorithm>::Zstd { level } => {
+                    CompressionAlgorithm::Zstd { level: level.to_native() }
+                }
+            };
+            let data_compression = match &archived_filters.data_compression {
+                Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
+                Archived::<CompressionAlgorithm>::Zstd { level } => {
+                    CompressionAlgorithm::Zstd { level: level.to_native() }
+                }
+            };
+
+            let uncompressed_keywords = keywords_compression.decompress(compressed_keyword_bytes)?;
+            let uncompressed_data = data_compression.decompress(compressed_data_bytes)?;
+
+            let uncomp_kw_len = uncompressed_keywords.len();
+            let uncomp_data_len = uncompressed_data.len();
+            let uncomp_total = uncomp_kw_len + uncomp_data_len;
+
+            println!("Chunk {} (uncompressed):", idx);
+            println!("  Keywords: {} bytes ({:.2} KB)", uncomp_kw_len, uncomp_kw_len as f64 / 1024.0);
+            println!("  Data:     {} bytes ({:.2} KB)", uncomp_data_len, uncomp_data_len as f64 / 1024.0);
+            println!("  Total:    {} bytes ({:.2} KB)", uncomp_total, uncomp_total as f64 / 1024.0);
+            println!("  Compression ratio: {:.2}x", uncomp_total as f64 / total_len as f64);
+
+            total_uncompressed_keywords += uncomp_kw_len as u64;
+            total_uncompressed_data += uncomp_data_len as u64;
+        }
+
+        println!();
+        println!("Average uncompressed chunk size (first 5): {:.2} KB",
+                 (total_uncompressed_keywords + total_uncompressed_data) as f64 / (5.0 * 1024.0));
+        println!("Target chunk size: ~1024 KB (1 MB)");
+        println!();
+
+        // Step 5.6: Test raw disk I/O performance for data.bin
+        println!("Testing raw disk I/O performance...");
 
         let data_bin_path = format!("{}.index/{}", file_path,
                                     if let Some(prefix) = index_file_prefix {
@@ -215,7 +365,6 @@ mod tests {
         let chunk_time = chunk_start.elapsed();
 
         // Phase 3: Read chunk from disk (I/O only)
-        use crate::index_structure::index_files::{index_filename, IndexFile};
 
         let chunk_info = &searcher.filters.chunk_index[chunk_idx];
         let data_path = format!("{}/{}",
@@ -228,34 +377,41 @@ mod tests {
         let length = chunk_info.total_length as u64;
         let range = start..(start + length);
         let result = store.get_range(&obj_path, range).await?;
-
-        // Copy once into aligned buffer (optimization #1)
-        let mut buffer = AlignedVec::<16>::new();
-        buffer.extend_from_slice(&result);
+        let compressed_buffer = result.to_vec();
         let io_time = io_start.elapsed();
 
-        // Phase 4: Deserialize keywords
-        use rkyv::util::AlignedVec;
-        use rkyv::Archived;
-        use rkyv::rancor::Error as RkyvError;
+        // Phase 4: Decompress and deserialize keywords
 
         let deser_keywords_start = Instant::now();
         let keyword_length = chunk_info.keyword_list_length as usize;
 
-        // Access keywords directly from aligned buffer (no additional copy)
-        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&buffer[..keyword_length])
+        // Split compressed buffer into keyword and data sections
+        let compressed_keyword_bytes = &compressed_buffer[..keyword_length];
+        let compressed_data_bytes = &compressed_buffer[keyword_length..];
+
+        // Decompress keyword section
+        let keyword_bytes = searcher.filters.keywords_compression.decompress(compressed_keyword_bytes)?;
+
+        // Deserialize keywords from decompressed data
+        let mut keyword_buffer = AlignedVec::<16>::new();
+        keyword_buffer.extend_from_slice(&keyword_bytes);
+        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&keyword_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
         let keywords: Vec<String> = archived_keywords.iter().map(|s| s.to_string()).collect();
         let deser_keywords_time = deser_keywords_start.elapsed();
 
-        // Phase 5: Zero-copy access to data (NO deserialization yet)
+        // Phase 5: Decompress and access data
         let deser_data_start = Instant::now();
 
-        // Access data directly from aligned buffer (no additional copy)
+        // Decompress data section
+        let data_bytes = searcher.filters.data_compression.decompress(compressed_data_bytes)?;
+
+        // Deserialize data from decompressed data
         use crate::index_data::KeywordDataFlat;
-        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&buffer[keyword_length..])
+        let mut data_buffer = AlignedVec::<16>::new();
+        data_buffer.extend_from_slice(&data_bytes);
+        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
-        // Zero-copy: just getting pointer, no conversion yet
         let deser_data_time = deser_data_start.elapsed();
 
         // Phase 6: Binary search
@@ -628,6 +784,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(feature = "ci", ignore)]
+    #[serial]
     async fn test_performance_with_debug_1_row_group() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
         let index_file_prefix = Some("test_performance_comparison_");
@@ -727,14 +884,154 @@ mod tests {
         println!("Building keyword index...");
         let index_start = Instant::now();
 
-        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix).await?;
+        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None).await?;
 
         let index_time = index_start.elapsed();
         println!("Index built in: {:?}\n", index_time);
 
-        // Step 5.5: Test raw disk I/O performance for data.bin
-        println!("Testing raw disk I/O performance...");
+        // Step 5.5: Analyze chunk sizes from filters.rkyv
+        println!("=== Chunk Size Analysis ===");
         use crate::utils::file_interaction_local_and_cloud::get_object_store;
+        use crate::index_structure::index_files::{index_filename, IndexFile};
+
+        let filters_path = format!("{}.index/{}", file_path,
+                                   if let Some(prefix) = index_file_prefix {
+                                       format!("{}filters.rkyv", prefix)
+                                   } else {
+                                       "filters.rkyv".to_string()
+                                   }
+        );
+
+        // Read and deserialize filters
+        let (store, path) = get_object_store(&filters_path).await?;
+        let filters_bytes = store.get(&path).await?.bytes().await?;
+
+        use rkyv::util::AlignedVec;
+        use rkyv::Archived;
+        use crate::index_data::IndexFilters;
+
+        let mut aligned = AlignedVec::<16>::new();
+        aligned.extend_from_slice(&filters_bytes);
+        let archived_filters: &Archived<IndexFilters> = rkyv::access(&aligned)
+            .map_err(|e: RkyvError| format!("Failed to access filters: {}", e))?;
+
+        let num_chunks = archived_filters.chunk_index.len();
+        println!("Total chunks: {}", num_chunks);
+        println!("Compression: keywords={:?}, data={:?}",
+                 archived_filters.keywords_compression,
+                 archived_filters.data_compression);
+        println!();
+
+        // Analyze chunk sizes
+        let mut total_compressed_keywords = 0u64;
+        let mut total_compressed_data = 0u64;
+        let mut total_compressed = 0u64;
+
+        for (idx, chunk) in archived_filters.chunk_index.iter().enumerate().take(5) {
+            let keyword_len = chunk.keyword_list_length.to_native();
+            let total_len = chunk.total_length.to_native();
+            let data_len = total_len - keyword_len;
+
+            println!("Chunk {} (compressed):", idx);
+            println!("  Keywords: {} bytes ({:.2} KB)", keyword_len, keyword_len as f64 / 1024.0);
+            println!("  Data:     {} bytes ({:.2} KB)", data_len, data_len as f64 / 1024.0);
+            println!("  Total:    {} bytes ({:.2} KB)", total_len, total_len as f64 / 1024.0);
+
+            total_compressed_keywords += keyword_len as u64;
+            total_compressed_data += data_len as u64;
+            total_compressed += total_len as u64;
+        }
+
+        if num_chunks > 5 {
+            println!("... ({} more chunks)", num_chunks - 5);
+
+            // Sum all chunks
+            for chunk in archived_filters.chunk_index.iter() {
+                let keyword_len = chunk.keyword_list_length.to_native() as u64;
+                let total_len = chunk.total_length.to_native() as u64;
+                let data_len = total_len - keyword_len;
+
+                total_compressed_keywords += keyword_len;
+                total_compressed_data += data_len;
+                total_compressed += total_len;
+            }
+        }
+
+        println!();
+        println!("Summary (compressed):");
+        println!("  Total keywords: {} bytes ({:.2} MB)", total_compressed_keywords, total_compressed_keywords as f64 / (1024.0 * 1024.0));
+        println!("  Total data:     {} bytes ({:.2} MB)", total_compressed_data, total_compressed_data as f64 / (1024.0 * 1024.0));
+        println!("  Total:          {} bytes ({:.2} MB)", total_compressed, total_compressed as f64 / (1024.0 * 1024.0));
+        println!();
+
+        // Now decompress a few chunks to see actual uncompressed sizes
+        println!("Analyzing uncompressed sizes (first 5 chunks)...");
+
+        let data_bin_path = format!("{}.index/{}", file_path,
+                                    if let Some(prefix) = index_file_prefix {
+                                        format!("{}data.bin", prefix)
+                                    } else {
+                                        "data.bin".to_string()
+                                    }
+        );
+
+        let (data_store, data_path) = get_object_store(&data_bin_path).await?;
+
+        let mut total_uncompressed_keywords = 0u64;
+        let mut total_uncompressed_data = 0u64;
+
+        for (idx, chunk) in archived_filters.chunk_index.iter().enumerate().take(5) {
+            let offset = chunk.offset.to_native();
+            let keyword_len = chunk.keyword_list_length.to_native() as u64;
+            let total_len = chunk.total_length.to_native() as u64;
+
+            // Read compressed chunk
+            let range = offset..(offset + total_len);
+            let compressed_bytes = data_store.get_range(&data_path, range).await?.to_vec();
+
+            let compressed_keyword_bytes = &compressed_bytes[..keyword_len as usize];
+            let compressed_data_bytes = &compressed_bytes[keyword_len as usize..];
+
+            // Decompress
+            use crate::index_data::CompressionAlgorithm;
+            let keywords_compression = match &archived_filters.keywords_compression {
+                Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
+                Archived::<CompressionAlgorithm>::Zstd { level } => {
+                    CompressionAlgorithm::Zstd { level: level.to_native() }
+                }
+            };
+            let data_compression = match &archived_filters.data_compression {
+                Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
+                Archived::<CompressionAlgorithm>::Zstd { level } => {
+                    CompressionAlgorithm::Zstd { level: level.to_native() }
+                }
+            };
+
+            let uncompressed_keywords = keywords_compression.decompress(compressed_keyword_bytes)?;
+            let uncompressed_data = data_compression.decompress(compressed_data_bytes)?;
+
+            let uncomp_kw_len = uncompressed_keywords.len();
+            let uncomp_data_len = uncompressed_data.len();
+            let uncomp_total = uncomp_kw_len + uncomp_data_len;
+
+            println!("Chunk {} (uncompressed):", idx);
+            println!("  Keywords: {} bytes ({:.2} KB)", uncomp_kw_len, uncomp_kw_len as f64 / 1024.0);
+            println!("  Data:     {} bytes ({:.2} KB)", uncomp_data_len, uncomp_data_len as f64 / 1024.0);
+            println!("  Total:    {} bytes ({:.2} KB)", uncomp_total, uncomp_total as f64 / 1024.0);
+            println!("  Compression ratio: {:.2}x", uncomp_total as f64 / total_len as f64);
+
+            total_uncompressed_keywords += uncomp_kw_len as u64;
+            total_uncompressed_data += uncomp_data_len as u64;
+        }
+
+        println!();
+        println!("Average uncompressed chunk size (first 5): {:.2} KB",
+                 (total_uncompressed_keywords + total_uncompressed_data) as f64 / (5.0 * 1024.0));
+        println!("Target chunk size: ~1024 KB (1 MB)");
+        println!();
+
+        // Step 5.6: Test raw disk I/O performance for data.bin
+        println!("Testing raw disk I/O performance...");
 
         let data_bin_path = format!("{}.index/{}", file_path,
                                     if let Some(prefix) = index_file_prefix {
@@ -829,7 +1126,6 @@ mod tests {
         let chunk_time = chunk_start.elapsed();
 
         // Phase 3: Read chunk from disk (I/O only)
-        use crate::index_structure::index_files::{index_filename, IndexFile};
 
         let chunk_info = &searcher.filters.chunk_index[chunk_idx];
         let data_path = format!("{}/{}",
@@ -842,34 +1138,41 @@ mod tests {
         let length = chunk_info.total_length as u64;
         let range = start..(start + length);
         let result = store.get_range(&obj_path, range).await?;
-
-        // Copy once into aligned buffer (optimization #1)
-        let mut buffer = AlignedVec::<16>::new();
-        buffer.extend_from_slice(&result);
+        let compressed_buffer = result.to_vec();
         let io_time = io_start.elapsed();
 
-        // Phase 4: Deserialize keywords
-        use rkyv::util::AlignedVec;
-        use rkyv::Archived;
-        use rkyv::rancor::Error as RkyvError;
+        // Phase 4: Decompress and deserialize keywords
 
         let deser_keywords_start = Instant::now();
         let keyword_length = chunk_info.keyword_list_length as usize;
 
-        // Access keywords directly from aligned buffer (no additional copy)
-        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&buffer[..keyword_length])
+        // Split compressed buffer into keyword and data sections
+        let compressed_keyword_bytes = &compressed_buffer[..keyword_length];
+        let compressed_data_bytes = &compressed_buffer[keyword_length..];
+
+        // Decompress keyword section
+        let keyword_bytes = searcher.filters.keywords_compression.decompress(compressed_keyword_bytes)?;
+
+        // Deserialize keywords from decompressed data
+        let mut keyword_buffer = AlignedVec::<16>::new();
+        keyword_buffer.extend_from_slice(&keyword_bytes);
+        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&keyword_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
         let keywords: Vec<String> = archived_keywords.iter().map(|s| s.to_string()).collect();
         let deser_keywords_time = deser_keywords_start.elapsed();
 
-        // Phase 5: Zero-copy access to data (NO deserialization yet)
+        // Phase 5: Decompress and access data
         let deser_data_start = Instant::now();
 
-        // Access data directly from aligned buffer (no additional copy)
+        // Decompress data section
+        let data_bytes = searcher.filters.data_compression.decompress(compressed_data_bytes)?;
+
+        // Deserialize data from decompressed data
         use crate::index_data::KeywordDataFlat;
-        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&buffer[keyword_length..])
+        let mut data_buffer = AlignedVec::<16>::new();
+        data_buffer.extend_from_slice(&data_bytes);
+        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
-        // Zero-copy: just getting pointer, no conversion yet
         let deser_data_time = deser_data_start.elapsed();
 
         // Phase 6: Binary search
@@ -1242,6 +1545,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(feature = "ci", ignore)]
+    #[serial]
     async fn test_performance_with_debug_v2_parquet() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
         let index_file_prefix = Some("test_performance_comparison_");
@@ -1342,14 +1646,154 @@ mod tests {
         println!("Building keyword index...");
         let index_start = Instant::now();
 
-        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix).await?;
+        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None).await?;
 
         let index_time = index_start.elapsed();
         println!("Index built in: {:?}\n", index_time);
 
-        // Step 5.5: Test raw disk I/O performance for data.bin
-        println!("Testing raw disk I/O performance...");
+        // Step 5.5: Analyze chunk sizes from filters.rkyv
+        println!("=== Chunk Size Analysis ===");
         use crate::utils::file_interaction_local_and_cloud::get_object_store;
+        use crate::index_structure::index_files::{index_filename, IndexFile};
+
+        let filters_path = format!("{}.index/{}", file_path,
+                                   if let Some(prefix) = index_file_prefix {
+                                       format!("{}filters.rkyv", prefix)
+                                   } else {
+                                       "filters.rkyv".to_string()
+                                   }
+        );
+
+        // Read and deserialize filters
+        let (store, path) = get_object_store(&filters_path).await?;
+        let filters_bytes = store.get(&path).await?.bytes().await?;
+
+        use rkyv::util::AlignedVec;
+        use rkyv::Archived;
+        use crate::index_data::IndexFilters;
+
+        let mut aligned = AlignedVec::<16>::new();
+        aligned.extend_from_slice(&filters_bytes);
+        let archived_filters: &Archived<IndexFilters> = rkyv::access(&aligned)
+            .map_err(|e: RkyvError| format!("Failed to access filters: {}", e))?;
+
+        let num_chunks = archived_filters.chunk_index.len();
+        println!("Total chunks: {}", num_chunks);
+        println!("Compression: keywords={:?}, data={:?}",
+                 archived_filters.keywords_compression,
+                 archived_filters.data_compression);
+        println!();
+
+        // Analyze chunk sizes
+        let mut total_compressed_keywords = 0u64;
+        let mut total_compressed_data = 0u64;
+        let mut total_compressed = 0u64;
+
+        for (idx, chunk) in archived_filters.chunk_index.iter().enumerate().take(5) {
+            let keyword_len = chunk.keyword_list_length.to_native();
+            let total_len = chunk.total_length.to_native();
+            let data_len = total_len - keyword_len;
+
+            println!("Chunk {} (compressed):", idx);
+            println!("  Keywords: {} bytes ({:.2} KB)", keyword_len, keyword_len as f64 / 1024.0);
+            println!("  Data:     {} bytes ({:.2} KB)", data_len, data_len as f64 / 1024.0);
+            println!("  Total:    {} bytes ({:.2} KB)", total_len, total_len as f64 / 1024.0);
+
+            total_compressed_keywords += keyword_len as u64;
+            total_compressed_data += data_len as u64;
+            total_compressed += total_len as u64;
+        }
+
+        if num_chunks > 5 {
+            println!("... ({} more chunks)", num_chunks - 5);
+
+            // Sum all chunks
+            for chunk in archived_filters.chunk_index.iter() {
+                let keyword_len = chunk.keyword_list_length.to_native() as u64;
+                let total_len = chunk.total_length.to_native() as u64;
+                let data_len = total_len - keyword_len;
+
+                total_compressed_keywords += keyword_len;
+                total_compressed_data += data_len;
+                total_compressed += total_len;
+            }
+        }
+
+        println!();
+        println!("Summary (compressed):");
+        println!("  Total keywords: {} bytes ({:.2} MB)", total_compressed_keywords, total_compressed_keywords as f64 / (1024.0 * 1024.0));
+        println!("  Total data:     {} bytes ({:.2} MB)", total_compressed_data, total_compressed_data as f64 / (1024.0 * 1024.0));
+        println!("  Total:          {} bytes ({:.2} MB)", total_compressed, total_compressed as f64 / (1024.0 * 1024.0));
+        println!();
+
+        // Now decompress a few chunks to see actual uncompressed sizes
+        println!("Analyzing uncompressed sizes (first 5 chunks)...");
+
+        let data_bin_path = format!("{}.index/{}", file_path,
+                                    if let Some(prefix) = index_file_prefix {
+                                        format!("{}data.bin", prefix)
+                                    } else {
+                                        "data.bin".to_string()
+                                    }
+        );
+
+        let (data_store, data_path) = get_object_store(&data_bin_path).await?;
+
+        let mut total_uncompressed_keywords = 0u64;
+        let mut total_uncompressed_data = 0u64;
+
+        for (idx, chunk) in archived_filters.chunk_index.iter().enumerate().take(5) {
+            let offset = chunk.offset.to_native();
+            let keyword_len = chunk.keyword_list_length.to_native() as u64;
+            let total_len = chunk.total_length.to_native() as u64;
+
+            // Read compressed chunk
+            let range = offset..(offset + total_len);
+            let compressed_bytes = data_store.get_range(&data_path, range).await?.to_vec();
+
+            let compressed_keyword_bytes = &compressed_bytes[..keyword_len as usize];
+            let compressed_data_bytes = &compressed_bytes[keyword_len as usize..];
+
+            // Decompress
+            use crate::index_data::CompressionAlgorithm;
+            let keywords_compression = match &archived_filters.keywords_compression {
+                Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
+                Archived::<CompressionAlgorithm>::Zstd { level } => {
+                    CompressionAlgorithm::Zstd { level: level.to_native() }
+                }
+            };
+            let data_compression = match &archived_filters.data_compression {
+                Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
+                Archived::<CompressionAlgorithm>::Zstd { level } => {
+                    CompressionAlgorithm::Zstd { level: level.to_native() }
+                }
+            };
+
+            let uncompressed_keywords = keywords_compression.decompress(compressed_keyword_bytes)?;
+            let uncompressed_data = data_compression.decompress(compressed_data_bytes)?;
+
+            let uncomp_kw_len = uncompressed_keywords.len();
+            let uncomp_data_len = uncompressed_data.len();
+            let uncomp_total = uncomp_kw_len + uncomp_data_len;
+
+            println!("Chunk {} (uncompressed):", idx);
+            println!("  Keywords: {} bytes ({:.2} KB)", uncomp_kw_len, uncomp_kw_len as f64 / 1024.0);
+            println!("  Data:     {} bytes ({:.2} KB)", uncomp_data_len, uncomp_data_len as f64 / 1024.0);
+            println!("  Total:    {} bytes ({:.2} KB)", uncomp_total, uncomp_total as f64 / 1024.0);
+            println!("  Compression ratio: {:.2}x", uncomp_total as f64 / total_len as f64);
+
+            total_uncompressed_keywords += uncomp_kw_len as u64;
+            total_uncompressed_data += uncomp_data_len as u64;
+        }
+
+        println!();
+        println!("Average uncompressed chunk size (first 5): {:.2} KB",
+                 (total_uncompressed_keywords + total_uncompressed_data) as f64 / (5.0 * 1024.0));
+        println!("Target chunk size: ~1024 KB (1 MB)");
+        println!();
+
+        // Step 5.6: Test raw disk I/O performance for data.bin
+        println!("Testing raw disk I/O performance...");
 
         let data_bin_path = format!("{}.index/{}", file_path,
                                     if let Some(prefix) = index_file_prefix {
@@ -1444,7 +1888,6 @@ mod tests {
         let chunk_time = chunk_start.elapsed();
 
         // Phase 3: Read chunk from disk (I/O only)
-        use crate::index_structure::index_files::{index_filename, IndexFile};
 
         let chunk_info = &searcher.filters.chunk_index[chunk_idx];
         let data_path = format!("{}/{}",
@@ -1457,34 +1900,40 @@ mod tests {
         let length = chunk_info.total_length as u64;
         let range = start..(start + length);
         let result = store.get_range(&obj_path, range).await?;
-
-        // Copy once into aligned buffer (optimization #1)
-        let mut buffer = AlignedVec::<16>::new();
-        buffer.extend_from_slice(&result);
+        let compressed_buffer = result.to_vec();
         let io_time = io_start.elapsed();
 
-        // Phase 4: Deserialize keywords
-        use rkyv::util::AlignedVec;
-        use rkyv::Archived;
-        use rkyv::rancor::Error as RkyvError;
-
+        // Phase 4: Decompress and deserialize keywords
         let deser_keywords_start = Instant::now();
         let keyword_length = chunk_info.keyword_list_length as usize;
 
-        // Access keywords directly from aligned buffer (no additional copy)
-        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&buffer[..keyword_length])
+        // Split compressed buffer into keyword and data sections
+        let compressed_keyword_bytes = &compressed_buffer[..keyword_length];
+        let compressed_data_bytes = &compressed_buffer[keyword_length..];
+
+        // Decompress keyword section
+        let keyword_bytes = searcher.filters.keywords_compression.decompress(compressed_keyword_bytes)?;
+
+        // Deserialize keywords from decompressed data
+        let mut keyword_buffer = AlignedVec::<16>::new();
+        keyword_buffer.extend_from_slice(&keyword_bytes);
+        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&keyword_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
         let keywords: Vec<String> = archived_keywords.iter().map(|s| s.to_string()).collect();
         let deser_keywords_time = deser_keywords_start.elapsed();
 
-        // Phase 5: Zero-copy access to data (NO deserialization yet)
+        // Phase 5: Decompress and access data
         let deser_data_start = Instant::now();
 
-        // Access data directly from aligned buffer (no additional copy)
+        // Decompress data section
+        let data_bytes = searcher.filters.data_compression.decompress(compressed_data_bytes)?;
+
+        // Deserialize data from decompressed data
         use crate::index_data::KeywordDataFlat;
-        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&buffer[keyword_length..])
+        let mut data_buffer = AlignedVec::<16>::new();
+        data_buffer.extend_from_slice(&data_bytes);
+        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
-        // Zero-copy: just getting pointer, no conversion yet
         let deser_data_time = deser_data_start.elapsed();
 
         // Phase 6: Binary search

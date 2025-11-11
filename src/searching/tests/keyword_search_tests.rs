@@ -2,7 +2,7 @@
 mod tests {
     use crate::searching::keyword_search::KeywordSearcher;
     use crate::index_structure::column_filter::ColumnFilter;
-    use crate::index_data::IndexFilters;
+    use crate::index_data::{CompressionAlgorithm, IndexFilters};
     use crate::utils::column_pool::ColumnPool;
 
     /// Creates a test searcher with standard split character configuration
@@ -21,6 +21,8 @@ mod tests {
             parquet_last_modified: 0,
             error_rate: 0.01,
             split_chars_inclusive,
+            keywords_compression: CompressionAlgorithm::None,
+            data_compression: CompressionAlgorithm::None,
             column_pool: ColumnPool::new(),
             column_filters: std::collections::HashMap::new(),
             global_filter: ColumnFilter::RkyvHashSet(vec![]),

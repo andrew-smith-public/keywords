@@ -161,6 +161,14 @@ impl KeywordSearcher {
             split_chars_inclusive: archived_filters.split_chars_inclusive.iter()
                 .map(|v| v.iter().map(|c| char::from(*c)).collect())
                 .collect(),
+            keywords_compression: match &archived_filters.keywords_compression {
+                crate::index_data::ArchivedCompressionAlgorithm::None => crate::index_data::CompressionAlgorithm::None,
+                crate::index_data::ArchivedCompressionAlgorithm::Zstd { level } => { crate::index_data::CompressionAlgorithm::Zstd { level: level.to_native() } }
+            },
+            data_compression: match &archived_filters.data_compression {
+                crate::index_data::ArchivedCompressionAlgorithm::None => crate::index_data::CompressionAlgorithm::None,
+                crate::index_data::ArchivedCompressionAlgorithm::Zstd { level } => { crate::index_data::CompressionAlgorithm::Zstd { level: level.to_native() } }
+            },
             column_pool: {
                 let mut pool = crate::utils::column_pool::ColumnPool::new();
                 pool.strings = archived_filters.column_pool.strings.iter()
@@ -343,14 +351,17 @@ impl KeywordSearcher {
         // Use object store abstraction for cloud/local compatibility
         let (store, obj_path) = get_object_store(&data_path).await?;
 
-        // Read just the keyword list section
+        // Read just the keyword list section (compressed)
         let start = chunk_info.offset;
         let length = chunk_info.keyword_list_length as u64;
 
         let range = start..(start + length);
 
         let result = store.get_range(&obj_path, range).await?;
-        let buffer = result.to_vec();
+        let compressed_buffer = result.to_vec();
+
+        // Decompress keyword list
+        let buffer = self.filters.keywords_compression.decompress(&compressed_buffer)?;
 
         // Deserialize keyword list
         let mut aligned_buffer = AlignedVec::<16>::new();
@@ -400,23 +411,29 @@ impl KeywordSearcher {
         let result = store.get_range(&obj_path, range).await?;
         let buffer = result.to_vec();
 
-        // Split buffer into keyword section and data section
+        // Split buffer into compressed keyword section and compressed data section
         let keyword_length = chunk_info.keyword_list_length as usize;
-        let keyword_bytes = &buffer[..keyword_length];
-        let data_bytes = &buffer[keyword_length..];
+        let compressed_keyword_bytes = &buffer[..keyword_length];
+        let compressed_data_bytes = &buffer[keyword_length..];
+
+        // Decompress keyword list
+        let keyword_bytes = self.filters.keywords_compression.decompress(compressed_keyword_bytes)?;
 
         // Deserialize keyword list
         let mut keyword_buffer = AlignedVec::<16>::new();
-        keyword_buffer.extend_from_slice(keyword_bytes);
+        keyword_buffer.extend_from_slice(&keyword_bytes);
 
         let archived_keywords: &Archived<Vec<String>> = rkyv::access(&keyword_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize keyword list: {}", e))?;
 
         let keywords: Vec<String> = archived_keywords.iter().map(|s| s.to_string()).collect();
 
+        // Decompress data section
+        let data_bytes = self.filters.data_compression.decompress(compressed_data_bytes)?;
+
         // Deserialize data section
         let mut data_buffer = AlignedVec::<16>::new();
-        data_buffer.extend_from_slice(data_bytes);
+        data_buffer.extend_from_slice(&data_bytes);
 
         let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize chunk data: {}", e))?;
@@ -698,15 +715,21 @@ impl KeywordSearcher {
         let range = start..(start + length);
         let result = store.get_range(&obj_path, range).await?;
 
-        // Copy once into aligned buffer (eliminates second copy)
-        let mut buffer = AlignedVec::<16>::new();
-        buffer.extend_from_slice(&result);
+        // Copy into buffer
+        let buffer = result.to_vec();
 
-        // Step 4: Zero-copy access to archived data (no additional copies)
+        // Step 4: Decompress and access archived data
         let keyword_length = chunk_info.keyword_list_length as usize;
+        let compressed_keyword_bytes = &buffer[..keyword_length];
+        let compressed_data_bytes = &buffer[keyword_length..];
 
-        // Access keyword section directly in aligned buffer
-        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&buffer[..keyword_length])
+        // Decompress keyword section
+        let keyword_bytes = self.filters.keywords_compression.decompress(compressed_keyword_bytes)?;
+        let mut keyword_buffer = AlignedVec::<16>::new();
+        keyword_buffer.extend_from_slice(&keyword_bytes);
+
+        // Access keyword section
+        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&keyword_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize keyword list: {}", e))?;
 
         // Binary search (zero-copy)
@@ -723,8 +746,13 @@ impl KeywordSearcher {
             }
         };
 
-        // Access data section directly in aligned buffer (no additional copy)
-        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&buffer[keyword_length..])
+        // Decompress data section
+        let data_bytes = self.filters.data_compression.decompress(compressed_data_bytes)?;
+        let mut data_buffer = AlignedVec::<16>::new();
+        data_buffer.extend_from_slice(&data_bytes);
+
+        // Access data section
+        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize chunk data: {}", e))?;
 
         // Get only the one item we need (still zero-copy)
@@ -1983,7 +2011,7 @@ impl KeywordSearcher {
     /// * `level` - Current delimiter level (0-3)
     /// * `tokens` - Accumulator for all discovered tokens
     fn split_phrase_recursive(&self, text: &str, level: usize, tokens: &mut std::collections::HashSet<String>) {
-        // Base case: reached maximum split level
+        // Base case: reached maximum split-level
         if level >= self.filters.split_chars_inclusive.len() {
             tokens.insert(text.to_string());
             return;
@@ -2339,7 +2367,7 @@ impl KeywordSearcher {
     }
 
     /// Verify a match using parent keyword information
-    /// Get the minimum (highest priority) split level in the phrase
+    /// Get the minimum (highest priority) split-level in the phrase
     /// Lower number = higher priority (level 0 = whitespace, level 3 = hyphens)
     pub(super) fn get_min_phrase_split_level(&self, phrase: &str) -> Option<usize> {
         for (level, split_chars) in self.filters.split_chars_inclusive.iter().enumerate() {
@@ -2350,7 +2378,7 @@ impl KeywordSearcher {
         None
     }
 
-    /// Determine the split level of a keyword's parent from the keyword's splits_matched.
+    /// Determine the split-level of a keyword's parent from the keyword's splits_matched.
     ///
     /// The splits_matched field encodes which levels a keyword survived:
     /// - Bit 0 (1): root token
@@ -2359,7 +2387,7 @@ impl KeywordSearcher {
     /// - Bit 3 (8): survived level 2 (started from level 2 split)
     /// - Bit 4 (16): survived level 3 (started from level 3 split)
     ///
-    /// To find parent split level: find the lowest set bit (excluding bit 0), that's level+1 where parent was split.
+    /// To find parent split-level: find the lowest set bit (excluding bit 0), that's level+1 where parent was split.
     ///
     /// Example: splits_matched = 28 = 4+8+16 (bits 2,3,4 set)
     /// - Lowest set bit (excluding bit 0) is bit 2
@@ -2460,7 +2488,7 @@ impl KeywordSearcher {
 
     /// Recursively search up the parent chain for a keyword that contains the phrase.
     ///
-    /// Optimization: Only check parents whose split level is >= min_phrase_level.
+    /// Optimization: Only check parents whose split-level is >= min_phrase_level.
     /// This is because a phrase can only exist in parents that were split at the same
     /// or lower priority (higher number) level as the delimiters in the phrase.
     ///
@@ -2472,7 +2500,7 @@ impl KeywordSearcher {
     ///
     /// * `phrase` - The phrase to find
     /// * `current_keyword` - The current keyword whose parents to check
-    /// * `min_phrase_level` - Minimum split level for optimization
+    /// * `min_phrase_level` - Minimum split-level for optimization
     /// * `depth` - Current recursion depth (to prevent stack overflow)
     async fn verify_match_with_grandparent(
         &self,
