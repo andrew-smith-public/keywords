@@ -7,7 +7,7 @@ fn test_mixed_whitespace_types() {
     let col_ref = column_pool.intern("test_col");
 
     // Mix of space, tab, newline, carriage return
-    perform_split("word1 word2\tword3\nword4\rword5", col_ref, 0, 0, &mut keyword_map);
+    perform_split("word1 word2\tword3\nword4\rword5", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     // All whitespace types are level 0 delimiters
     assert_eq!(keyword_map.len(), 5, "Should split on all whitespace types");
@@ -24,7 +24,7 @@ fn test_single_character_keyword() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("a", col_ref, 0, 0, &mut keyword_map);
+    perform_split("a", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("a"));
@@ -36,7 +36,7 @@ fn test_numeric_keywords() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("123 456.789 0", col_ref, 0, 0, &mut keyword_map);
+    perform_split("123 456.789 0", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert!(keyword_map.contains_key("123"));
     assert!(keyword_map.contains_key("456"));
@@ -51,7 +51,7 @@ fn test_special_characters_preserved_in_keywords() {
     let col_ref = column_pool.intern("test_col");
 
     // Characters that are NOT delimiters should be preserved
-    perform_split("hello%world", col_ref, 0, 0, &mut keyword_map);
+    perform_split("hello%world", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     // % is not a delimiter, so this should be one keyword
     assert!(keyword_map.contains_key("hello%world"));
@@ -63,7 +63,7 @@ fn test_alternating_keywords_and_delimiters() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("a b c d e f", col_ref, 0, 0, &mut keyword_map);
+    perform_split("a b c d e f", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert_eq!(keyword_map.len(), 6);
     for c in ['a', 'b', 'c', 'd', 'e', 'f'] {
@@ -78,7 +78,7 @@ fn test_unicode_emoji_in_keywords() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("hello😀world🎉test", col_ref, 0, 0, &mut keyword_map);
+    perform_split("hello😀world🎉test", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     // Emojis are not delimiters, should be part of the keyword
     assert!(keyword_map.contains_key("hello😀world🎉test"));
@@ -90,7 +90,7 @@ fn test_mixed_case_sensitivity() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("Hello WORLD TeSt", col_ref, 0, 0, &mut keyword_map);
+    perform_split("Hello WORLD TeSt", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     // Case should be preserved
     assert!(keyword_map.contains_key("Hello"));
@@ -107,7 +107,7 @@ fn test_null_byte_handling() {
 
     // String with null byte (if your system supports it)
     let input = "before\0after";
-    perform_split(input, col_ref, 0, 0, &mut keyword_map);
+    perform_split(input, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     // The null byte is not a delimiter, so should be preserved
     // (though in practice this might be unusual)
@@ -121,7 +121,7 @@ fn test_zero_values() {
     let col_ref = column_pool.intern("test_col");
 
     // All zero values
-    perform_split("keyword", col_ref, 0, 0, &mut keyword_map);
+    perform_split("keyword", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     let kw = keyword_map.get("keyword").unwrap();
     assert_eq!(kw.row_group_to_rows[0][0][0].row, 0);

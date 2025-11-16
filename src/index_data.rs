@@ -1,10 +1,9 @@
 use hashbrown::HashMap;
 use std::collections::HashMap as StdHashMap;
-use crate::utils::column_pool::ColumnPool;
-use crate::index_structure::column_filter::ColumnFilter;
 use rkyv::{Archive, Serialize as RkyvSerialize, Deserialize as RkyvDeserialize, to_bytes};
 use rkyv::rancor::Error as RkyvError;
-use crate::keyword_shred::SPLIT_CHARS_INCLUSIVE;
+use crate::utils::column_pool::ColumnPool;
+use crate::index_structure::column_filter::ColumnFilter;
 use crate::utils::file_interaction_local_and_cloud::get_object_store;
 use crate::{KeywordOneFile, ParquetSource, ProcessResult, MAX_CHUNK_SIZE_BYTES};
 use crate::index_structure::index_files::{index_filename, IndexFile};
@@ -96,6 +95,9 @@ pub struct IndexFilters {
     pub column_filters: StdHashMap<String, ColumnFilter>,
     pub global_filter: ColumnFilter,
     pub chunk_index: Vec<ChunkInfo>,
+
+    // Per-column full keyword storage flags
+    pub column_full_keyword_stored: StdHashMap<String, bool>,
 }
 
 /// Information about a chunk in the data file.
@@ -336,10 +338,12 @@ fn convert_to_flat(
 /// # use keywords::index_data::{build_distributed_index, CompressionAlgorithm};
 /// use keywords::ParquetSource;
 /// use keywords::column_parquet_reader::process_parquet_file;
+/// use keywords::keyword_shred::SPLIT_CHARS_INCLUSIVE;
 /// # async fn example() -> () {
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
-///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None).await.unwrap();
+///     let split_chars: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE.iter().map(|&chars| chars.to_vec()).collect();
+///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None).await.unwrap();
 ///
 ///     // Build with default compression
 ///     let index_files = build_distributed_index(
@@ -348,6 +352,7 @@ fn convert_to_flat(
 ///         0.01,
 ///         CompressionAlgorithm::Zstd { level: 8 },
 ///         CompressionAlgorithm::Zstd { level: 8 },
+///         &split_chars,
 ///     ).await.unwrap();
 ///
 ///     // Build without compression
@@ -357,6 +362,7 @@ fn convert_to_flat(
 ///         0.01,
 ///         CompressionAlgorithm::None,
 ///         CompressionAlgorithm::None,
+///         &split_chars,
 ///     ).await.unwrap();
 /// # }
 /// ```
@@ -366,6 +372,7 @@ pub async fn build_distributed_index(
     error_rate: f64,
     keywords_compression: CompressionAlgorithm,
     data_compression: CompressionAlgorithm,
+    split_chars: &[Vec<char>],
 ) -> Result<DistributedIndexFiles, Box<dyn std::error::Error + Send + Sync>> {
     // Get parquet metadata for validation and to cache metadata location
     let (parquet_etag, parquet_size, parquet_last_modified, parquet_metadata_offset, parquet_metadata_length) = match source {
@@ -572,8 +579,8 @@ pub async fn build_distributed_index(
     }
 
     // Build filters file
-    let split_chars_vec: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE.iter()
-        .map(|&chars| chars.to_vec())
+    let split_chars_vec: Vec<Vec<char>> = split_chars.iter()
+        .map(|chars| chars.to_vec())
         .collect();
 
     let index_filters = IndexFilters {
@@ -593,6 +600,9 @@ pub async fn build_distributed_index(
             .collect(),
         global_filter: result.global_filter.clone(),
         chunk_index,
+        column_full_keyword_stored: result.column_full_keyword_stored.iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect(),
     };
 
     let filters_bytes = to_bytes::<RkyvError>(&index_filters)
@@ -654,11 +664,13 @@ pub struct DistributedIndexFiles {
 /// # use keywords::index_data::{save_distributed_index, build_distributed_index, CompressionAlgorithm};
 /// use keywords::ParquetSource;
 /// use keywords::column_parquet_reader::process_parquet_file;
+/// use keywords::keyword_shred::SPLIT_CHARS_INCLUSIVE;
 ///
 /// # async fn example() -> () {
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
-///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None).await.unwrap();
+///     let split_chars: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE.iter().map(|&chars| chars.to_vec()).collect();
+///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None).await.unwrap();
 ///
 ///     let index_files = build_distributed_index(
 ///         &result,
@@ -666,6 +678,7 @@ pub struct DistributedIndexFiles {
 ///         0.01,
 ///         CompressionAlgorithm::Zstd { level: 8 },
 ///         CompressionAlgorithm::Zstd { level: 8 },
+///         &split_chars,
 ///     ).await.unwrap();
 ///
 ///     // Save without prefix (path can be arbitrary for in-memory sources)

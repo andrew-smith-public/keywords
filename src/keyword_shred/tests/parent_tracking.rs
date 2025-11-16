@@ -6,8 +6,8 @@ fn test_row_add_same_row_same_parent() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 1);
     let kw = keyword_map.get("Hello").unwrap();
@@ -33,7 +33,7 @@ fn test_parent_keyword_tracking() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("parent/child", col_ref, 0, 0, &mut keyword_map);
+    perform_split("parent/child", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     let child = keyword_map.get("child").unwrap();
 
@@ -58,8 +58,8 @@ fn test_same_row_different_parents() {
     let col_ref = column_pool.intern("test_col");
 
     // Create two different parent strings that contain "test"
-    perform_split("parent1/test", col_ref, 0, 10, &mut keyword_map);
-    perform_split("parent2/test", col_ref, 0, 10, &mut keyword_map);  // Same row!
+    perform_split("parent1/test", col_ref, 0, 10, &mut keyword_map, default_split_lookup(), false);
+    perform_split("parent2/test", col_ref, 0, 10, &mut keyword_map, default_split_lookup(), false);  // Same row!
 
     let kw = keyword_map.get("test").unwrap();
 
@@ -108,7 +108,7 @@ fn test_parent_keyword_hierarchy_all_levels() {
 
     let complex_string = "file.txt$data#tag-item_name";
 
-    perform_split(complex_string, col_ref, 0, 0, &mut keyword_map);
+    perform_split(complex_string, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\n=== Parent Keyword Hierarchy Test ===");
     println!("Original string: {}", complex_string);
@@ -219,7 +219,7 @@ fn test_parent_keywords_empty_for_unsplit_root() {
     let col_ref = column_pool.intern("test_col");
 
     // Simple keyword with no delimiters - should have no parent
-    perform_split("simple", col_ref, 0, 0, &mut keyword_map);
+    perform_split("simple", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     let kw = keyword_map.get("simple").unwrap();
     assert!(
@@ -235,9 +235,9 @@ fn test_parent_keywords_multiple_occurrences() {
     let col_ref = column_pool.intern("test_col");
 
     // Create scenarios where "test" appears with different parents
-    perform_split("parent1/test", col_ref, 0, 0, &mut keyword_map);
-    perform_split("parent2/test", col_ref, 0, 1, &mut keyword_map);
-    perform_split("parent3-test", col_ref, 0, 2, &mut keyword_map);
+    perform_split("parent1/test", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
+    perform_split("parent2/test", col_ref, 0, 1, &mut keyword_map, default_split_lookup(), false);
+    perform_split("parent3-test", col_ref, 0, 2, &mut keyword_map, default_split_lookup(), false);
 
     let kw = keyword_map.get("test").unwrap();
 

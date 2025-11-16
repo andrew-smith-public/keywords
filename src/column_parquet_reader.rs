@@ -300,7 +300,9 @@ pub(crate) async fn stream_and_process_parquet(
     excluded_columns: Option<HashSet<String>>,
     metadata_with_cache: &MetadataWithCache,
     keyword_map: &mut HashMap<Rc<str>, KeywordOneFile>,
-    column_pool: &mut ColumnPool
+    column_pool: &mut ColumnPool,
+    split_lookup: &crate::keyword_shred::SplitLookup,
+    column_full_keyword_stored: &HashMap<String, bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Extract metadata
@@ -386,7 +388,14 @@ pub(crate) async fn stream_and_process_parquet(
         // distinguish transient vs fatal errors at this layer. Fatal errors (corrupted Parquet,
         // invalid schemas) should fail fast. If more sophisticated error recovery is needed
         // (e.g., skip corrupted columns, continue with partial index), add explicit Result handling.
-        process_column_chunk(column_chunk, &metadata_for_processor, keyword_map, column_pool);
+        process_column_chunk(
+            column_chunk,
+            &metadata_for_processor,
+            keyword_map,
+            column_pool,
+            split_lookup,
+            column_full_keyword_stored,
+        );
     }
 
     // Ensure reader completed successfully
@@ -601,7 +610,9 @@ fn process_column_chunk(
     column_chunk: ColumnChunk,
     metadata: &Arc<ParquetMetaData>,
     keyword_map: &mut HashMap<Rc<str>, KeywordOneFile>,
-    column_pool: &mut ColumnPool
+    column_pool: &mut ColumnPool,
+    split_lookup: &crate::keyword_shred::SplitLookup,
+    column_full_keyword_stored: &HashMap<String, bool>,
 ) {
     // Create a chunk reader for our column data
     let chunk_reader = ColumnBytesReader::new(column_chunk.bytes, column_chunk.start_offset);
@@ -649,13 +660,16 @@ fn process_column_chunk(
                 .expect("Cast to Utf8 should produce StringArray");
 
             // Call user callback with cumulative offset
+            let store_full_keyword = column_full_keyword_stored.get(&column_chunk.column_name).copied().unwrap_or(false);
             process_arrow_string_array(
                 string_array,
                 &column_chunk.column_name,
                 column_chunk.row_group,
                 cumulative_row_offset,
                 keyword_map,
-                column_pool
+                column_pool,
+                split_lookup,
+                store_full_keyword,
             );
         }
 
@@ -816,7 +830,9 @@ pub(crate) fn process_arrow_string_array(
     row_group: u16,
     row_offset: u32,
     keyword_map: &mut HashMap<Rc<str>, KeywordOneFile>,
-    column_pool: &mut ColumnPool
+    column_pool: &mut ColumnPool,
+    split_lookup: &crate::keyword_shred::SplitLookup,
+    store_full_keyword: bool,
 ) {
     let column_reference: u32 = column_pool.intern(column_name);
     for row_idx in 0..array.len() {
@@ -825,14 +841,17 @@ pub(crate) fn process_arrow_string_array(
             // Get string slice directly from Arrow array (zero-copy)
             let value = array.value(row_idx);
 
-            // Only process non-empty strings
-            if !value.is_empty() {
+            // Process both empty and non-empty strings
+            // Empty strings are only stored if store_full_keyword is true
+            if !value.is_empty() || store_full_keyword {
                 perform_split(
                     value,
                     column_reference,
                     row_group,
                     row_offset + row_idx as u32,  // Add offset to handle multiple batches
-                    keyword_map
+                    keyword_map,
+                    split_lookup,
+                    store_full_keyword,
                 );
             }
         }
@@ -896,7 +915,7 @@ pub(crate) fn process_arrow_string_array(
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// // Process with defaults (1% error rate, all columns)
-/// let result = process_parquet_file(ParquetSource::Path("data.parquet".to_string()), None, None).await?;
+/// let result = process_parquet_file(ParquetSource::Path("data.parquet".to_string()), None, None, None, None, None).await?;
 /// println!("Indexed {} unique keywords", result.keyword_map.len());
 ///
 /// // Process with custom error rate and exclusions
@@ -906,7 +925,10 @@ pub(crate) fn process_arrow_string_array(
 /// let result = process_parquet_file(
 ///     ParquetSource::Path("s3://bucket/data.parquet".to_string()),
 ///     Some(excluded),
-///     Some(0.001)  // 0.1% error rate
+///     Some(0.001),  // 0.1% error rate
+///     None,
+///     None,
+///     None
 /// ).await?;
 ///
 /// // Use bloom filters for fast lookups
@@ -927,9 +949,26 @@ pub async fn process_parquet_file(
     source: ParquetSource,
     exclude_columns: Option<HashSet<String>>,
     error_rate: Option<f64>,
+    split_chars: Option<Vec<Vec<char>>>,
+    store_full_keyword_default: Option<bool>,
+    full_keyword_column_exceptions: Option<HashSet<String>>,
 ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
     // Default to 1% error rate if not specified
     let error_rate = error_rate.unwrap_or(0.01);
+
+    // Default split chars to SPLIT_CHARS_INCLUSIVE if not provided
+    let split_chars_vec = split_chars.unwrap_or_else(|| {
+        crate::keyword_shred::SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect()
+    });
+
+    // Build split lookup table
+    let split_lookup = crate::keyword_shred::SplitLookup::new(&split_chars_vec);
+
+    // Default to not storing full keywords
+    let store_full_default = store_full_keyword_default.unwrap_or(false);
+    let exceptions = full_keyword_column_exceptions.unwrap_or_else(HashSet::new);
 
     // Read metadata and determine file path for streaming
     let metadata_with_cache: MetadataWithCache = read_metadata(source, None).await?;
@@ -949,11 +988,30 @@ pub async fn process_parquet_file(
     let mut keyword_map = HashMap::with_capacity(estimated);
     let mut column_pool = ColumnPool::new();
 
+    // Build column_full_keyword_stored map
+    // Get all column names from the metadata
+    let schema = metadata_with_cache.metadata.file_metadata().schema_descr();
+    let mut column_full_keyword_stored = HashMap::new();
+
+    for i in 0..schema.num_columns() {
+        let column_name = schema.column(i).name().to_string();
+        // Determine if this column should store full keywords
+        // If it's in exceptions, flip the default
+        let should_store = if exceptions.contains(&column_name) {
+            !store_full_default
+        } else {
+            store_full_default
+        };
+        column_full_keyword_stored.insert(column_name, should_store);
+    }
+
     stream_and_process_parquet(
         exclude_columns,
         &metadata_with_cache,
         &mut keyword_map,
-        &mut column_pool
+        &mut column_pool,
+        &split_lookup,
+        &column_full_keyword_stored,
     ).await?;
 
     // Process columns (will reuse cached data if available)
@@ -973,6 +1031,12 @@ pub async fn process_parquet_file(
     }
     let global_filter = ColumnFilter::create_column_filter(&all_keywords, error_rate);
 
+    // Convert column_full_keyword_stored to use Rc<str> for consistency
+    let column_full_keyword_stored_rc: HashMap<Rc<str>, bool> = column_full_keyword_stored
+        .into_iter()
+        .map(|(k, v)| (Rc::from(k.as_str()), v))
+        .collect();
+
     // Return the populated map, pool, column keywords map, filters, and global filter
     Ok(ProcessResult {
         keyword_map,
@@ -980,6 +1044,7 @@ pub async fn process_parquet_file(
         column_keywords_map,
         column_filters,
         global_filter,
+        column_full_keyword_stored: column_full_keyword_stored_rc,
     })
 }
 
@@ -1041,11 +1106,20 @@ mod tests {
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
         let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
+        // Build default split lookup for tests
+        let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect();
+        let split_lookup = crate::keyword_shred::SplitLookup::new(&split_chars);
+        let column_full_keyword_stored = HashMap::new();
+
         stream_and_process_parquet(
             None,
             &metadata_with_cache,
             &mut keyword_map,
-            &mut column_pool
+            &mut column_pool,
+            &split_lookup,
+            &column_full_keyword_stored,
         ).await.unwrap();
 
         // Verify that we have all 1000 unique keywords
@@ -1099,11 +1173,19 @@ mod tests {
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
         let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
+        let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect();
+        let split_lookup = crate::keyword_shred::SplitLookup::new(&split_chars);
+        let column_full_keyword_stored = HashMap::new();
+
         stream_and_process_parquet(
             None,
             &metadata_with_cache,
             &mut keyword_map,
-            &mut column_pool
+            &mut column_pool,
+            &split_lookup,
+            &column_full_keyword_stored,
         ).await.unwrap();
 
         // Verify row group 0, row 0
@@ -1163,11 +1245,19 @@ mod tests {
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
         let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
+        let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect();
+        let split_lookup = crate::keyword_shred::SplitLookup::new(&split_chars);
+        let column_full_keyword_stored = HashMap::new();
+
         stream_and_process_parquet(
             None,
             &metadata_with_cache,
             &mut keyword_map,
-            &mut column_pool
+            &mut column_pool,
+            &split_lookup,
+            &column_full_keyword_stored,
         ).await.unwrap();
 
         // Should only have 3 keywords (nulls skipped)
@@ -1212,11 +1302,19 @@ mod tests {
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
         let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
+        let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect();
+        let split_lookup = crate::keyword_shred::SplitLookup::new(&split_chars);
+        let column_full_keyword_stored = HashMap::new();
+
         stream_and_process_parquet(
             None,
             &metadata_with_cache,
             &mut keyword_map,
-            &mut column_pool
+            &mut column_pool,
+            &split_lookup,
+            &column_full_keyword_stored,
         ).await.unwrap();
 
         // Should only have 2 keywords (empty string skipped)
@@ -1251,11 +1349,19 @@ mod tests {
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
         let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
+        let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect();
+        let split_lookup = crate::keyword_shred::SplitLookup::new(&split_chars);
+        let column_full_keyword_stored = HashMap::new();
+
         stream_and_process_parquet(
             Some(excluded),
             &metadata_with_cache,
             &mut keyword_map,
-            &mut column_pool
+            &mut column_pool,
+            &split_lookup,
+            &column_full_keyword_stored,
         ).await.unwrap();
 
         // Should only have keyword from included column
@@ -1303,11 +1409,19 @@ mod tests {
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
         let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
+        let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect();
+        let split_lookup = crate::keyword_shred::SplitLookup::new(&split_chars);
+        let column_full_keyword_stored = HashMap::new();
+
         stream_and_process_parquet(
             None,
             &metadata_with_cache,
             &mut keyword_map,
-            &mut column_pool
+            &mut column_pool,
+            &split_lookup,
+            &column_full_keyword_stored,
         ).await.unwrap();
 
         // Verify split keywords exist
@@ -1370,11 +1484,19 @@ mod tests {
         let bytes = bytes::Bytes::from(parquet_bytes.clone());
         let metadata_with_cache = read_metadata(ParquetSource::Bytes(bytes.clone()), None).await.unwrap();
 
+        let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect();
+        let split_lookup = crate::keyword_shred::SplitLookup::new(&split_chars);
+        let column_full_keyword_stored = HashMap::new();
+
         stream_and_process_parquet(
             None,
             &metadata_with_cache,
             &mut keyword_map,
-            &mut column_pool
+            &mut column_pool,
+            &split_lookup,
+            &column_full_keyword_stored,
         ).await.unwrap();
 
         // THE BUG: Without the fix, all these would be at row 0, 1, or 2

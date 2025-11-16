@@ -1,12 +1,6 @@
 use super::*;
 
 #[test]
-fn test_split_chars_count() {
-    assert_eq!(SPLIT_CHARS_COUNT, 4);
-    assert_eq!(SPLIT_CHARS_INCLUSIVE.len(), 4);
-}
-
-#[test]
 fn test_row_creation() {
     let row = Row {
         row: 42,
@@ -42,7 +36,7 @@ fn test_simple_keyword_no_splits() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("simple").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
+    perform_split(String::from("simple").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("simple"));
     let kw = keyword_map.get("simple").unwrap();
@@ -69,7 +63,7 @@ fn test_keyword_with_space_split() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("hello world").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
+    perform_split(String::from("hello world").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 2);
     assert!(keyword_map.contains_key("hello"));
@@ -114,7 +108,7 @@ fn test_keyword_with_space_start() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from(" hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
+    perform_split(String::from(" hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("hello"));
@@ -142,7 +136,7 @@ fn test_keyword_with_space_end() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("hello ").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
+    perform_split(String::from("hello ").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("hello"));
@@ -170,7 +164,7 @@ fn test_keyword_with_space_middle() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from(" hello ").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
+    perform_split(String::from(" hello ").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("hello"));
@@ -198,8 +192,8 @@ fn test_row_add_consecutive_rows() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 1u32, &mut keyword_map);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 1u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 1);
     let kw = keyword_map.get("Hello").unwrap();
@@ -225,9 +219,9 @@ fn test_row_add_non_consecutive_rows() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
-    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 1u32, &mut keyword_map);
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 2u32, &mut keyword_map);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 1u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 2u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 2);
     let kw = keyword_map.get("Hello").unwrap();
@@ -259,9 +253,9 @@ fn test_row_add_multiple_consecutive_rows() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 1u32, &mut keyword_map);
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 2u32, &mut keyword_map);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 1u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 2u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 1);
     let kw = keyword_map.get("Hello").unwrap();
@@ -287,10 +281,10 @@ fn test_row_add_interspersed_keywords() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
-    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 1u32, &mut keyword_map);
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 2u32, &mut keyword_map);
-    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 3u32, &mut keyword_map);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 1u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 2u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 3u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 2);
     let kw = keyword_map.get("Hello").unwrap();
@@ -322,10 +316,10 @@ fn test_row_add_consecutive_interspersed_keywords() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
-    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 1u32, &mut keyword_map);
-    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 2u32, &mut keyword_map);
-    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 3u32, &mut keyword_map);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Hello").as_str(), col_ref, 0u16, 1u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 2u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split(String::from("Goodbye").as_str(), col_ref, 0u16, 3u32, &mut keyword_map, default_split_lookup(), false);
     println!("{:?}", keyword_map);
     assert_eq!(keyword_map.len(), 2);
     let kw = keyword_map.get("Hello").unwrap();
@@ -351,7 +345,7 @@ fn test_single_char_keywords_extracted() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("a bc d efg h").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
+    perform_split(String::from("a bc d efg h").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
 
     println!("{:?}", keyword_map);
 
@@ -380,7 +374,7 @@ fn test_single_digit_extracted() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split(String::from("1").as_str(), col_ref, 0u16, 0u32, &mut keyword_map);
+    perform_split(String::from("1").as_str(), col_ref, 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
 
     println!("{:?}", keyword_map);
 
@@ -406,7 +400,7 @@ fn test_split_all_levels_comprehensive() {
 
     let test_string = "hello world/path:to@email.com$price#tag-dash_underscore";
 
-    perform_split(test_string, col_ref, 0, 0, &mut keyword_map);
+    perform_split(test_string, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\n=== All Keywords Found ===");
     for (keyword, data) in keyword_map.iter() {
@@ -455,7 +449,7 @@ fn test_all_level_0_delimiters() {
 
     for (input, expected_words) in test_cases {
         keyword_map.clear();
-        perform_split(input, col_ref, 0, 0, &mut keyword_map);
+        perform_split(input, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
         for word in expected_words {
             assert!(
@@ -488,7 +482,7 @@ fn test_all_level_1_delimiters() {
 
     for (input, expected_words) in test_cases {
         keyword_map.clear();
-        perform_split(input, col_ref, 0, 0, &mut keyword_map);
+        perform_split(input, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
         for word in expected_words {
             assert!(
@@ -521,7 +515,7 @@ fn test_all_level_2_delimiters() {
 
     for (input, expected_words) in test_cases {
         keyword_map.clear();
-        perform_split(input, col_ref, 0, 0, &mut keyword_map);
+        perform_split(input, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
         for word in expected_words {
             assert!(
@@ -549,7 +543,7 @@ fn test_all_level_3_delimiters() {
 
     for (input, expected_words) in test_cases {
         keyword_map.clear();
-        perform_split(input, col_ref, 0, 0, &mut keyword_map);
+        perform_split(input, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
         for word in expected_words {
             assert!(
@@ -570,7 +564,7 @@ fn test_hierarchical_splitting() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("hello-world/test.file", col_ref, 0, 0, &mut keyword_map);
+    perform_split("hello-world/test.file", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nHierarchical split results:");
     for (keyword, data) in keyword_map.iter() {
@@ -600,7 +594,7 @@ fn test_empty_segments_ignored() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("word1//word2", col_ref, 0, 0, &mut keyword_map);
+    perform_split("word1//word2", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert!(keyword_map.contains_key("word1"));
     assert!(keyword_map.contains_key("word2"));
@@ -617,7 +611,7 @@ fn test_complex_real_world_example() {
     let col_ref = column_pool.intern("test_col");
 
     let url = "https://example.com/api/v1/users?id=123&name=john_doe";
-    perform_split(url, col_ref, 0, 0, &mut keyword_map);
+    perform_split(url, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nComplex example keywords:");
     for keyword in keyword_map.keys() {
@@ -648,10 +642,10 @@ fn test_multiple_row_groups() {
     let col_ref = column_pool.intern("test_col");
 
     // Add same keyword across different row groups
-    perform_split("common", col_ref, 0, 10, &mut keyword_map);  // row_group 0
-    perform_split("common", col_ref, 1, 20, &mut keyword_map);  // row_group 1
-    perform_split("common", col_ref, 2, 30, &mut keyword_map);  // row_group 2
-    perform_split("common", col_ref, 5, 40, &mut keyword_map);  // row_group 5
+    perform_split("common", col_ref, 0, 10, &mut keyword_map, default_split_lookup(), false);  // row_group 0
+    perform_split("common", col_ref, 1, 20, &mut keyword_map, default_split_lookup(), false);  // row_group 1
+    perform_split("common", col_ref, 2, 30, &mut keyword_map, default_split_lookup(), false);  // row_group 2
+    perform_split("common", col_ref, 5, 40, &mut keyword_map, default_split_lookup(), false);  // row_group 5
 
     let kw = keyword_map.get("common").unwrap();
 
@@ -691,12 +685,12 @@ fn test_same_keyword_many_columns() {
     let col5 = column_pool.intern("col5");
     let col6 = column_pool.intern("col6");
 
-    perform_split("apple", col1, 0, 0, &mut keyword_map);
-    perform_split("apple", col2, 0, 1, &mut keyword_map);
-    perform_split("apple", col3, 0, 2, &mut keyword_map);
-    perform_split("apple", col4, 0, 3, &mut keyword_map);
-    perform_split("apple", col5, 0, 4, &mut keyword_map);
-    perform_split("apple", col6, 0, 5, &mut keyword_map);
+    perform_split("apple", col1, 0, 0, &mut keyword_map, default_split_lookup(), false);
+    perform_split("apple", col2, 0, 1, &mut keyword_map, default_split_lookup(), false);
+    perform_split("apple", col3, 0, 2, &mut keyword_map, default_split_lookup(), false);
+    perform_split("apple", col4, 0, 3, &mut keyword_map, default_split_lookup(), false);
+    perform_split("apple", col5, 0, 4, &mut keyword_map, default_split_lookup(), false);
+    perform_split("apple", col6, 0, 5, &mut keyword_map, default_split_lookup(), false);
 
     let kw = keyword_map.get("apple").unwrap();
 
@@ -728,10 +722,10 @@ fn test_non_ascii_characters() {
     let col_ref = column_pool.intern("test_col");
 
     // Test various non-ASCII strings
-    perform_split("hello世界", col_ref, 0, 0, &mut keyword_map);
-    perform_split("café", col_ref, 0, 1, &mut keyword_map);
-    perform_split("привет", col_ref, 0, 2, &mut keyword_map);
-    perform_split("emoji😀test", col_ref, 0, 3, &mut keyword_map);
+    perform_split("hello世界", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
+    perform_split("café", col_ref, 0, 1, &mut keyword_map, default_split_lookup(), false);
+    perform_split("привет", col_ref, 0, 2, &mut keyword_map, default_split_lookup(), false);
+    perform_split("emoji😀test", col_ref, 0, 3, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nNon-ASCII keywords found:");
     for keyword in keyword_map.keys() {
@@ -755,10 +749,10 @@ fn test_consecutive_rows_different_split_bits() {
     let col_ref = column_pool.intern("test_col");
 
     // Add "test" with one split pattern
-    perform_split("test", col_ref, 0, 0, &mut keyword_map);
+    perform_split("test", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     // Add "test-variant" where "test" has different splits_matched
-    perform_split("test-variant", col_ref, 0, 1, &mut keyword_map);
+    perform_split("test-variant", col_ref, 0, 1, &mut keyword_map, default_split_lookup(), false);
 
     let kw = keyword_map.get("test").unwrap();
 
@@ -784,7 +778,7 @@ fn test_display_keyword_one_file() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("hello world", col_ref, 0, 0, &mut keyword_map);
+    perform_split("hello world", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     let kw = keyword_map.get("hello").unwrap();
 
@@ -810,10 +804,10 @@ fn test_mixed_row_groups_and_columns() {
     let col2 = column_pool.intern("col2");
 
     // Add "data" to multiple columns and row groups
-    perform_split("data", col1, 0, 10, &mut keyword_map);
-    perform_split("data", col1, 1, 20, &mut keyword_map);
-    perform_split("data", col2, 0, 30, &mut keyword_map);
-    perform_split("data", col2, 2, 40, &mut keyword_map);
+    perform_split("data", col1, 0, 10, &mut keyword_map, default_split_lookup(), false);
+    perform_split("data", col1, 1, 20, &mut keyword_map, default_split_lookup(), false);
+    perform_split("data", col2, 0, 30, &mut keyword_map, default_split_lookup(), false);
+    perform_split("data", col2, 2, 40, &mut keyword_map, default_split_lookup(), false);
 
     let kw = keyword_map.get("data").unwrap();
 
@@ -834,7 +828,7 @@ fn test_deeply_nested_delimiters() {
 
     // String with delimiters at all 4 levels nested
     let nested = "a b/c:d.e-f";
-    perform_split(nested, col_ref, 0, 0, &mut keyword_map);
+    perform_split(nested, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nDeeply nested keywords:");
     for keyword in keyword_map.keys() {

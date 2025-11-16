@@ -5,7 +5,7 @@ fn test_column_keywords_map_single_value() {
     let mut keyword_map: HashMap<Rc<str>, KeywordOneFile> = HashMap::new();
     let mut column_pool = ColumnPool::new();
 
-    perform_split("hello".into(), column_pool.intern("col1"), 0u16, 0u32, &mut keyword_map);
+    perform_split("hello".into(), column_pool.intern("col1"), 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -22,7 +22,7 @@ fn test_column_keywords_map_split_values() {
     let mut keyword_map: HashMap<Rc<str>, KeywordOneFile> = HashMap::new();
     let mut column_pool = ColumnPool::new();
 
-    perform_split("hello world".into(), column_pool.intern("col1"), 0u16, 0u32, &mut keyword_map);
+    perform_split("hello world".into(), column_pool.intern("col1"), 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -38,9 +38,9 @@ fn test_column_keywords_map_multiple_columns() {
     let mut keyword_map: HashMap<Rc<str>, KeywordOneFile> = HashMap::new();
     let mut column_pool = ColumnPool::new();
 
-    perform_split("apple".into(), column_pool.intern("col1"), 0u16, 0u32, &mut keyword_map);
-    perform_split("banana orange".into(), column_pool.intern("col2"), 0u16, 0u32, &mut keyword_map);
-    perform_split("apple".into(), column_pool.intern("col3"), 0u16, 0u32, &mut keyword_map);
+    perform_split("apple".into(), column_pool.intern("col1"), 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split("banana orange".into(), column_pool.intern("col2"), 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
+    perform_split("apple".into(), column_pool.intern("col3"), 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -66,7 +66,7 @@ fn test_column_keywords_map_complex_splitting() {
     let mut keyword_map: HashMap<Rc<str>, KeywordOneFile> = HashMap::new();
     let mut column_pool = ColumnPool::new();
 
-    perform_split("path/to/file.txt".into(), column_pool.intern("filepath"), 0u16, 0u32, &mut keyword_map);
+    perform_split("path/to/file.txt".into(), column_pool.intern("filepath"), 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -84,7 +84,7 @@ fn test_column_keywords_map_single_chars() {
     let mut keyword_map: HashMap<Rc<str>, KeywordOneFile> = HashMap::new();
     let mut column_pool = ColumnPool::new();
 
-    perform_split("a bc d efg h".into(), column_pool.intern("mixed"), 0u16, 0u32, &mut keyword_map);
+    perform_split("a bc d efg h".into(), column_pool.intern("mixed"), 0u16, 0u32, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -117,7 +117,7 @@ fn test_build_column_keywords_map_single_column_multiple_keywords() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("col1");
 
-    perform_split("apple banana cherry", col_ref, 0, 0, &mut keyword_map);
+    perform_split("apple banana cherry", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -139,8 +139,8 @@ fn test_build_column_keywords_map_overlapping_keywords() {
     let col2 = column_pool.intern("col2");
 
     // "shared" appears in both columns
-    perform_split("shared unique1", col1, 0, 0, &mut keyword_map);
-    perform_split("shared unique2", col2, 0, 0, &mut keyword_map);
+    perform_split("shared unique1", col1, 0, 0, &mut keyword_map, default_split_lookup(), false);
+    perform_split("shared unique2", col2, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -163,7 +163,7 @@ fn test_build_column_keywords_map_skips_global_bucket() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("col1");
 
-    perform_split("keyword", col_ref, 0, 0, &mut keyword_map);
+    perform_split("keyword", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -188,7 +188,7 @@ fn test_build_column_keywords_map_many_columns() {
         let col_name = format!("col{}", i);
         let col_ref = column_pool.intern(&col_name);
         let keyword = format!("keyword{} shared", i);
-        perform_split(&keyword, col_ref, 0, i as u32, &mut keyword_map);
+        perform_split(&keyword, col_ref, 0, i as u32, &mut keyword_map, default_split_lookup(), false);
     }
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
@@ -213,7 +213,7 @@ fn test_build_column_keywords_map_with_splitting() {
     let col_ref = column_pool.intern("filepath");
 
     // This will split into multiple keywords
-    perform_split("path/to/file.txt", col_ref, 0, 0, &mut keyword_map);
+    perform_split("path/to/file.txt", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
 
@@ -235,9 +235,9 @@ fn test_build_column_keywords_map_indexset_ordering() {
     let col_ref = column_pool.intern("col1");
 
     // Add keywords in a specific order
-    perform_split("zebra", col_ref, 0, 0, &mut keyword_map);
-    perform_split("apple", col_ref, 0, 1, &mut keyword_map);
-    perform_split("banana", col_ref, 0, 2, &mut keyword_map);
+    perform_split("zebra", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
+    perform_split("apple", col_ref, 0, 1, &mut keyword_map, default_split_lookup(), false);
+    perform_split("banana", col_ref, 0, 2, &mut keyword_map, default_split_lookup(), false);
 
     let column_keywords_map = build_column_keywords_map(&keyword_map, &column_pool);
     let col1_keywords = column_keywords_map.get("col1").unwrap();

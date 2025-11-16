@@ -665,6 +665,9 @@ mod comprehensive_large_file_tests {
             None,
             Some(0.01),
             None,
+            None,
+            None,
+            None,
             None
         ).await.expect("Failed to build index");
         println!("Index building time: {:.2?}\n", start_index.elapsed());

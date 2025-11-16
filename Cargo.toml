@@ -24,6 +24,7 @@ once_cell = "1.21.3"
 futures = "0.3.31"
 libc = "0.2.177"
 zstd = "0.13.3"
+reqwest = "0.12.24"
 
 # Optional: for better S3 configuration
 [dependencies.aws-config]

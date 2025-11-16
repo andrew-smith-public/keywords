@@ -20,7 +20,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //!     // Build an index with default compression
-//!     build_and_save_index("data.parquet", None, None, None, None, None).await?;
+//!     build_and_save_index("data.parquet", None, None, None, None, None, None, None, None).await?;
 //!
 //!     // Search for a keyword
 //!     let result = search("data.parquet", "example", None, true).await?;
@@ -51,6 +51,7 @@ use indexmap::IndexSet;
 use std::rc::Rc;
 use std::collections::HashSet as StdHashSet;
 use bytes::Bytes;
+use keyword_shred::SPLIT_CHARS_INCLUSIVE;
 use crate::index_data::{build_distributed_index, save_distributed_index, CompressionAlgorithm};
 use crate::utils::column_pool::ColumnPool;
 use crate::index_structure::column_filter::ColumnFilter;
@@ -107,7 +108,8 @@ impl From<Vec<u8>> for ParquetSource {
 const MAX_CHUNK_SIZE_BYTES: usize = 1_000_000;
 
 /// Result of processing a Parquet file.
-/// Contains the keyword map, the column name pool, column keywords map, column filters, and global filter.
+/// Contains the keyword map, the column name pool, column keywords map, column filters, global filter,
+/// and per-column full keyword storage flags.
 #[derive(Debug)]
 pub struct ProcessResult {
     pub keyword_map: HashMap<Rc<str>, KeywordOneFile>,
@@ -115,6 +117,7 @@ pub struct ProcessResult {
     pub column_keywords_map: HashMap<Rc<str>, IndexSet<Rc<str>>>,
     pub column_filters: HashMap<Rc<str>, ColumnFilter>,
     pub global_filter: ColumnFilter,
+    pub column_full_keyword_stored: HashMap<Rc<str>, bool>,
 }
 
 /// Information about a keyword index for a Parquet file.
@@ -176,6 +179,9 @@ pub async fn build_and_save_index(
     index_file_prefix: Option<&str>,
     keywords_compression: Option<CompressionAlgorithm>,
     data_compression: Option<CompressionAlgorithm>,
+    split_chars: Option<Vec<Vec<char>>>,
+    store_full_keyword_default: Option<bool>,
+    full_keyword_column_exceptions: Option<StdHashSet<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let error_rate = error_rate.unwrap_or(0.01);
     let keywords_compression = keywords_compression.unwrap_or(CompressionAlgorithm::Zstd { level: 8 });
@@ -192,10 +198,25 @@ pub async fn build_and_save_index(
 
     println!("Processing parquet file...");
     let source = ParquetSource::Path(parquet_path.to_string());
-    let result = process_parquet_file(source.clone(), exclude_columns, Some(error_rate)).await?;
+
+    // Default split_chars to SPLIT_CHARS_INCLUSIVE if not provided
+    let split_chars_vec = split_chars.unwrap_or_else(|| {
+        SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect()
+    });
+
+    let result = process_parquet_file(
+        source.clone(),
+        exclude_columns,
+        Some(error_rate),
+        Some(split_chars_vec.clone()),
+        store_full_keyword_default,
+        full_keyword_column_exceptions,
+    ).await?;
 
     println!("Building distributed index...");
-    let files = build_distributed_index(&result, &source, error_rate, keywords_compression, data_compression).await?;
+    let files = build_distributed_index(&result, &source, error_rate, keywords_compression, data_compression, &split_chars_vec).await?;
 
     println!("Saving index files...");
     save_distributed_index(&files, parquet_path, index_file_prefix).await?;
@@ -500,6 +521,9 @@ pub async fn build_index_in_memory(
     error_rate: Option<f64>,
     keywords_compression: Option<CompressionAlgorithm>,
     data_compression: Option<CompressionAlgorithm>,
+    split_chars: Option<Vec<Vec<char>>>,
+    store_full_keyword_default: Option<bool>,
+    full_keyword_column_exceptions: Option<StdHashSet<String>>,
 ) -> Result<KeywordSearcher, Box<dyn std::error::Error + Send + Sync>> {
     use crate::utils::file_interaction_local_and_cloud::register_memory_file;
 
@@ -537,9 +561,23 @@ pub async fn build_index_in_memory(
         }
     };
 
+    // Default split_chars to SPLIT_CHARS_INCLUSIVE if not provided
+    let split_chars_vec = split_chars.unwrap_or_else(|| {
+        SPLIT_CHARS_INCLUSIVE.iter()
+            .map(|&chars| chars.to_vec())
+            .collect()
+    });
+
     // Build index using memory path
-    let result = process_parquet_file(source, exclude_columns, Some(error_rate)).await?;
-    let files = build_distributed_index(&result, &ParquetSource::Path(memory_path.clone()), error_rate, keywords_compression, data_compression).await?;
+    let result = process_parquet_file(
+        source,
+        exclude_columns,
+        Some(error_rate),
+        Some(split_chars_vec.clone()),
+        store_full_keyword_default,
+        full_keyword_column_exceptions,
+    ).await?;
+    let files = build_distributed_index(&result, &ParquetSource::Path(memory_path.clone()), error_rate, keywords_compression, data_compression, &split_chars_vec).await?;
 
     // Save to memory using the abstraction
     save_distributed_index(&files, &memory_path, None).await?;

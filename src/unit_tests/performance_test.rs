@@ -124,6 +124,9 @@ mod tests {
             Some(0.01),
             index_file_prefix,
             None,
+            None,
+            None,
+            None,
             None
         ).await?;
 

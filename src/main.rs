@@ -298,7 +298,17 @@ async fn handle_index(file_path: &str, keywords_compression: keywords::index_dat
     println!("Indexing file: {}", file_path);
     println!("This may take a while for large files...\n");
 
-    match keywords::build_and_save_index(file_path, None, None, None, Some(keywords_compression), Some(data_compression)).await {
+    match keywords::build_and_save_index(
+        file_path,
+        None,  // exclude_columns
+        None,  // error_rate
+        None,  // index_file_prefix
+        Some(keywords_compression),
+        Some(data_compression),
+        None,  // split_chars (use default)
+        None,  // store_full_keyword_default (use default: false)
+        None,  // full_keyword_column_exceptions
+    ).await {
         Ok(()) => {
             println!("\n✓ Indexing completed successfully!");
         }

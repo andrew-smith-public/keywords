@@ -6,3 +6,6 @@ pub mod integration_tests;
 pub mod comprehensive_test;
 mod performance_comparison_test;
 mod compression_level_analysis;
+mod different_splitting;
+mod comprehensive_test_modified_splits;
+mod yellow_taxi_test;

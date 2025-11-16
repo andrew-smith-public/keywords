@@ -1,63 +1,76 @@
+use std::iter::Iterator;
 use hashbrown::HashMap;
 use hashbrown::hash_map::RawEntryMut;
 use indexmap::IndexSet;
 use smallvec::{SmallVec, smallvec};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use crate::utils::column_pool::{ColumnPool};
 
-// Original constants
+// Original constants (used as defaults)
 pub const SPLIT_CHARS_INCLUSIVE: &[&[char]] = &[
     &['\r', '\n', '\t', '\'', '"', '<', '>', '(', ')', '|', ',', '!', ';', '{', '}', '*', ' '],
     &['/', '@', '=', ':', '\\', '?', '&'],
     &['.', '$', '#', '`', '~', '^', '+'],
     &['-', '_'],
 ];
-pub const SPLIT_CHARS_COUNT: usize = SPLIT_CHARS_INCLUSIVE.len();
 
 pub const ADDITIONAL_ROWS_CAP: u16 = u16::MAX - 1;
 
-// Build lookup table once as a static
-static SPLIT_LOOKUP: [[bool; 128]; 4] = {
-    let mut lookup = [[false; 128]; 4];
+/// Default split lookup table built from SPLIT_CHARS_INCLUSIVE.
+/// Useful for tests and as a default configuration.
+static DEFAULT_SPLIT_LOOKUP: OnceLock<SplitLookup> = OnceLock::new();
 
-    let mut level = 0;
-    while level < 4 {
-        let mut i = 0;
-        while i < SPLIT_CHARS_INCLUSIVE[level].len() {
-            let ch = SPLIT_CHARS_INCLUSIVE[level][i] as u32;
-            if ch < 128 {
-                lookup[level][ch as usize] = true;
-            }
-            i += 1;
-        }
-        level += 1;
-    }
-    lookup
-};
-
-/// Checks if a character is a delimiter at the specified split-level.
-///
-/// This function uses a pre-computed lookup table for fast delimiter detection.
-/// It only works for ASCII characters; non-ASCII characters always return false.
-///
-/// # Arguments
-///
-/// * `c` - The character to check
-/// * `level` - The split-level (0-3) corresponding to different delimiter sets
-///
-/// # Returns
-///
-/// Returns `true` if the character is an ASCII delimiter at the given level, `false` otherwise.
-///
-/// # Safety
-///
-/// Uses `get_unchecked` for performance after checking that the character is ASCII.
-/// The ASCII check ensures the character value is always < 128, making the unchecked
-/// access safe.
-#[inline(always)]
-pub fn is_delimiter(c: char, level: usize) -> bool {
-    c.is_ascii() && unsafe { *SPLIT_LOOKUP[level].get_unchecked(c as usize) }
+/// Get the default split lookup table.
+/// This is lazily initialized on first access.
+pub fn default_split_lookup() -> &'static SplitLookup {
+    DEFAULT_SPLIT_LOOKUP.get_or_init(|| {
+        let split_chars: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE
+            .iter()
+            .map(|&chars| chars.to_vec())
+            .collect();
+        SplitLookup::new(&split_chars)
+    })
 }
+
+/// Dynamic split lookup table for runtime-configurable split characters
+pub struct SplitLookup {
+    lookup: Vec<[bool; 128]>,
+}
+
+impl SplitLookup {
+    /// Build a lookup table from split character configuration
+    pub fn new(split_chars: &[Vec<char>]) -> Self {
+        let mut lookup = vec![[false; 128]; split_chars.len()];
+
+        for (level, chars) in split_chars.iter().enumerate() {
+            for &ch in chars {
+                let ch_u32 = ch as u32;
+                if ch_u32 < 128 {
+                    lookup[level][ch_u32 as usize] = true;
+                }
+            }
+        }
+
+        SplitLookup { lookup }
+    }
+
+    /// Check if a character is a delimiter at the specified split-level
+    #[inline(always)]
+    pub fn is_delimiter(&self, c: char, level: usize) -> bool {
+        c.is_ascii() && level < self.lookup.len() && unsafe {
+            *self.lookup[level].get_unchecked(c as usize)
+        }
+    }
+
+    /// Get the number of split levels
+    #[inline(always)]
+    pub fn num_levels(&self) -> usize {
+        self.lookup.len()
+    }
+}
+
+
 
 #[derive(Debug, Eq, Hash, PartialEq)]
 pub struct Row {
@@ -495,17 +508,18 @@ fn perform_split_inner(
     keyword_map: &mut HashMap<Rc<str>, KeywordOneFile>,
     split_level: usize,
     incomplete_split_match_bit_in: u16,
-    parent_keyword: &Option<Rc<str>>
+    parent_keyword: &Option<Rc<str>>,
+    split_lookup: &SplitLookup,
 ) {
     let mut new_parent_keyword: Option<Rc<str>> = None;
     let mut output_parent_decision_complete = false;
     let current_split_level = 1 << (split_level + 1);
 
-    for split in keyword_string.split(|c| is_delimiter(c, split_level)).filter(|s| !s.is_empty()) {
+    for split in keyword_string.split(|c| split_lookup.is_delimiter(c, split_level)).filter(|s| !s.is_empty()) {
         if split.len() == keyword_string.len() {
             let combined_match_bit: u16 = incomplete_split_match_bit_in | current_split_level;
             output_parent_decision_complete = true;
-            if split_level + 1 == SPLIT_CHARS_COUNT {
+            if split_level + 1 == split_lookup.num_levels() {
                 merge_or_add_keyword_no_return(
                     keyword_string,
                     column_reference,
@@ -525,7 +539,8 @@ fn perform_split_inner(
                     keyword_map,
                     split_level + 1,
                     combined_match_bit,
-                    parent_keyword
+                    parent_keyword,
+                    split_lookup,
                 );
             }
             break;
@@ -551,7 +566,7 @@ fn perform_split_inner(
                 parent_keyword
             };
 
-            if split_level + 1 == SPLIT_CHARS_COUNT {
+            if split_level + 1 == split_lookup.num_levels() {
                 merge_or_add_keyword_no_return(
                     split,
                     column_reference,
@@ -570,7 +585,8 @@ fn perform_split_inner(
                     keyword_map,
                     split_level + 1,
                     current_split_level,
-                    parent_to_use
+                    parent_to_use,
+                    split_lookup,
                 );
             }
         }
@@ -605,14 +621,18 @@ fn perform_split_inner(
 /// * `row_group` - The row group number in the Parquet file
 /// * `row_number` - The row number in the Parquet file
 /// * `keyword_map` - Mutable reference to the keyword map where results are stored
+/// * `split_lookup` - The split lookup table for determining delimiters
+/// * `store_full_keyword` - If true, store the entire unsplit keyword before splitting
 ///
 /// # Examples
 ///
 /// ```
-/// # use keywords::keyword_shred::perform_split;
+/// # use keywords::keyword_shred::{perform_split, SplitLookup, SPLIT_CHARS_INCLUSIVE};
 /// use hashbrown::HashMap;
 /// let mut keyword_map = HashMap::new();
-/// perform_split("hello-world", 1, 0, 42, &mut keyword_map);
+/// let split_chars: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE.iter().map(|&chars| chars.to_vec()).collect();
+/// let split_lookup = SplitLookup::new(&split_chars);
+/// perform_split("hello-world", 1, 0, 42, &mut keyword_map, &split_lookup, false);
 /// // Creates entries for "hello-world", "hello", and "world" with parent-child relationships
 /// ```
 pub fn perform_split(
@@ -620,8 +640,42 @@ pub fn perform_split(
     column_reference: u32,  // From a column pool
     row_group: u16,
     row_number: u32,
-    keyword_map: &mut HashMap<Rc<str>, KeywordOneFile>
+    keyword_map: &mut HashMap<Rc<str>, KeywordOneFile>,
+    split_lookup: &SplitLookup,
+    store_full_keyword: bool,
 ) {
+    // Handle empty string - only store if store_full_keyword is true
+    if keyword_string.is_empty() {
+        if store_full_keyword {
+            merge_or_add_keyword_no_return(
+                keyword_string,
+                column_reference,
+                row_group,
+                row_number,
+                1, // Bit 0 set - this is the unsplit value
+                keyword_map,
+                &None, // No parent
+            );
+        }
+        return;
+    }
+
+    // Store the full keyword before splitting if requested and use it as parent
+    let parent_for_splits = if store_full_keyword {
+        let keyword_rc = merge_or_add_keyword_return_rc(
+            keyword_string,
+            column_reference,
+            row_group,
+            row_number,
+            1, // Bit 0 set - this is the unsplit value
+            keyword_map,
+            &None, // No parent - this is the root
+        );
+        Some(keyword_rc)
+    } else {
+        None
+    };
+
     perform_split_inner(
         keyword_string,
         column_reference,
@@ -630,7 +684,8 @@ pub fn perform_split(
         keyword_map,
         0,
         1,
-        &None,  // No parent - this is the root/original string from parquet
+        &parent_for_splits,  // Pass full keyword as parent if stored, otherwise None
+        split_lookup,
     );
 }
 

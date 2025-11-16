@@ -19,6 +19,8 @@ mod tests {
             parquet_etag: "test".to_string(),
             parquet_size: 0,
             parquet_last_modified: 0,
+            parquet_metadata_offset: 5,
+            parquet_metadata_length: 5,
             error_rate: 0.01,
             split_chars_inclusive,
             keywords_compression: CompressionAlgorithm::None,
@@ -27,8 +29,7 @@ mod tests {
             column_filters: std::collections::HashMap::new(),
             global_filter: ColumnFilter::RkyvHashSet(vec![]),
             chunk_index: vec![],
-            parquet_metadata_offset: 5,
-            parquet_metadata_length: 5
+            column_full_keyword_stored: std::collections::HashMap::new(),
         };
 
         KeywordSearcher {

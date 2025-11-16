@@ -215,6 +215,9 @@ impl KeywordSearcher {
                     count: chunk.count.to_native(),
                 })
                 .collect(),
+            column_full_keyword_stored: archived_filters.column_full_keyword_stored.iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect(),
         };
 
         Ok(Self {

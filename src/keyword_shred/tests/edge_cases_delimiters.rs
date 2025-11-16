@@ -6,7 +6,7 @@ fn test_empty_string() {
     let mut column_pool = ColumnPool::new();
     let col_ref = column_pool.intern("test_col");
 
-    perform_split("", col_ref, 0, 0, &mut keyword_map);
+    perform_split("", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert_eq!(keyword_map.len(), 0, "Empty string should produce no keywords");
 }
@@ -18,7 +18,7 @@ fn test_only_level_0_delimiters() {
     let col_ref = column_pool.intern("test_col");
 
     // Only level 0 delimiters: space, tab, newline, etc.
-    perform_split("   \t\n\r  ", col_ref, 0, 0, &mut keyword_map);
+    perform_split("   \t\n\r  ", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert_eq!(
         keyword_map.len(),
@@ -37,7 +37,7 @@ fn test_only_level_1_delimiters() {
     // Level 0: no splits → "//@@==::??&&" added as keyword
     // Level 1: splits to all empty parts → no more keywords
     // Result: 1 keyword
-    perform_split("//@@==::??&&", col_ref, 0, 0, &mut keyword_map);
+    perform_split("//@@==::??&&", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert_eq!(
         keyword_map.len(),
@@ -58,7 +58,7 @@ fn test_only_level_2_delimiters() {
     // Level 1: no splits → "...$$###```~~~^^^+++" added as keyword (same string)
     // Level 2: splits to all empty parts → no more keywords
     // Result: 1 unique keyword (same string at levels 0 and 1)
-    perform_split("...$$###```~~~^^^+++", col_ref, 0, 0, &mut keyword_map);
+    perform_split("...$$###```~~~^^^+++", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert_eq!(
         keyword_map.len(),
@@ -80,7 +80,7 @@ fn test_only_level_3_delimiters() {
     // Level 2: no splits → "---___---___" added as keyword (same string)
     // Level 3: splits to all empty parts → no more keywords
     // Result: 1 unique keyword (same string at all levels)
-    perform_split("---___---___", col_ref, 0, 0, &mut keyword_map);
+    perform_split("---___---___", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     assert_eq!(
         keyword_map.len(),
@@ -104,7 +104,7 @@ fn test_all_delimiters_mixed() {
     // Level 2 split → "-_" (1 part, added as keyword)
     // Level 3 split → nothing (no keyword)
     // Result: 3 keywords
-    perform_split(" \t//@..$##-_", col_ref, 0, 0, &mut keyword_map);
+    perform_split(" \t//@..$##-_", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nKeywords found:");
     for keyword in keyword_map.keys() {
@@ -136,7 +136,7 @@ fn test_all_delimiters_non_hierarchical_order() {
     // String: "-.#/@\t$:~'|\r^(&\n=<+>)?!_`;{,}*\""
     let complex = "-.#/@\t$:~'|\r^(&\n=<+>)?!_`;{,}*\"";
     
-    perform_split(complex, col_ref, 0, 0, &mut keyword_map);
+    perform_split(complex, col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nAll delimiters non-hierarchical order test:");
     println!("Original: {:?}", complex);
@@ -209,7 +209,7 @@ fn test_consecutive_delimiters() {
     // "word3---word4" at Level 3 splits on - → ["word3", "word4"]
     //   Before processing splits, "word3---word4" is ADDED
     // Expected: word1, word2///word3---word4, word2, word3---word4, word3, word4 = 6 keywords
-    perform_split("word1   word2///word3---word4", col_ref, 0, 0, &mut keyword_map);
+    perform_split("word1   word2///word3---word4", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nConsecutive delimiters keywords:");
     for keyword in keyword_map.keys() {
@@ -240,7 +240,7 @@ fn test_trailing_delimiters_only() {
     // "---" at Level 3: splits on - → [] (empty after filter)
     //   Loop doesn't execute, so "---" is ADDED via line 400
     // Expected: keyword///...---, keyword, ...---, --- = 4 keywords
-    perform_split("keyword///...---", col_ref, 0, 0, &mut keyword_map);
+    perform_split("keyword///...---", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nTrailing delimiters keywords:");
     for keyword in keyword_map.keys() {
@@ -266,7 +266,7 @@ fn test_leading_delimiters_only() {
     // "...---keyword" at Level 2 splits on . → ["---keyword"]
     // "---keyword" at Level 3 splits on - → ["keyword"]
     // Expected: ///...---keyword, ...---keyword, ---keyword, keyword = 4 keywords
-    perform_split("///...---keyword", col_ref, 0, 0, &mut keyword_map);
+    perform_split("///...---keyword", col_ref, 0, 0, &mut keyword_map, default_split_lookup(), false);
 
     println!("\nLeading delimiters keywords:");
     for keyword in keyword_map.keys() {
