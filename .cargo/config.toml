@@ -1,7 +1,6 @@
 [build]
 rustflags = [
-    "-C", "target-cpu=native",
-    "-C", "link-arg=-fuse-ld=mold"  # Faster linking (build time, not runtime)
+    "-C", "target-cpu=native"
 ]
 
 [env]
