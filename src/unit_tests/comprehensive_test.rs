@@ -25,11 +25,17 @@ mod comprehensive_large_file_tests {
     use crate::searching::pruned_reader::PrunedParquetReader;
     use rand::{Rng, SeedableRng};
 
+    #[cfg(not(debug_assertions))]
     const ROWS_PER_GROUP: usize = 250_000;
+    #[cfg(debug_assertions)]
+    const ROWS_PER_GROUP: usize = 25_000;
     const NUM_ROW_GROUPS: usize = 5;
     const NUM_COLUMNS: usize = 10;
     const TOTAL_ROWS: usize = ROWS_PER_GROUP * NUM_ROW_GROUPS;
+    #[cfg(not(debug_assertions))]
     const RANDOM_STRING_POOL_SIZE: usize = 25_000;
+    #[cfg(debug_assertions)]
+    const RANDOM_STRING_POOL_SIZE: usize = 5_000;
 
     /// Helper function to check if a keyword is found in the expected row and row group
     ///
@@ -336,7 +342,7 @@ mod comprehensive_large_file_tests {
         // Middle of second row group - path with hierarchical splits
         tests.push(TestString {
             content: "/usr/local/bin/python3.11".to_string(), // Level 1: /, Level 2: .
-            row_position: ROWS_PER_GROUP + 125_000,
+            row_position: ROWS_PER_GROUP + ROWS_PER_GROUP / 2,
             column: 3,
         });
 
@@ -357,7 +363,7 @@ mod comprehensive_large_file_tests {
         // Middle of middle row group - JSON-like structure
         tests.push(TestString {
             content: r#"{"user":{"name":"test","email":"test@example.org"},"active":true}"#.to_string(),
-            row_position: ROWS_PER_GROUP * 2 + 125_000,
+            row_position: ROWS_PER_GROUP * 2 + ROWS_PER_GROUP / 2,
             column: 6,
         });
 
@@ -378,7 +384,7 @@ mod comprehensive_large_file_tests {
         // Middle of fourth row group
         tests.push(TestString {
             content: "base64::encode(data) -> Result<String, Error>".to_string(),
-            row_position: ROWS_PER_GROUP * 3 + 125_000,
+            row_position: ROWS_PER_GROUP * 3 + ROWS_PER_GROUP / 2,
             column: 9,
         });
 
@@ -399,7 +405,7 @@ mod comprehensive_large_file_tests {
         // Middle of last row group - use space before time to ensure "10" is a separate keyword
         tests.push(TestString {
             content: "2024-01-15 10:30:45.123Z".to_string(), // Space before time splits properly
-            row_position: ROWS_PER_GROUP * 4 + 125_000,
+            row_position: ROWS_PER_GROUP * 4 + ROWS_PER_GROUP / 2,
             column: 2,
         });
 
@@ -411,7 +417,7 @@ mod comprehensive_large_file_tests {
         });
 
         // Add 10,000 consecutive rows pattern (rows 100,000 to 109,999 in RG0)
-        for i in 100_000..110_000 {
+        for i in (ROWS_PER_GROUP * 4 / 10)..(10_000 + ROWS_PER_GROUP * 4 / 10) {
             tests.push(TestString {
                 content: "CONSECUTIVE_PATTERN_TEST".to_string(),
                 row_position: i,
@@ -422,7 +428,7 @@ mod comprehensive_large_file_tests {
         // Add 7,500 non-consecutive rows pattern (every 100th row from 500,000 to 1,249,900)
         // Note: Loop attempts 10,000 but only 7,500 fit within TOTAL_ROWS (1,250,000)
         for i in 0..10_000 {
-            let row = 500_000 + (i * 100);
+            let row = ROWS_PER_GROUP * 2 + (i * (ROWS_PER_GROUP/2500));
             if row < TOTAL_ROWS {
                 tests.push(TestString {
                     content: "NONCONSECUTIVE_PATTERN_TEST".to_string(),
@@ -435,112 +441,112 @@ mod comprehensive_large_file_tests {
         // Add complex strings that should match at keyword level but need verification
         tests.push(TestString {
             content: "example.com is not the same as api.example.com".to_string(),
-            row_position: 50_000,
+            row_position: ROWS_PER_GROUP / 5,
             column: 6,
         });
 
         tests.push(TestString {
             content: "The word test appears but not another word".to_string(),
-            row_position: 75_000,
+            row_position: 3 * ROWS_PER_GROUP / 10,
             column: 7,
         });
 
         // Add strings that split differently at different levels
         tests.push(TestString {
             content: "level0 space|pipe;semicolon".to_string(), // Level 0 splits
-            row_position: 150_000,
+            row_position: 6 * ROWS_PER_GROUP / 10,
             column: 8,
         });
 
         tests.push(TestString {
             content: "level1/slash:colon@at=equals".to_string(), // Level 1 splits
-            row_position: 175_000,
+            row_position: 7 * ROWS_PER_GROUP / 10,
             column: 9,
         });
 
         tests.push(TestString {
             content: "level2.dot$dollar#hash".to_string(), // Level 2 splits
-            row_position: 200_000,
+            row_position: 8 * ROWS_PER_GROUP / 10,
             column: 0,
         });
 
         tests.push(TestString {
             content: "level3-dash_underscore".to_string(), // Level 3 splits
-            row_position: 225_000,
+            row_position: 9 * ROWS_PER_GROUP / 10,
             column: 1,
         });
 
         // Add test cases for parent verification in phrase search
         tests.push(TestString {
             content: "parent_child_grandchild".to_string(),
-            row_position: 300_000,
+            row_position: 12 * ROWS_PER_GROUP / 10,
             column: 2,
         });
 
         tests.push(TestString {
             content: "child without parent".to_string(),
-            row_position: 300_001,
+            row_position: 1 + 12 * ROWS_PER_GROUP / 10,
             column: 2,
         });
 
         // UTF-8 test cases with various complex characters
         tests.push(TestString {
             content: "用户@例子.com/路径?参数=值".to_string(), // Chinese characters with email structure
-            row_position: 350_000,
+            row_position: 14 * ROWS_PER_GROUP / 10,
             column: 3,
         });
 
         tests.push(TestString {
             content: "Hello/👋/World/🌍/Test/✨/Data".to_string(), // Emoji separated by delimiters
-            row_position: 350_001,
+            row_position: 1 + 14 * ROWS_PER_GROUP / 10,
             column: 4,
         });
 
         tests.push(TestString {
             content: "مرحبا/العالم@البريد.org".to_string(), // Arabic with delimiters
-            row_position: 350_002,
+            row_position: 2 + 14 * ROWS_PER_GROUP / 10,
             column: 5,
         });
 
         tests.push(TestString {
             content: "Привет-Мир_test@тест.ru".to_string(), // Cyrillic with mixed delimiters
-            row_position: 350_003,
+            row_position: 3 + 14 * ROWS_PER_GROUP / 10,
             column: 6,
         });
 
         tests.push(TestString {
             content: "日本語/テスト@例.jp?key=値&sort=順序".to_string(), // Japanese URL structure
-            row_position: 350_004,
+            row_position: 4 + 14 * ROWS_PER_GROUP / 10,
             column: 7,
         });
 
         tests.push(TestString {
             content: "λ∀x∈ℝ→∞≠π×∑".to_string(), // Mathematical symbols (no delimiters - will be one token)
-            row_position: 350_005,
+            row_position: 5 + 14 * ROWS_PER_GROUP / 10,
             column: 8,
         });
 
         tests.push(TestString {
             content: "café-résumé_naïve@côte.fr".to_string(), // Latin extended (accented characters)
-            row_position: 350_006,
+            row_position: 6 + 14 * ROWS_PER_GROUP / 10,
             column: 9,
         });
 
         tests.push(TestString {
             content: "🔥-hot-🔥/api/v1/🚀-rocket-🚀?emoji=✅".to_string(), // Emoji in URL structure
-            row_position: 350_007,
+            row_position: 7 + 14 * ROWS_PER_GROUP / 10,
             column: 0,
         });
 
         tests.push(TestString {
             content: "Mixed混合/मिश्रित/혼합/test".to_string(), // Mixed scripts with delimiters
-            row_position: 350_008,
+            row_position: 8 + 14 * ROWS_PER_GROUP / 10,
             column: 1,
         });
 
         tests.push(TestString {
             content: "€100.50/£75.25/¥1000/₹500".to_string(), // Currency symbols with numbers and delimiters
-            row_position: 350_009,
+            row_position: 9 + 14 * ROWS_PER_GROUP / 10,
             column: 2,
         });
 
@@ -819,24 +825,24 @@ mod comprehensive_large_file_tests {
 
         // Unix path at row 375,000 (middle of RG1), column 3
         let result = searcher.search("usr", Some("col_3"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "usr", "col_3", ROWS_PER_GROUP + 125_000, true);
-        println!("✓ Found 'usr' directory at row {}, RG 1", ROWS_PER_GROUP + 125_000);
+        assert_found_in_row(&result, "usr", "col_3", ROWS_PER_GROUP + ROWS_PER_GROUP / 2, true);
+        println!("✓ Found 'usr' directory at row {}, RG 1", ROWS_PER_GROUP + ROWS_PER_GROUP / 2);
 
         let result = searcher.search("local", Some("col_3"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "local", "col_3", ROWS_PER_GROUP + 125_000, true);
+        assert_found_in_row(&result, "local", "col_3", ROWS_PER_GROUP + ROWS_PER_GROUP / 2, true);
         println!("✓ Found 'local' directory at correct position");
 
         let result = searcher.search("bin", Some("col_3"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "bin", "col_3", ROWS_PER_GROUP + 125_000, true);
+        assert_found_in_row(&result, "bin", "col_3", ROWS_PER_GROUP + ROWS_PER_GROUP / 2, true);
         println!("✓ Found 'bin' directory at correct position");
 
         let result = searcher.search("python3", Some("col_3"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "python3", "col_3", ROWS_PER_GROUP + 125_000, true);
+        assert_found_in_row(&result, "python3", "col_3", ROWS_PER_GROUP + ROWS_PER_GROUP / 2, true);
         println!("✓ Found 'python3' executable at correct position");
 
         // Phrase search for path
         let result = searcher.search("/usr/local", Some("col_3"), false).await.expect("Search failed");
-        assert_found_in_row(&result, "/usr/local", "col_3", ROWS_PER_GROUP + 125_000, false);
+        assert_found_in_row(&result, "/usr/local", "col_3", ROWS_PER_GROUP + ROWS_PER_GROUP / 2, false);
         println!("✓ Found phrase '/usr/local' at correct position (path hierarchy)");
 
         // Verify by reading actual parquet data
@@ -993,8 +999,8 @@ mod comprehensive_large_file_tests {
         // Middle of row group 1 (row 375,000)
         let result = searcher.search("python3", Some("col_3"), true)
             .await.expect("Search failed");
-        assert_found_in_row(&result, "python3", "col_3", ROWS_PER_GROUP + 125_000, true);
-        println!("✓ Found 'python3' at middle of row group 1 (row {})", ROWS_PER_GROUP + 125_000);
+        assert_found_in_row(&result, "python3", "col_3", ROWS_PER_GROUP + ROWS_PER_GROUP / 2, true);
+        println!("✓ Found 'python3' at middle of row group 1 (row {})", ROWS_PER_GROUP + ROWS_PER_GROUP / 2);
 
         println!();
 
@@ -1023,11 +1029,11 @@ mod comprehensive_large_file_tests {
 
         // JSON structure at row 625,000 (RG2), column 6
         let result = searcher.search("user", Some("col_6"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "user", "col_6", ROWS_PER_GROUP * 2 + 125_000, true);
-        println!("✓ Found JSON 'user' key at row {}, RG 2", ROWS_PER_GROUP * 2 + 125_000);
+        assert_found_in_row(&result, "user", "col_6", ROWS_PER_GROUP * 2 + ROWS_PER_GROUP / 2, true);
+        println!("✓ Found JSON 'user' key at row {}, RG 2", ROWS_PER_GROUP * 2 + ROWS_PER_GROUP / 2);
 
         let result = searcher.search("org", Some("col_6"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "org", "col_6", ROWS_PER_GROUP * 2 + 125_000, true);
+        assert_found_in_row(&result, "org", "col_6", ROWS_PER_GROUP * 2 + ROWS_PER_GROUP / 2, true);
         println!("✓ Found 'org' domain at correct position");
 
         // Git URL at row 749,999 (last row RG2), column 7
@@ -1045,15 +1051,15 @@ mod comprehensive_large_file_tests {
 
         // Rust function signature at row 875,000 (RG3), column 9
         let result = searcher.search("base64", Some("col_9"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "base64", "col_9", ROWS_PER_GROUP * 3 + 125_000, true);
-        println!("✓ Found 'base64' module at row {}, RG 3", ROWS_PER_GROUP * 3 + 125_000);
+        assert_found_in_row(&result, "base64", "col_9", ROWS_PER_GROUP * 3 + ROWS_PER_GROUP / 2, true);
+        println!("✓ Found 'base64' module at row {}, RG 3", ROWS_PER_GROUP * 3 + ROWS_PER_GROUP / 2);
 
         let result = searcher.search("encode", Some("col_9"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "encode", "col_9", ROWS_PER_GROUP * 3 + 125_000, true);
+        assert_found_in_row(&result, "encode", "col_9", ROWS_PER_GROUP * 3 + ROWS_PER_GROUP / 2, true);
         println!("✓ Found 'encode' function at correct position");
 
         let result = searcher.search("Result", Some("col_9"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "Result", "col_9", ROWS_PER_GROUP * 3 + 125_000, true);
+        assert_found_in_row(&result, "Result", "col_9", ROWS_PER_GROUP * 3 + ROWS_PER_GROUP / 2, true);
         println!("✓ Found 'Result' type at correct position");
 
         let result = searcher.search("String", None, true).await.expect("Search failed");
@@ -1074,19 +1080,19 @@ mod comprehensive_large_file_tests {
 
         // ISO timestamp at row 1,125,000 (RG4), column 2
         let result = searcher.search("2024", Some("col_2"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "2024", "col_2", ROWS_PER_GROUP * 4 + 125_000, true);
-        println!("✓ Found '2024' year at row {}, RG 4", ROWS_PER_GROUP * 4 + 125_000);
+        assert_found_in_row(&result, "2024", "col_2", ROWS_PER_GROUP * 4 + ROWS_PER_GROUP / 2, true);
+        println!("✓ Found '2024' year at row {}, RG 4", ROWS_PER_GROUP * 4 + ROWS_PER_GROUP / 2);
 
         let result = searcher.search("01", Some("col_2"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "01", "col_2", ROWS_PER_GROUP * 4 + 125_000, true);
+        assert_found_in_row(&result, "01", "col_2", ROWS_PER_GROUP * 4 + ROWS_PER_GROUP / 2, true);
         println!("✓ Found '01' month at correct position");
 
         let result = searcher.search("10", Some("col_2"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "10", "col_2", ROWS_PER_GROUP * 4 + 125_000, true);
+        assert_found_in_row(&result, "10", "col_2", ROWS_PER_GROUP * 4 + ROWS_PER_GROUP / 2, true);
         println!("✓ Found '10' hour at correct position");
 
         let result = searcher.search("123Z", Some("col_2"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "123Z", "col_2", ROWS_PER_GROUP * 4 + 125_000, true);
+        assert_found_in_row(&result, "123Z", "col_2", ROWS_PER_GROUP * 4 + ROWS_PER_GROUP / 2, true);
         println!("✓ Found '123Z' milliseconds with timezone at correct position");
 
         // IP address with port at row 750,000 (RG3), column 8
@@ -1166,111 +1172,111 @@ mod comprehensive_large_file_tests {
 
         // Chinese characters with email structure (row 350,000, col 3)
         let result = searcher.search("用户", Some("col_3"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "用户", "col_3", 350_000, true);
+        assert_found_in_row(&result, "用户", "col_3", 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Chinese '用户' (user) at correct position");
 
         let result = searcher.search("例子", Some("col_3"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "例子", "col_3", 350_000, true);
+        assert_found_in_row(&result, "例子", "col_3", 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Chinese '例子' (example) at correct position");
 
         let result = searcher.search("路径", Some("col_3"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "路径", "col_3", 350_000, true);
+        assert_found_in_row(&result, "路径", "col_3", 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Chinese '路径' (path) at correct position");
 
         // Emoji (row 350,001, col 4)
         let result = searcher.search("👋", Some("col_4"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "👋", "col_4", 350_001, true);
+        assert_found_in_row(&result, "👋", "col_4", 1 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found emoji '👋' (waving hand) at correct position");
 
         let result = searcher.search("🌍", Some("col_4"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "🌍", "col_4", 350_001, true);
+        assert_found_in_row(&result, "🌍", "col_4", 1 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found emoji '🌍' (globe) at correct position");
 
         let result = searcher.search("🔥", Some("col_0"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "🔥", "col_0", 350_007, true);
+        assert_found_in_row(&result, "🔥", "col_0", 7 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found emoji '🔥' (fire) at correct position");
 
         let result = searcher.search("🚀", Some("col_0"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "🚀", "col_0", 350_007, true);
+        assert_found_in_row(&result, "🚀", "col_0", 7 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found emoji '🚀' (rocket) at correct position");
 
         // Arabic (row 350,002, col 5)
         let result = searcher.search("مرحبا", Some("col_5"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "مرحبا", "col_5", 350_002, true);
+        assert_found_in_row(&result, "مرحبا", "col_5", 2 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Arabic 'مرحبا' (hello) at correct position");
 
         let result = searcher.search("العالم", Some("col_5"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "العالم", "col_5", 350_002, true);
+        assert_found_in_row(&result, "العالم", "col_5", 2 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Arabic 'العالم' (world) at correct position");
 
         // Cyrillic (row 350,003, col 6)
         let result = searcher.search("Привет", Some("col_6"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "Привет", "col_6", 350_003, true);
+        assert_found_in_row(&result, "Привет", "col_6", 3 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Cyrillic 'Привет' (hello) at correct position");
 
         let result = searcher.search("Мир", Some("col_6"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "Мир", "col_6", 350_003, true);
+        assert_found_in_row(&result, "Мир", "col_6", 3 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Cyrillic 'Мир' (world) at correct position");
 
         let result = searcher.search("тест", Some("col_6"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "тест", "col_6", 350_003, true);
+        assert_found_in_row(&result, "тест", "col_6", 3 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Cyrillic 'тест' (test) at correct position");
 
         // Japanese (row 350,004, col 7)
         let result = searcher.search("日本語", Some("col_7"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "日本語", "col_7", 350_004, true);
+        assert_found_in_row(&result, "日本語", "col_7", 4 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Japanese '日本語' (Japanese language) at correct position");
 
         let result = searcher.search("テスト", Some("col_7"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "テスト", "col_7", 350_004, true);
+        assert_found_in_row(&result, "テスト", "col_7", 4 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Japanese 'テスト' (test) at correct position");
 
         // Mathematical symbols (row 350,005, col 8) - no delimiters so whole string is one token
         let result = searcher.search("λ∀x∈ℝ→∞≠π×∑", Some("col_8"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "λ∀x∈ℝ→∞≠π×∑", "col_8", 350_005, true);
+        assert_found_in_row(&result, "λ∀x∈ℝ→∞≠π×∑", "col_8", 5 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found mathematical symbols as single token at correct position");
 
         // Latin extended (row 350,006, col 9)
         let result = searcher.search("café", Some("col_9"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "café", "col_9", 350_006, true);
+        assert_found_in_row(&result, "café", "col_9", 6 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found 'café' with accent at correct position");
 
         let result = searcher.search("résumé", Some("col_9"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "résumé", "col_9", 350_006, true);
+        assert_found_in_row(&result, "résumé", "col_9", 6 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found 'résumé' with accents at correct position");
 
         let result = searcher.search("naïve", Some("col_9"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "naïve", "col_9", 350_006, true);
+        assert_found_in_row(&result, "naïve", "col_9", 6 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found 'naïve' with diaeresis at correct position");
 
         // Currency symbols (row 350,009, col 2)
         let result = searcher.search("€100", Some("col_2"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "€100", "col_2", 350_009, true);
+        assert_found_in_row(&result, "€100", "col_2", 9 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found currency symbol '€100' (Euro) at correct position");
 
         let result = searcher.search("£75", Some("col_2"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "£75", "col_2", 350_009, true);
+        assert_found_in_row(&result, "£75", "col_2", 9 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found currency symbol '£75' (Pound) at correct position");
 
         let result = searcher.search("¥1000", Some("col_2"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "¥1000", "col_2", 350_009, true);
+        assert_found_in_row(&result, "¥1000", "col_2", 9 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found currency symbol '¥1000' (Yen) at correct position");
 
         let result = searcher.search("₹500", Some("col_2"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "₹500", "col_2", 350_009, true);
+        assert_found_in_row(&result, "₹500", "col_2", 9 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found currency symbol '₹500' (Rupee) at correct position");
 
         // Mixed scripts (row 350,008, col 1)
         let result = searcher.search("Mixed混合", Some("col_1"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "Mixed混合", "col_1", 350_008, true);
+        assert_found_in_row(&result, "Mixed混合", "col_1", 8 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Chinese 'Mixed混合' from mixed-script string at correct position");
 
         let result = searcher.search("मिश्रित", Some("col_1"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "मिश्रित", "col_1", 350_008, true);
+        assert_found_in_row(&result, "मिश्रित", "col_1", 8 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Hindi 'मिश्रित' from mixed-script string at correct position");
 
         let result = searcher.search("혼합", Some("col_1"), true).await.expect("Search failed");
-        assert_found_in_row(&result, "혼합", "col_1", 350_008, true);
+        assert_found_in_row(&result, "혼합", "col_1", 8 + 14 * ROWS_PER_GROUP / 10, true);
         println!("✓ Found Korean '혼합' from mixed-script string at correct position");
 
         println!();

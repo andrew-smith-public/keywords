@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[cfg(feature = "compression_comparison")]
 mod tests {
     use std::sync::Arc;
     use std::time::Instant;
@@ -10,12 +11,14 @@ mod tests {
     use rand::Rng;
     use rand::distr::Alphanumeric;
     use std::fs::File;
+    #[cfg(feature = "perf_generate_figures")]
+    use serial_test::serial;
     use crate::build_and_save_index;
     use crate::index_data::CompressionAlgorithm;
-    use serial_test::serial;
+    #[cfg(feature = "compression_comparison")]
 
-    #[cfg_attr(feature = "perf_detail", tokio::test)]
-    #[cfg_attr(feature = "perf_detail", serial)]
+    #[cfg_attr(feature = "compression_comparison", tokio::test)]
+    #[cfg_attr(feature = "perf_generate_figures", serial)]
     async fn test_compression_level_analysis() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Compression Level Analysis ===\n");
         println!("This test measures index build time and data.bin size for each Zstd compression level.");
@@ -287,15 +290,6 @@ mod tests {
                      savings as f64 / (1024.0 * 1024.0),
                      savings_pct);
         }
-
-        println!("\n=== Recommendations ===\n");
-        println!("Current default: Zstd:15");
-        println!();
-        println!("Consider these trade-offs:");
-        println!("  • Fast indexing, good compression: Zstd:3-6");
-        println!("  • Balanced: Zstd:10-15");
-        println!("  • Maximum compression: Zstd:20-22 (slow but smallest)");
-        println!("  • No compression: Only if build speed is critical");
 
         // Clean up: delete the test file and all index variants
         std::fs::remove_file(&file_path)?;

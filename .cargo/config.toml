@@ -1,5 +1,8 @@
 [build]
 rustflags = [
     "-C", "target-cpu=native",
-    "-C", "link-arg=-fuse-ld=mold",  # Faster linking (build time, not runtime)
+    "-C", "link-arg=-fuse-ld=mold"  # Faster linking (build time, not runtime)
 ]
+
+[env]
+RUST_TEST_THREADS = "16"

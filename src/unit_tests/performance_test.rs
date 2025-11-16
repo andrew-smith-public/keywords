@@ -5,21 +5,23 @@ mod tests {
     use arrow::array::{ArrayRef, StringArray, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::{WriterProperties, WriterVersion};
+    use parquet::file::properties::WriterProperties;
+    #[cfg(not(debug_assertions))] use parquet::file::properties::WriterVersion;
     use parquet::basic::Compression;
     use rand::Rng;
     use rand::distr::Alphanumeric;
     use std::fs::File;
     use rkyv::rancor::Error as RkyvError;
-    use crate::build_and_save_index;
+    #[cfg(feature = "perf_generate_figures")]
     use serial_test::serial;
+    use crate::build_and_save_index;
 
     #[tokio::test]
     #[cfg_attr(feature = "ci", ignore)]
-    #[serial]
+    #[cfg_attr(feature = "perf_generate_figures", serial)]
     async fn test_performance_with_debug() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
-        let index_file_prefix = Some("test_performance_comparison_");
+        let index_file_prefix = Some("test_performance_comparison_d1_");
 
         // Step 1: Generate random string pool (5000 strings, 10-20 chars)
         println!("Generating random string pool...");
@@ -784,10 +786,11 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(feature = "ci", ignore)]
-    #[serial]
+    #[cfg_attr(feature = "perf_generate_figures", serial)]
+    #[cfg(not(debug_assertions))]
     async fn test_performance_with_debug_1_row_group() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
-        let index_file_prefix = Some("test_performance_comparison_");
+        let index_file_prefix = Some("test_performance_comparison_rg_");
 
         // Step 1: Generate random string pool (5000 strings, 10-20 chars)
         println!("Generating random string pool...");
@@ -1545,10 +1548,11 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(feature = "ci", ignore)]
-    #[serial]
+    #[cfg_attr(feature = "perf_generate_figures", serial)]
+    #[cfg(not(debug_assertions))]
     async fn test_performance_with_debug_v2_parquet() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n=== Performance Test: Keyword Index vs Pushdown Predicate ===\n");
-        let index_file_prefix = Some("test_performance_comparison_");
+        let index_file_prefix = Some("test_performance_comparison_v2_");
 
         // Step 1: Generate random string pool (5000 strings, 10-20 chars)
         println!("Generating random string pool...");
