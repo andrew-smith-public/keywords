@@ -3415,7 +3415,7 @@ DEALINGS IN THE SOFTWARE.
 
 The following components are licensed under MIT:
 
-- bytes 1.10.1
+- bytes 1.11.0
 
 ### License Text
 ```text
