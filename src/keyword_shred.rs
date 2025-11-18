@@ -177,7 +177,8 @@ pub struct KeywordOneFile {
     pub(crate) splits_matched: u16,
     pub(crate) column_references: SmallVec<[u32; 2]>,  // Stack-allocated for ≤2 columns
     pub(crate) row_groups: Vec<SmallVec<[u16; 4]>>,   // Adaptive storage based on file's row group count
-    pub(crate) row_group_to_rows: Vec<Vec<Vec<Row>>>
+    pub(crate) row_group_to_rows: Vec<Vec<Vec<Row>>>,
+    pub(crate) parent_tracking_enabled: Vec<bool>,    // Parallel to column_references - tracks if parent is stored
 }
 
 impl std::fmt::Display for KeywordOneFile {
@@ -282,7 +283,8 @@ impl KeywordOneFile {
     /// Adds keyword details to the structure, creating the column reference if needed.
     ///
     /// This method updates the splits_matched bitmask and ensures the column reference
-    /// exists in the structure before delegating to add_group.
+    /// exists in the structure before delegating to add_group. If parent tracking has been
+    /// disabled for this column (due to threshold exceeded), the parent_keyword is ignored.
     ///
     /// # Arguments
     ///
@@ -290,7 +292,7 @@ impl KeywordOneFile {
     /// * `row_group` - The row group number
     /// * `row_number` - The actual row number in the file
     /// * `split_match_bit` - Bitmask indicating which split levels matched
-    /// * `parent_keyword` - Reference to the parent keyword in the split hierarchy
+    /// * `parent_keyword` - Reference to the parent keyword in the split hierarchy (ignored if parent tracking disabled)
     fn add_keyword_details(
         &mut self,
         column_reference: u32,
@@ -302,16 +304,123 @@ impl KeywordOneFile {
         self.splits_matched |= split_match_bit;
         match self.column_references.iter().position(|&c| c == column_reference) {
             Some(idx) => {
-                self.add_group(idx, row_group, row_number, split_match_bit, parent_keyword);
+                // Check if parent tracking is enabled for this column
+                let parent_to_use = if self.parent_tracking_enabled[idx] {
+                    parent_keyword
+                } else {
+                    &None  // Don't track parent - allows Row object merging
+                };
+                self.add_group(idx, row_group, row_number, split_match_bit, parent_to_use);
             }
             None => {
                 self.column_references.push(column_reference);
                 self.row_groups.push(SmallVec::new());
                 self.row_group_to_rows.push(Vec::new());
+                self.parent_tracking_enabled.push(true);  // Start with parent tracking enabled
                 let new_idx = self.column_references.len() - 1;
                 self.add_group(new_idx, row_group, row_number, split_match_bit, parent_keyword);
             }
         }
+    }
+
+    /// Reconsolidates Row objects for a specific column after disabling parent tracking.
+    ///
+    /// This method is called when a keyword exceeds the parent tracking threshold for a column.
+    /// It clears all parent_keyword references and merges consecutive Row objects that can now
+    /// be combined using the additional_rows field.
+    ///
+    /// # Arguments
+    ///
+    /// * `column_idx` - Internal column index in the row_group_to_rows structure
+    ///
+    /// # Process
+    ///
+    /// 1. Clear all parent_keyword references (set to None)
+    /// 2. Merge rows with same row number (duplicates from different parents)
+    /// 3. Merge consecutive/overlapping rows with same splits_matched level
+    ///
+    /// # Memory Impact
+    ///
+    /// This optimization can significantly reduce memory usage for common keywords.
+    /// For example, a keyword appearing in every row with different parents might
+    /// go from 100,000 Row objects to just a few hundred after reconsolidation.
+    pub(crate) fn reconsolidate_column_rows(&mut self, column_idx: usize) {
+        // Count Row objects before reconsolidation
+        let count_before: usize = self.row_group_to_rows[column_idx]
+            .iter()
+            .map(|row_group| row_group.len())
+            .sum();
+
+        for row_group_rows in &mut self.row_group_to_rows[column_idx] {
+            // Step 1: Clear all parent references
+            for row in row_group_rows.iter_mut() {
+                row.parent_keyword = None;
+            }
+
+            // Step 2: Merge duplicate, consecutive, and overlapping rows
+            let mut i = 0;
+            while i < row_group_rows.len().saturating_sub(1) {
+                let current_end = row_group_rows[i].row + row_group_rows[i].additional_rows as u32;
+                let next_start = row_group_rows[i + 1].row;
+                let next_end = next_start + row_group_rows[i + 1].additional_rows as u32;
+
+                if current_end + 1 >= next_start
+                    && row_group_rows[i].splits_matched == row_group_rows[i + 1].splits_matched
+                {
+                    // Merge: take the maximum extent of both rows
+                    let merged_end = current_end.max(next_end);
+                    let new_additional = (merged_end - row_group_rows[i].row) as u16;
+
+                    if new_additional <= ADDITIONAL_ROWS_CAP {
+                        // Normal merge: expand current row's range and remove next
+                        row_group_rows[i].additional_rows = new_additional;
+                        row_group_rows.remove(i + 1);
+                        // Don't increment i - check if we can merge with next row too
+                        continue;
+                    } else {
+                        // Hit cap: fill current row to capacity and adjust next row
+                        row_group_rows[i].additional_rows = ADDITIONAL_ROWS_CAP;
+                        let new_next_start = row_group_rows[i].row + ADDITIONAL_ROWS_CAP as u32 + 1;
+
+                        // Adjust next row to start where we left off
+                        // Keep its original end position
+                        let next_original_end = next_end;
+                        row_group_rows[i + 1].row = new_next_start;
+
+                        if new_next_start <= next_original_end {
+                            row_group_rows[i + 1].additional_rows = (next_original_end - new_next_start) as u16;
+                        } else {
+                            // Next row was completely consumed, remove it
+                            row_group_rows.remove(i + 1);
+                            continue;
+                        }
+
+                        // Move to next row
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // Count Row objects after reconsolidation
+        let count_after: usize = self.row_group_to_rows[column_idx]
+            .iter()
+            .map(|row_group| row_group.len())
+            .sum();
+
+        let reduction = count_before.saturating_sub(count_after);
+        let reduction_pct = if count_before > 0 {
+            (reduction as f64 / count_before as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        println!(
+            "Reconsolidate column_idx {}: {} → {} Row objects ({} reduced, {:.1}% reduction)",
+            column_idx, count_before, count_after, reduction, reduction_pct
+        );
     }
 }
 
@@ -360,7 +469,8 @@ fn create_new_keyword_one_file(
                 splits_matched: split_match_bit,
                 parent_keyword: parent_keyword.clone(),
             }]]
-        ]
+        ],
+        parent_tracking_enabled: vec![true, true],  // Start with parent tracking enabled for both columns
     }
 }
 
@@ -498,7 +608,8 @@ fn merge_or_add_keyword_no_return(
 /// * `split_level` - Current split-level (0-3)
 /// * `incomplete_split_match_bit_in` - Accumulated bitmask of splits matched so far
 /// * `parent_keyword` - Reference to the parent keyword in the split hierarchy
-// Optimized version: Use lookup table and optimized character iteration
+/// * `split_lookup` - The splitting characters
+/// * `store_full_keyword` - Should we store the entire keyword
 #[inline]
 fn perform_split_inner(
     keyword_string: &str,
@@ -510,6 +621,7 @@ fn perform_split_inner(
     incomplete_split_match_bit_in: u16,
     parent_keyword: &Option<Rc<str>>,
     split_lookup: &SplitLookup,
+    store_full_keyword: bool,
 ) {
     let mut new_parent_keyword: Option<Rc<str>> = None;
     let mut output_parent_decision_complete = false;
@@ -541,12 +653,13 @@ fn perform_split_inner(
                     combined_match_bit,
                     parent_keyword,
                     split_lookup,
+                    false
                 );
             }
             break;
         }
         else {
-            if !output_parent_decision_complete && (incomplete_split_match_bit_in != 1) {
+            if store_full_keyword || (!output_parent_decision_complete && (incomplete_split_match_bit_in != 1)) {
                 let keyword_rc_str = merge_or_add_keyword_return_rc(
                     keyword_string,
                     column_reference,
@@ -587,6 +700,7 @@ fn perform_split_inner(
                     current_split_level,
                     parent_to_use,
                     split_lookup,
+                    false
                 );
             }
         }
@@ -594,7 +708,7 @@ fn perform_split_inner(
 
     // If the final characters were only splitting characters the loop will hit nothing so we need
     // to just output here
-    if !output_parent_decision_complete && incomplete_split_match_bit_in != 1 {
+    if store_full_keyword || (!output_parent_decision_complete && incomplete_split_match_bit_in != 1) {
         merge_or_add_keyword_no_return(
             keyword_string,
             column_reference,
@@ -660,22 +774,6 @@ pub fn perform_split(
         return;
     }
 
-    // Store the full keyword before splitting if requested and use it as parent
-    let parent_for_splits = if store_full_keyword {
-        let keyword_rc = merge_or_add_keyword_return_rc(
-            keyword_string,
-            column_reference,
-            row_group,
-            row_number,
-            1, // Bit 0 set - this is the unsplit value
-            keyword_map,
-            &None, // No parent - this is the root
-        );
-        Some(keyword_rc)
-    } else {
-        None
-    };
-
     perform_split_inner(
         keyword_string,
         column_reference,
@@ -684,8 +782,9 @@ pub fn perform_split(
         keyword_map,
         0,
         1,
-        &parent_for_splits,  // Pass full keyword as parent if stored, otherwise None
+        &None,
         split_lookup,
+        store_full_keyword
     );
 }
 

@@ -98,7 +98,7 @@ mod tests {
         TEST_SEARCHER.get_or_init(|| async {
             println!("Building test index in memory...");
             let parquet_bytes: Bytes = create_test_parquet().expect("Failed to create test parquet");
-            build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None)
+            build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None)
                 .await
                 .expect("Build Index Failed")
         }).await

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::keyword_shred::{perform_split, SplitLookup};
+    use crate::keyword_shred::{default_split_lookup, perform_split, SplitLookup};
     use hashbrown::HashMap;
 
     // ========== Custom Split Characters Tests ==========
@@ -207,12 +207,36 @@ mod tests {
         perform_split("@@@", 1, 0, 0, &mut keyword_map, &lookup, true);
 
         // Should store full keyword
-        assert!(keyword_map.contains_key("@@@"),
-                "Should store full keyword even if all delimiters");
+        assert!(keyword_map.contains_key("@@@"), "Should store full keyword even if all delimiters");
 
         // Should not have any child splits (nothing left after splitting)
-        assert_eq!(keyword_map.len(), 1,
-                   "Should only have full keyword, no valid splits");
+        assert_eq!(keyword_map.len(), 1, "Should only have full keyword, no valid splits");
+    }
+
+    #[test]
+    fn test_full_keyword_only_level2_delimiters() {
+        let mut keyword_map = HashMap::new();
+
+        perform_split("@@@", 1, 0, 0, &mut keyword_map, &default_split_lookup(), true);
+
+        // Should store full keyword
+        assert!(keyword_map.contains_key("@@@"), "Should store full keyword even if all delimiters");
+
+        // Should not have any child splits (nothing left after splitting)
+        assert_eq!(keyword_map.len(), 1, "Should only have full keyword, no valid splits");
+    }
+
+    #[test]
+    fn test_non_full_keyword_only_level1_delimiters() {
+        let mut keyword_map = HashMap::new();
+
+        let split_chars = vec![vec!['@']];
+        let lookup = SplitLookup::new(&split_chars);
+
+        perform_split("@@@", 1, 0, 0, &mut keyword_map, &lookup, false);
+
+        // Should not have any child splits (nothing left after splitting)
+        assert_eq!(keyword_map.len(), 0, "Should not have anything in the keyword map");
     }
 
     // ========== Combined Feature Test ==========

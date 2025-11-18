@@ -423,6 +423,7 @@ mod performance_tests {
             None,
             None,
             None,
+            None,
             None
         ).await?;
         Ok(start.elapsed())

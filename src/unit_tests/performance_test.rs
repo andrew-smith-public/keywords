@@ -127,6 +127,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             None
         ).await?;
 
@@ -890,7 +891,7 @@ mod tests {
         println!("Building keyword index...");
         let index_start = Instant::now();
 
-        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None).await?;
+        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None, None, None, None, None).await?;
 
         let index_time = index_start.elapsed();
         println!("Index built in: {:?}\n", index_time);
@@ -1653,7 +1654,7 @@ mod tests {
         println!("Building keyword index...");
         let index_start = Instant::now();
 
-        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None).await?;
+        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None, None, None, None, None).await?;
 
         let index_time = index_start.elapsed();
         println!("Index built in: {:?}\n", index_time);

@@ -343,7 +343,7 @@ fn convert_to_flat(
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
 ///     let split_chars: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE.iter().map(|&chars| chars.to_vec()).collect();
-///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None).await.unwrap();
+///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None, Some(0.2)).await.unwrap();
 ///
 ///     // Build with default compression
 ///     let index_files = build_distributed_index(
@@ -670,7 +670,7 @@ pub struct DistributedIndexFiles {
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
 ///     let split_chars: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE.iter().map(|&chars| chars.to_vec()).collect();
-///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None).await.unwrap();
+///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None, Some(0.2)).await.unwrap();
 ///
 ///     let index_files = build_distributed_index(
 ///         &result,
