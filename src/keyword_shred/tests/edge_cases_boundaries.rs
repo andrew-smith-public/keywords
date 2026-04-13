@@ -76,7 +76,7 @@ fn test_very_long_keyword() {
     assert!(keyword_map.contains_key(long_keyword.as_str()));
 
     let kw = keyword_map.get(long_keyword.as_str()).unwrap();
-    assert_eq!(kw.splits_matched, 31); // All levels match (no splits)
+    assert_eq!(kw.splits_matched, NonZeroU16::new(31)); // All levels match (no splits)
 }
 
 #[test]

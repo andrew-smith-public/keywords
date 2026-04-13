@@ -308,7 +308,8 @@ async fn handle_index(file_path: &str, keywords_compression: keywords::index_dat
         None,  // split_chars (use default)
         None,  // store_full_keyword_default (use default: false)
         None,  // full_keyword_column_exceptions
-        None   // parent tracking threshold
+        None,  // parent tracking threshold
+        None,  // split elimination threshold
     ).await {
         Ok(()) => {
             println!("\n✓ Indexing completed successfully!");

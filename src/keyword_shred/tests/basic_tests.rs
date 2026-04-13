@@ -5,12 +5,12 @@ fn test_row_creation() {
     let row = Row {
         row: 42,
         additional_rows: 2,
-        splits_matched: 0b0001,
+        splits_matched: NonZeroU16::new(1),
         parent_keyword: None,
     };
     assert_eq!(row.row, 42);
     assert_eq!(row.additional_rows, 2);
-    assert_eq!(row.splits_matched, 1);
+    assert_eq!(row.splits_matched, NonZeroU16::new(1));
 }
 
 #[test]
@@ -18,13 +18,13 @@ fn test_row_equality() {
     let row1 = Row {
         row: 1,
         additional_rows: 0,
-        splits_matched: 0b0001,
+        splits_matched: NonZeroU16::new(1),
         parent_keyword: None,
     };
     let row2 = Row {
         row: 1,
         additional_rows: 0,
-        splits_matched: 0b0001,
+        splits_matched: NonZeroU16::new(1),
         parent_keyword: None,
     };
     assert_eq!(row1, row2);
@@ -40,7 +40,7 @@ fn test_simple_keyword_no_splits() {
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("simple"));
     let kw = keyword_map.get("simple").unwrap();
-    assert_eq!(kw.splits_matched, 31);
+    assert_eq!(kw.splits_matched, NonZeroU16::new(31));
     assert_eq!(kw.column_references.len(), 2);
     assert!(kw.column_references.len() >= 2);
     assert_eq!(kw.row_groups.len(), 2);
@@ -52,7 +52,7 @@ fn test_simple_keyword_no_splits() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
 }
@@ -69,7 +69,7 @@ fn test_keyword_with_space_split() {
     assert!(keyword_map.contains_key("hello"));
     assert!(keyword_map.contains_key("world"));
     let kw = keyword_map.get("hello").unwrap();
-    assert_eq!(kw.splits_matched, 30);
+    assert_eq!(kw.splits_matched, NonZeroU16::new(30));
     assert_eq!(kw.column_references.len(), 2);
     assert!(kw.column_references.len() >= 2);
     assert_eq!(kw.row_groups.len(), 2);
@@ -81,11 +81,11 @@ fn test_keyword_with_space_split() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 30,
+        splits_matched: NonZeroU16::new(30),
         parent_keyword: None,
     });
     let kw2 = keyword_map.get("world").unwrap();
-    assert_eq!(kw2.splits_matched, 30);
+    assert_eq!(kw2.splits_matched, NonZeroU16::new(30));
     assert_eq!(kw2.column_references.len(), 2);
     assert!(kw2.column_references.len() >= 2);
     assert_eq!(kw2.row_groups.len(), 2);
@@ -97,7 +97,7 @@ fn test_keyword_with_space_split() {
     assert_eq!(kw2.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 30,
+        splits_matched: NonZeroU16::new(30),
         parent_keyword: None,
     });
 }
@@ -113,7 +113,7 @@ fn test_keyword_with_space_start() {
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("hello"));
     let kw = keyword_map.get("hello").unwrap();
-    assert_eq!(kw.splits_matched, 30);
+    assert_eq!(kw.splits_matched, NonZeroU16::new(30));
     assert_eq!(kw.column_references.len(), 2);
     assert!(kw.column_references.len() >= 2);
     assert_eq!(kw.row_groups.len(), 2);
@@ -125,7 +125,7 @@ fn test_keyword_with_space_start() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 30,
+        splits_matched: NonZeroU16::new(30),
         parent_keyword: None,
     });
 }
@@ -141,7 +141,7 @@ fn test_keyword_with_space_end() {
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("hello"));
     let kw = keyword_map.get("hello").unwrap();
-    assert_eq!(kw.splits_matched, 30);
+    assert_eq!(kw.splits_matched, NonZeroU16::new(30));
     assert_eq!(kw.column_references.len(), 2);
     assert!(kw.column_references.len() >= 2);
     assert_eq!(kw.row_groups.len(), 2);
@@ -153,7 +153,7 @@ fn test_keyword_with_space_end() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 30,
+        splits_matched: NonZeroU16::new(30),
         parent_keyword: None,
     });
 }
@@ -169,7 +169,7 @@ fn test_keyword_with_space_middle() {
     assert_eq!(keyword_map.len(), 1);
     assert!(keyword_map.contains_key("hello"));
     let kw = keyword_map.get("hello").unwrap();
-    assert_eq!(kw.splits_matched, 30);
+    assert_eq!(kw.splits_matched, NonZeroU16::new(30));
     assert_eq!(kw.column_references.len(), 2);
     assert!(kw.column_references.len() >= 2);
     assert_eq!(kw.row_groups.len(), 2);
@@ -181,7 +181,7 @@ fn test_keyword_with_space_middle() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 30,
+        splits_matched: NonZeroU16::new(30),
         parent_keyword: None,
     });
 }
@@ -208,7 +208,7 @@ fn test_row_add_consecutive_rows() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 1,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
 }
@@ -236,13 +236,13 @@ fn test_row_add_non_consecutive_rows() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
     assert_eq!(kw.row_group_to_rows[0][0][1], Row {
         row: 2,
         additional_rows: 0,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
 }
@@ -270,7 +270,7 @@ fn test_row_add_multiple_consecutive_rows() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 2,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
 }
@@ -299,13 +299,13 @@ fn test_row_add_interspersed_keywords() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
     assert_eq!(kw.row_group_to_rows[0][0][1], Row {
         row: 2,
         additional_rows: 0,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
 }
@@ -334,7 +334,7 @@ fn test_row_add_consecutive_interspersed_keywords() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 1,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
 }
@@ -363,7 +363,7 @@ fn test_single_char_keywords_extracted() {
     assert_eq!(kw_a.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 30,
+        splits_matched: NonZeroU16::new(30),
         parent_keyword: None,
     });
 }
@@ -387,7 +387,7 @@ fn test_single_digit_extracted() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
 }
@@ -404,7 +404,7 @@ fn test_split_all_levels_comprehensive() {
 
     println!("\n=== All Keywords Found ===");
     for (keyword, data) in keyword_map.iter() {
-        println!("Keyword: '{}', splits_matched: {:04b}", keyword, data.splits_matched);
+        println!("Keyword: '{}', splits_matched: {:04b}", keyword, data.splits_matched.unwrap());
     }
 
     assert!(keyword_map.contains_key("hello"), "Should find 'hello'");
@@ -568,7 +568,7 @@ fn test_hierarchical_splitting() {
 
     println!("\nHierarchical split results:");
     for (keyword, data) in keyword_map.iter() {
-        println!("  '{}' - splits_matched: {:05b}", keyword, data.splits_matched);
+        println!("  '{}' - splits_matched: {:05b}", keyword, data.splits_matched.unwrap());
     }
 
     assert!(keyword_map.contains_key("hello"));
@@ -582,10 +582,10 @@ fn test_hierarchical_splitting() {
     assert!(keyword_map.contains_key("hello-world/test.file"), "Should find full string");
 
     let hello_world = keyword_map.get("hello-world").unwrap();
-    println!("'hello-world' splits_matched: {:05b}", hello_world.splits_matched);
+    println!("'hello-world' splits_matched: {:05b}", hello_world.splits_matched.unwrap());
 
     let test_file = keyword_map.get("test.file").unwrap();
-    println!("'test.file' splits_matched: {:05b}", test_file.splits_matched);
+    println!("'test.file' splits_matched: {:05b}", test_file.splits_matched.unwrap());
 }
 
 #[test]
@@ -758,7 +758,7 @@ fn test_consecutive_rows_different_split_bits() {
 
     println!("\nRows for 'test' with different split bits:");
     for (i, row) in kw.row_group_to_rows[0][0].iter().enumerate() {
-        println!("  Row {}: row={}, splits_matched={:05b}", i, row.row, row.splits_matched);
+        println!("  Row {}: row={}, splits_matched={:05b}", i, row.row, row.splits_matched.unwrap());
     }
 
     // Should have 2 separate Row entries because splits_matched differs

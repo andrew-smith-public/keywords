@@ -453,7 +453,8 @@ impl KeywordSearcher {
                                     crate::index_data::FlatRow {
                                         row: row.row.to_native(),
                                         additional_rows: row.additional_rows.to_native(),
-                                        splits_matched: row.splits_matched.to_native(),
+                                        splits_matched: row.splits_matched.as_ref()
+                                            .map(|s| s.to_native()),
                                         parent_chunk: row.parent_chunk.as_ref().map(|c| c.to_native()),
                                         parent_position: row.parent_position.as_ref().map(|p| p.to_native()),
                                     }
@@ -462,7 +463,8 @@ impl KeywordSearcher {
                         }).collect(),
                     }
                 }).collect(),
-                splits_matched: item.splits_matched.to_native(),
+                splits_matched: item.splits_matched.as_ref()
+                    .map(|s| s.to_native()),
             }
         }).collect();
 
@@ -823,7 +825,8 @@ impl KeywordSearcher {
                 for flat_row in rg.rows.iter() {
                     let row: u32 = flat_row.row.to_native();
                     let additional_rows: u32 = flat_row.additional_rows.to_native();
-                    let splits_matched: u16 = flat_row.splits_matched.to_native();
+                    let splits_matched: Option<std::num::NonZeroU16> = flat_row.splits_matched.as_ref()
+                        .map(|s| s.to_native());
                     let parent_chunk: Option<u16> = flat_row.parent_chunk.as_ref().map(|c| c.to_native());
                     let parent_position: Option<u16> = flat_row.parent_position.as_ref().map(|p| p.to_native());
 
@@ -884,7 +887,8 @@ impl KeywordSearcher {
             verified_matches: Some(KeywordLocationData {
                 columns,
                 total_occurrences,
-                splits_matched: archived_item.splits_matched.to_native(),
+                splits_matched: archived_item.splits_matched.as_ref()
+                    .map(|s| s.to_native()),
                 column_details,
             }),
             needs_verification: None,
@@ -1070,7 +1074,7 @@ impl KeywordSearcher {
                 for flat_row in &rg.rows {
                     let row: u32 = flat_row.row;
                     let additional_rows: u32 = flat_row.additional_rows;
-                    let splits_matched: u16 = flat_row.splits_matched;
+                    let splits_matched: Option<std::num::NonZeroU16> = flat_row.splits_matched;
                     let parent_chunk: Option<u16> = flat_row.parent_chunk;
                     let parent_position: Option<u16> = flat_row.parent_position;
 
@@ -2056,11 +2060,11 @@ impl KeywordSearcher {
         let mut column_map: HashMap<String, HashMap<u16, Vec<u32>>> = HashMap::new();
         let mut all_columns = std::collections::HashSet::new();
         let mut total_rows = 0u64;
-        let mut splits_matched = 0u16;
+        let mut splits_matched_bits = 0u16;
 
         for m in matches {
             all_columns.insert(m.column_name.clone());
-            splits_matched |= 1 << m.split_level;
+            splits_matched_bits |= 1 << m.split_level;
 
             let rg_map = column_map.entry(m.column_name.clone())
                 .or_insert_with(HashMap::new);
@@ -2070,6 +2074,9 @@ impl KeywordSearcher {
 
             total_rows += 1;
         }
+
+        // Convert splits_matched_bits to Option<NonZeroU16>
+        let splits_matched = std::num::NonZeroU16::new(splits_matched_bits);
 
         // Build column_details
         let mut column_details = Vec::new();
@@ -2231,7 +2238,7 @@ impl KeywordSearcher {
                 let row_group_id = rg.row_group_id;
 
                 // Build map of row -> (split-level, parent chunk, parent position) for base token
-                let base_row_info: HashMap<u32, Vec<(u16, Option<u16>, Option<u16>)>> = rg.row_ranges.iter()
+                let base_row_info: HashMap<u32, Vec<(Option<std::num::NonZeroU16>, Option<u16>, Option<u16>)>> = rg.row_ranges.iter()
                     .fold(HashMap::new(), |mut acc, range| {
                         for row in range.start_row..=range.end_row {
                             acc.entry(row)
@@ -2242,7 +2249,7 @@ impl KeywordSearcher {
                     });
 
                 // For each other token, build similar maps
-                let mut all_token_row_info: Vec<HashMap<u32, Vec<(u16, Option<u16>, Option<u16>)>>> = Vec::new();
+                let mut all_token_row_info: Vec<HashMap<u32, Vec<(Option<std::num::NonZeroU16>, Option<u16>, Option<u16>)>>> = Vec::new();
                 let mut all_tokens_have_rows = true;
 
                 for other_col in &other_token_column_data {
@@ -2252,7 +2259,7 @@ impl KeywordSearcher {
 
                     match other_rg {
                         Some(rg_data) => {
-                            let row_info: HashMap<u32, Vec<(u16, Option<u16>, Option<u16>)>> = rg_data.row_ranges.iter()
+                            let row_info: HashMap<u32, Vec<(Option<std::num::NonZeroU16>, Option<u16>, Option<u16>)>> = rg_data.row_ranges.iter()
                                 .fold(HashMap::new(), |mut acc, range| {
                                     for row in range.start_row..=range.end_row {
                                         acc.entry(row)
@@ -2323,24 +2330,31 @@ impl KeywordSearcher {
                                 .chain(other_info_combinations.iter().map(|(_, chunk, pos)| (*chunk, *pos)))
                                 .collect();
 
-                            // Convert splits_matched bitmasks to actual split levels, then take minimum
-                            let min_split_level = std::iter::once(base_info.0)
+                            // Check if any token has eliminated split info (splits_matched = None)
+                            let any_split_info_missing = std::iter::once(base_info.0)
                                 .chain(other_info_combinations.iter().map(|(split, _, _)| *split))
-                                .filter_map(|splits_matched| self.get_parent_split_level(splits_matched))
-                                .min()
-                                .unwrap_or(0) as u16;
+                                .any(|s| s.is_none());
 
-                            let status = self.verify_match_with_parent(
-                                phrase,
-                                &all_parent_refs,
-                                &parent_keywords,
-                            ).await;
+                            let status = if any_split_info_missing {
+                                // If split info is missing for any token, we can't reliably verify
+                                // Must read Parquet to confirm match
+                                MatchStatus::NeedsVerification {
+                                    reason: "Split-level information unavailable for one or more tokens".to_string()
+                                }
+                            } else {
+                                // All tokens have split info - verify using parent keywords
+                                self.verify_match_with_parent(
+                                    phrase,
+                                    &all_parent_refs,
+                                    &parent_keywords,
+                                ).await
+                            };
 
                             let match_info = PotentialMatch {
                                 column_name: column_name.clone(),
                                 row_group_id,
                                 row,
-                                split_level: min_split_level,
+                                split_level: 0,  // Not meaningful when split info missing
                                 status: status.clone(),
                             };
 
@@ -2471,7 +2485,7 @@ impl KeywordSearcher {
                         } else {
                             // Recurse to check grandparents
                             let min_phrase_level = self.get_min_phrase_split_level(phrase);
-                            self.verify_match_with_grandparent(phrase, parent_keyword, min_phrase_level, 0).await
+                            self.verify_match_with_ancestors(phrase, parent_keyword, min_phrase_level, 0).await
                         }
                     }
                     None => {
@@ -2505,7 +2519,7 @@ impl KeywordSearcher {
     /// * `current_keyword` - The current keyword whose parents to check
     /// * `min_phrase_level` - Minimum split-level for optimization
     /// * `depth` - Current recursion depth (to prevent stack overflow)
-    async fn verify_match_with_grandparent(
+    async fn verify_match_with_ancestors(
         &self,
         phrase: &str,
         current_keyword: &str,
@@ -2536,9 +2550,11 @@ impl KeywordSearcher {
                             for range in &rg.row_ranges {
                                 // Optimization: Check if this parent's split-level is compatible
                                 if let Some(min_level) = min_phrase_level {
-                                    if let Some(parent_split_level) = self.get_parent_split_level(range.splits_matched) {
-                                        if parent_split_level < min_level {
-                                            continue;
+                                    if let Some(splits) = range.splits_matched {
+                                        if let Some(parent_split_level) = self.get_parent_split_level(splits.get()) {
+                                            if parent_split_level < min_level {
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
@@ -2554,7 +2570,7 @@ impl KeywordSearcher {
                                                 }
                                             } else {
                                                 // Recurse further up the chain (boxed for async recursion)
-                                                Box::pin(self.verify_match_with_grandparent(
+                                                Box::pin(self.verify_match_with_ancestors(
                                                     phrase,
                                                     &grandparent_keyword,
                                                     min_phrase_level,
@@ -2628,7 +2644,7 @@ impl KeywordSearcher {
     /// Time complexity: O(∏ |vec_i|) - product of all vector lengths.
     /// Space complexity: Same as time (stores all combinations).
     /// Typically small since tokens rarely appear many times in same row.
-    fn cartesian_product<'a>(&self, vecs: &[&'a Vec<(u16, Option<u16>, Option<u16>)>]) -> Vec<Vec<&'a (u16, Option<u16>, Option<u16>)>> {
+    fn cartesian_product<'a>(&self, vecs: &[&'a Vec<(Option<std::num::NonZeroU16>, Option<u16>, Option<u16>)>]) -> Vec<Vec<&'a (Option<std::num::NonZeroU16>, Option<u16>, Option<u16>)>> {
         if vecs.is_empty() {
             return vec![Vec::new()];
         }

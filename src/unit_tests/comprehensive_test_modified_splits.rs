@@ -250,6 +250,7 @@ mod comprehensive_custom_features_tests {
             Some(split_chars.clone()),  // split_chars
             Some(false),  // store_full_keyword_default: don't store by default
             Some(full_keyword_exceptions),  // full_keyword_column_exceptions
+            None,
             None
         ).await.expect("Failed to build index");
 

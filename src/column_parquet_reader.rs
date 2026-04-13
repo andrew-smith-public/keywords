@@ -271,7 +271,8 @@ async fn read_metadata(
 /// * `column_pool` - Mutable reference to the column pool for interning column names
 /// * `split_lookup` - Reference to the split character lookup table
 /// * `column_full_keyword_stored` - Map of column names to whether full keywords should be stored
-/// * `threshold_count` - Optional threshold for disabling parent tracking (in Row object count)
+/// * `parent_threshold_count` - Optional threshold for disabling parent tracking (in Row object count)
+/// * `split_threshold_count` - Optional threshold for eliminating split match info (in Row object count)
 ///
 /// # Returns
 ///
@@ -306,7 +307,8 @@ pub(crate) async fn stream_and_process_parquet(
     column_pool: &mut ColumnPool,
     split_lookup: &crate::keyword_shred::SplitLookup,
     column_full_keyword_stored: &HashMap<String, bool>,
-    threshold_count: Option<usize>,
+    parent_threshold_count: Option<usize>,
+    split_threshold_count: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Extract metadata
@@ -399,7 +401,8 @@ pub(crate) async fn stream_and_process_parquet(
             column_pool,
             split_lookup,
             column_full_keyword_stored,
-            threshold_count,
+            parent_threshold_count,
+            split_threshold_count,
         );
     }
 
@@ -617,44 +620,55 @@ fn array_to_string_smart(array: &ArrayRef) -> ArrayRef {
     }
 }
 
-/// Checks if keywords exceed the threshold for a column and reconsolidates if needed.
+/// Checks if keywords exceed the thresholds for a column and reconsolidates if needed.
 ///
-/// This function implements the parent tracking threshold optimization. After processing
-/// a column chunk, it checks all keywords to see if they exceed the threshold for that column.
-/// When a keyword appears in too many rows (indicating it's a common value like "1", "Y", etc.),
-/// parent tracking is disabled for that keyword/column combination to reduce memory usage.
+/// This function implements both parent tracking and split elimination threshold optimizations.
+/// After processing a column chunk, it checks all keywords to see if they exceed either threshold.
+///
+/// When a keyword appears in too many rows:
+/// 1. Parent tracking is disabled first (if threshold exceeded)
+/// 2. Split match information is eliminated second (if split threshold exceeded)
+///
+/// Parent elimination must happen first because it reduces row object count.
+/// Split elimination only happens if row count still exceeds its threshold after parent elimination.
 ///
 /// # Arguments
 ///
 /// * `keyword_map` - Mutable reference to the keyword map
 /// * `column_ref` - Column reference (u32) from the column pool
-/// * `threshold_count` - Maximum number of Row objects before disabling parent tracking
+/// * `parent_threshold_count` - Maximum Row objects before disabling parent tracking
+/// * `split_threshold_count` - Maximum Row objects before eliminating split info
 ///
 /// # Algorithm
 ///
 /// For each keyword in the map:
 /// 1. Find the internal column index for the processed column
 /// 2. Count Row objects for that keyword/column
-/// 3. If count exceeds threshold AND parent tracking is enabled:
+/// 3. If count exceeds parent threshold AND parent tracking enabled:
 ///    - Disable parent tracking for that keyword/column
-///    - Reconsolidate existing Row objects (merge consecutive rows)
+///    - Reconsolidate existing Row objects (merge consecutive rows with same splits)
+/// 4. Re-count Row objects after parent elimination
+/// 5. If count still exceeds split threshold AND splits not yet eliminated:
+///    - Clear all splits_matched information
+///    - Reconsolidate again (merge all consecutive rows regardless of splits)
 ///
 /// # Memory Impact
 ///
-/// This optimization can significantly reduce index size. For example, a keyword appearing
-/// in every row with different parents might go from 100,000 Row objects to just a few
-/// hundred after reconsolidation.
+/// These optimizations can significantly reduce index size. For example:
+/// - Parent elimination: 100,000 Row objects → few hundred
+/// - Split elimination: Additional reduction if still over split threshold
 fn check_and_reconsolidate_if_needed(
     keyword_map: &mut HashMap<Rc<str>, KeywordOneFile>,
     column_ref: u32,
-    threshold_count: usize,
+    parent_threshold_count: usize,
+    split_threshold_count: usize,
 ) {
     // Check all keywords that might have been updated
     for (_keyword, keyword_data) in keyword_map.iter_mut() {
         for column_ref_choice in [column_ref, 0] {
             // Find the internal column index for this column reference
             if let Some(col_idx) = keyword_data.column_references.iter().position(|&c| c == column_ref_choice) {
-                // Check if parent tracking is still enabled for this column
+                // Step 1: Check parent tracking threshold
                 if keyword_data.parent_tracking_enabled[col_idx] {
                     // Count Row objects for this column
                     let row_object_count: usize = keyword_data.row_group_to_rows[col_idx]
@@ -662,10 +676,31 @@ fn check_and_reconsolidate_if_needed(
                         .map(|row_group| row_group.len())
                         .sum();
 
-                    if row_object_count > threshold_count {
-                        // Exceeded threshold! Disable parent tracking and reconsolidate
+                    if row_object_count > parent_threshold_count {
+                        // Exceeded parent threshold! Disable parent tracking and reconsolidate
                         keyword_data.parent_tracking_enabled[col_idx] = false;
                         keyword_data.reconsolidate_column_rows(col_idx);
+                    }
+                }
+
+                // Step 2: Check split elimination threshold (after potential parent elimination)
+                // Only eliminate splits if they haven't been eliminated yet
+                // Check if any row still has splits_matched information
+                let has_split_info = keyword_data.row_group_to_rows[col_idx]
+                    .iter()
+                    .flat_map(|row_group| row_group.iter())
+                    .any(|row| row.splits_matched.is_some());
+
+                if has_split_info {
+                    // Re-count Row objects after potential parent elimination
+                    let row_object_count: usize = keyword_data.row_group_to_rows[col_idx]
+                        .iter()
+                        .map(|row_group| row_group.len())
+                        .sum();
+
+                    if row_object_count > split_threshold_count {
+                        // Exceeded split threshold! Eliminate split info and reconsolidate
+                        keyword_data.reconsolidate_column_rows_eliminate_splits(col_idx);
                     }
                 }
             }
@@ -718,7 +753,8 @@ fn process_column_chunk(
     column_pool: &mut ColumnPool,
     split_lookup: &crate::keyword_shred::SplitLookup,
     column_full_keyword_stored: &HashMap<String, bool>,
-    threshold_count: Option<usize>,
+    parent_threshold_count: Option<usize>,
+    split_threshold_count: Option<usize>,
 ) {
     // Create a chunk reader for our column data
     let chunk_reader = ColumnBytesReader::new(column_chunk.bytes, column_chunk.start_offset);
@@ -783,14 +819,15 @@ fn process_column_chunk(
         cumulative_row_offset += batch_size;
     }
 
-    // Check threshold and reconsolidate if needed
-    if let Some(threshold) = threshold_count {
+    // Check thresholds and reconsolidate if needed
+    if let Some(parent_threshold) = parent_threshold_count {
         // Get the column reference (already interned during processing)
         let column_ref = column_pool.intern(&column_chunk.column_name);
         check_and_reconsolidate_if_needed(
             keyword_map,
             column_ref,
-            threshold,
+            parent_threshold,
+            split_threshold_count.unwrap_or(usize::MAX), // Default to no split elimination if not specified
         );
     }
 }
@@ -998,6 +1035,10 @@ pub(crate) fn process_arrow_string_array(
 ///   When a keyword appears in more than this fraction of rows in a column, parent tracking
 ///   is disabled for that keyword/column to reduce memory usage. For example, 0.2 means
 ///   keywords appearing in >20% of rows won't track parent information for that column.
+/// * `split_elimination_threshold` - Optional threshold for eliminating split match information
+///   When a keyword appears in more than this fraction of rows in a column (after parent
+///   elimination), split-level information is cleared to further reduce memory. Must be >=
+///   parent_tracking_threshold. For example, 0.3 means keywords in >30% of rows lose split info.
 ///
 /// # Returns
 ///
@@ -1039,7 +1080,7 @@ pub(crate) fn process_arrow_string_array(
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// // Process with defaults (1% error rate, all columns)
-/// let result = process_parquet_file(ParquetSource::Path("data.parquet".to_string()), None, None, None, None, None, None).await?;
+/// let result = process_parquet_file(ParquetSource::Path("data.parquet".to_string()), None, None, None, None, None, None, None).await?;
 /// println!("Indexed {} unique keywords", result.keyword_map.len());
 ///
 /// // Process with custom error rate and exclusions
@@ -1054,6 +1095,7 @@ pub(crate) fn process_arrow_string_array(
 ///     None,
 ///     None,
 ///     Some(0.15),  // Disable parent tracking for keywords in >15% of rows
+///     None
 /// ).await?;
 ///
 /// // Use bloom filters for fast lookups
@@ -1078,6 +1120,7 @@ pub async fn process_parquet_file(
     store_full_keyword_default: Option<bool>,
     full_keyword_column_exceptions: Option<HashSet<String>>,
     parent_tracking_threshold: Option<f64>,
+    split_elimination_threshold: Option<f64>,
 ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
     // Default to 1% error rate if not specified
     let error_rate = error_rate.unwrap_or(0.01);
@@ -1099,11 +1142,26 @@ pub async fn process_parquet_file(
     // Read metadata and determine file path for streaming
     let metadata_with_cache: MetadataWithCache = read_metadata(source, None).await?;
 
-    // Calculate threshold for parent tracking optimization
-    let threshold_count = parent_tracking_threshold.map(|threshold| {
+    // Calculate thresholds for parent tracking and split elimination optimizations
+    let parent_threshold_count = parent_tracking_threshold.map(|threshold| {
         let total_rows = metadata_with_cache.metadata.file_metadata().num_rows() as usize;
         (total_rows as f64 * threshold) as usize
     });
+
+    let split_threshold_count = split_elimination_threshold.map(|threshold| {
+        let total_rows = metadata_with_cache.metadata.file_metadata().num_rows() as usize;
+        (total_rows as f64 * threshold) as usize
+    });
+
+    // Validate that split threshold >= parent threshold (if both are specified)
+    if let (Some(parent_thresh), Some(split_thresh)) = (parent_tracking_threshold, split_elimination_threshold) {
+        if split_thresh < parent_thresh {
+            return Err(format!(
+                "split_elimination_threshold ({}) must be >= parent_tracking_threshold ({})",
+                split_thresh, parent_thresh
+            ).into());
+        }
+    }
 
     let num_rows: i64 = metadata_with_cache.metadata.file_metadata().num_rows();
     let num_cols: usize = metadata_with_cache.metadata.file_metadata().schema_descr().num_columns();
@@ -1144,7 +1202,8 @@ pub async fn process_parquet_file(
         &mut column_pool,
         &split_lookup,
         &column_full_keyword_stored,
-        threshold_count,
+        parent_threshold_count,
+        split_threshold_count,
     ).await?;
 
     // Process columns (will reuse cached data if available)
@@ -1253,7 +1312,8 @@ mod tests {
             &mut column_pool,
             &split_lookup,
             &column_full_keyword_stored,
-            None,  // threshold_count
+            None,  // parent_threshold_count
+            None,  // split_threshold_count
         ).await.unwrap();
 
         // Verify that we have all 1000 unique keywords
@@ -1320,7 +1380,8 @@ mod tests {
             &mut column_pool,
             &split_lookup,
             &column_full_keyword_stored,
-            None,  // threshold_count
+            None,  // parent_threshold_count
+            None,  // split_threshold_count
         ).await.unwrap();
 
         // Verify row group 0, row 0
@@ -1393,7 +1454,8 @@ mod tests {
             &mut column_pool,
             &split_lookup,
             &column_full_keyword_stored,
-            None,  // threshold_count
+            None,  // parent_threshold_count
+            None,  // split_threshold_count
         ).await.unwrap();
 
         // Should only have 3 keywords (nulls skipped)
@@ -1451,7 +1513,8 @@ mod tests {
             &mut column_pool,
             &split_lookup,
             &column_full_keyword_stored,
-            None,  // threshold_count
+            None,  // parent_threshold_count
+            None,  // split_threshold_count
         ).await.unwrap();
 
         // Should only have 2 keywords (empty string skipped)
@@ -1499,7 +1562,8 @@ mod tests {
             &mut column_pool,
             &split_lookup,
             &column_full_keyword_stored,
-            None,  // threshold_count
+            None,  // parent_threshold_count
+            None,  // split_threshold_count
         ).await.unwrap();
 
         // Should only have keyword from included column
@@ -1560,7 +1624,8 @@ mod tests {
             &mut column_pool,
             &split_lookup,
             &column_full_keyword_stored,
-            None,  // threshold_count
+            None,  // parent_threshold_count
+            None,  // split_threshold_count
         ).await.unwrap();
 
         // Verify split keywords exist
@@ -1636,7 +1701,8 @@ mod tests {
             &mut column_pool,
             &split_lookup,
             &column_full_keyword_stored,
-            None,  // threshold_count
+            None,  // parent_threshold_count
+            None,  // split_threshold_count
         ).await.unwrap();
 
         // THE BUG: Without the fix, all these would be at row 0, 1, or 2

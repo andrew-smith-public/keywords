@@ -22,7 +22,7 @@ fn test_row_add_same_row_same_parent() {
     assert_eq!(kw.row_group_to_rows[0][0][0], Row {
         row: 0,
         additional_rows: 0,
-        splits_matched: 31,
+        splits_matched: NonZeroU16::new(31),
         parent_keyword: None,
     });
 }

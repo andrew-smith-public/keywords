@@ -11,6 +11,7 @@ mod tests {
     use rand::Rng;
     use rand::distr::Alphanumeric;
     use std::fs::File;
+    use std::num::NonZeroU16;
     use rkyv::rancor::Error as RkyvError;
     #[cfg(feature = "perf_generate_figures")]
     use serial_test::serial;
@@ -123,6 +124,7 @@ mod tests {
             None,
             Some(0.01),
             index_file_prefix,
+            None,
             None,
             None,
             None,
@@ -456,7 +458,9 @@ mod tests {
                     row_ranges.push(RowRange {
                         start_row: flat_row.row.to_native(),  // Convert from archived
                         end_row: flat_row.row.to_native() + flat_row.additional_rows.to_native(),
-                        splits_matched: flat_row.splits_matched.to_native(),
+                        splits_matched: flat_row.splits_matched.as_ref().and_then(|archived_nz| {
+                            NonZeroU16::new(archived_nz.get())
+                        }),
                         parent_chunk: flat_row.parent_chunk.as_ref().map(|c| c.to_native()),
                         parent_position: flat_row.parent_position.as_ref().map(|p| p.to_native()),
                     });

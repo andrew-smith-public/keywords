@@ -303,7 +303,7 @@ mod tests {
         let parquet_bytes = create_small_test_parquet()
             .expect("Failed to create test parquet");
 
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None).await
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None, None).await
             .expect("Failed to build index");
 
         println!("\n✓ Index built successfully in memory");
@@ -321,7 +321,7 @@ mod tests {
         let parquet_bytes = create_small_test_parquet()
             .expect("Failed to create test parquet");
 
-        let _searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None).await
+        let _searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None, None).await
             .expect("Failed to build index");
 
         println!("✓ Index built successfully in memory");
@@ -341,7 +341,7 @@ mod tests {
         println!("  ✓ File data is > 2MB ({} bytes) - as expected", parquet_bytes.len());
 
         // Build index to verify it's valid
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None).await
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None, None).await
             .expect("Failed to build index");
 
         let info = searcher.get_index_info();
@@ -364,7 +364,7 @@ mod tests {
         println!("  ✓ File data is < 2MB ({} bytes) - as expected", parquet_bytes.len());
 
         // Build index to verify it's valid
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None).await
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None, None).await
             .expect("Failed to build index");
 
         let info = searcher.get_index_info();
@@ -381,7 +381,7 @@ mod tests {
         println!("\n=== Processing columns from generated small parquet ===");
 
         // Process the parquet and verify keywords are extracted
-        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None).await
+        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None).await
             .expect("Failed to process parquet file");
 
         println!("\n=== Processing complete ===");
@@ -408,7 +408,7 @@ mod tests {
         println!("\n=== Full processing test for larger.parquet ===");
 
         let start = std::time::Instant::now();
-        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None).await;
+        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None, None).await;
         let elapsed = start.elapsed();
 
         match result {
@@ -430,7 +430,7 @@ mod tests {
 
         println!("\n=== Full processing test for small.parquet ===");
 
-        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None).await;
+        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None, None).await;
 
         match result {
             Ok(process_result) => {
@@ -488,7 +488,7 @@ mod tests {
         println!("\n=== Testing column filters for small.parquet ===");
 
         // Process with default error rate (1%)
-        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None).await
+        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None, None).await
             .expect("Failed to process parquet file");
 
         println!("✓ Successfully processed file");
@@ -529,7 +529,7 @@ mod tests {
         println!("\n=== Testing custom error rate for small.parquet ===");
 
         // Process with 0.1% error rate (stricter)
-        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, Some(0.001), None, None, None, None).await
+        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, Some(0.001), None, None, None, None, None).await
             .expect("Failed to process parquet file");
 
         println!("✓ Successfully processed file with 0.1% error rate");
@@ -550,7 +550,7 @@ mod tests {
 
         println!("\n=== Testing global filter for small.parquet ===");
 
-        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None).await
+        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None, None).await
             .expect("Failed to process parquet file");
 
         println!("✓ Successfully created global filter");
@@ -582,7 +582,7 @@ mod tests {
 
         println!("\n=== Testing global filter performance benefit ===");
 
-        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None).await
+        let result = process_parquet_file(ParquetSource::Bytes(parquet_bytes.clone()), None, None, None, None, None, None, None).await
             .expect("Failed to process parquet file");
 
         // Test keywords that don't exist in any column
@@ -764,7 +764,7 @@ mod tests {
 
         // Build index in memory
         println!("\n2. Building index in memory...");
-        let _searcher = build_index_in_memory(ParquetSource::Bytes(Bytes::from(parquet_bytes)), None, Some(0.01), None, None, None, None, None, None).await
+        let _searcher = build_index_in_memory(ParquetSource::Bytes(Bytes::from(parquet_bytes)), None, Some(0.01), None, None, None, None, None, None, None).await
             .expect("Failed to build index");
         println!("✓ Index built successfully in memory");
     }
@@ -940,7 +940,7 @@ mod tests {
             // Build index
             println!("\nBuilding index...");
             let start_index = std::time::Instant::now();
-            let index_result = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None).await;
+            let index_result = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, Some(0.01), None, None, None, None, None, None, None).await;
 
             match index_result {
                 Ok(searcher) => {
@@ -1188,7 +1188,7 @@ mod column_filter_integration_tests {
         let parquet_bytes = create_test_parquet_multi_column().expect("Failed to create test parquet");
 
         // Build index
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None)
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None, None)
             .await
             .expect("Failed to build index");
 
@@ -1250,7 +1250,7 @@ mod column_filter_integration_tests {
         let parquet_bytes = create_test_parquet_many_columns().expect("Failed to create test parquet");
 
         // Build index
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None)
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None, None)
             .await
             .expect("Failed to build index");
 
@@ -1289,7 +1289,7 @@ mod column_filter_integration_tests {
         let parquet_bytes = create_test_parquet_hierarchical().expect("Failed to create test parquet");
 
         // Build index
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None)
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None, None)
             .await
             .expect("Failed to build index");
 
@@ -1368,7 +1368,7 @@ mod column_filter_integration_tests {
         let parquet_bytes = create_test_parquet_multi_column().expect("Failed to create test parquet");
 
         // Build index
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None)
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None, None)
             .await
             .expect("Failed to build index");
 
@@ -1401,7 +1401,7 @@ mod column_filter_integration_tests {
         let parquet_bytes = create_test_parquet_multi_column().expect("Failed to create test parquet");
 
         // Build index
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None)
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None, None)
             .await
             .expect("Failed to build index");
 
@@ -1419,7 +1419,7 @@ mod column_filter_integration_tests {
         let parquet_bytes = create_test_parquet_multi_column().expect("Failed to create test parquet");
 
         // Build index
-        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None)
+        let searcher = build_index_in_memory(ParquetSource::Bytes(parquet_bytes), None, None, None, None, None, None, None, None, None)
             .await
             .expect("Failed to build index");
 

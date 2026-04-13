@@ -5,6 +5,7 @@ use indexmap::IndexSet;
 use smallvec::{SmallVec, smallvec};
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::num::NonZeroU16;
 use crate::utils::column_pool::{ColumnPool};
 
 // Original constants (used as defaults)
@@ -76,7 +77,7 @@ impl SplitLookup {
 pub struct Row {
     pub(crate) row: u32,
     pub(crate) additional_rows: u16,
-    pub(crate) splits_matched: u16,
+    pub(crate) splits_matched: Option<NonZeroU16>,
 
     // Parent keyword tracking for phrase search optimization
     // Stores immediate parent (one level up in split hierarchy)
@@ -111,11 +112,17 @@ impl std::fmt::Display for Row {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Row {{ row: {}, additional_rows: {}, splits_matched: {:05b}, parent_keyword: ",
+            "Row {{ row: {}, additional_rows: {}, splits_matched: ",
             self.row,
             self.additional_rows,
-            self.splits_matched
         )?;
+
+        match self.splits_matched {
+            Some(splits) => write!(f, "Some({:05b})", splits.get())?,
+            None => write!(f, "None")?,
+        }
+
+        write!(f, ", parent_keyword: ")?;
 
         match &self.parent_keyword {
             Some(parent) => write!(f, "Some(\"{}\")", parent)?,
@@ -147,13 +154,23 @@ impl Row {
     pub(crate) fn add(
         &mut self,
         row_number: u32,
-        split_match_bit: u16,
+        split_match_bit: Option<NonZeroU16>,
         parent_keyword: &Option<Rc<str>>
     ) -> Option<Row> {
+
         let previous_row_seen_number = self.row + self.additional_rows as u32;
         if previous_row_seen_number == row_number && self.parent_keyword == *parent_keyword {
             // Same row, same parent - just merge splits_matched
-            self.splits_matched |= split_match_bit;
+            match (self.splits_matched, split_match_bit) {
+                (Some(existing), Some(new)) => {
+                    // Both have split info, OR them together
+                    self.splits_matched = NonZeroU16::new(existing.get() | new.get());
+                }
+                (None, _) | (_, None) => {
+                    // If either is None, the result remains None (info already eliminated)
+                    self.splits_matched = None;
+                }
+            }
             None
         } else if (previous_row_seen_number + 1 == row_number)
             && (self.splits_matched == split_match_bit)
@@ -174,11 +191,12 @@ impl Row {
 
 #[derive(Debug)]
 pub struct KeywordOneFile {
-    pub(crate) splits_matched: u16,
+    pub(crate) splits_matched: Option<NonZeroU16>,
     pub(crate) column_references: SmallVec<[u32; 2]>,  // Stack-allocated for ≤2 columns
     pub(crate) row_groups: Vec<SmallVec<[u16; 4]>>,   // Adaptive storage based on file's row group count
     pub(crate) row_group_to_rows: Vec<Vec<Vec<Row>>>,
     pub(crate) parent_tracking_enabled: Vec<bool>,    // Parallel to column_references - tracks if parent is stored
+    pub(crate) splits_tracking_enabled: Vec<bool>,    // Parallel to column_references - tracks if splits is stored
 }
 
 impl std::fmt::Display for KeywordOneFile {
@@ -195,8 +213,17 @@ impl std::fmt::Display for KeywordOneFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "KeywordOneFile {{ splits_matched: {}, columns: {}, row_groups: {} }}",
-            self.splits_matched,
+            "KeywordOneFile {{ splits_matched: ",
+        )?;
+
+        match self.splits_matched {
+            Some(splits) => write!(f, "{:b}", splits.get())?,
+            None => write!(f, "None")?,
+        }
+
+        write!(
+            f,
+            ", columns: {}, row_groups: {} }}",
             self.column_references.len(),
             self.row_groups.iter().map(|rg| rg.len()).sum::<usize>()
         )
@@ -225,19 +252,31 @@ impl KeywordOneFile {
         split_match_bit: u16,
         parent_keyword: &Option<Rc<str>>,
     ) {
-        let rows_len = self.row_group_to_rows[column_idx][row_idx].len();
-        if rows_len > 0 {
-            let previous_row: &mut Row = &mut self.row_group_to_rows[column_idx][row_idx][rows_len - 1];
-            let new_row: Option<Row> = previous_row.add(row_number, split_match_bit, parent_keyword);
-            if let Some(new_row_value) = new_row {
-                self.row_group_to_rows[column_idx][row_idx].push(new_row_value);
+        // Check if parent tracking is enabled for this column
+        let parent_to_store = if self.parent_tracking_enabled[column_idx] {
+            parent_keyword.clone()
+        } else {
+            None
+        };
+
+        // Check if split tracking is enabled for this column
+        let splits_to_store = if self.splits_tracking_enabled[column_idx] {
+            NonZeroU16::new(split_match_bit)
+        } else {
+            None
+        };
+
+        let rows = &mut self.row_group_to_rows[column_idx][row_idx];
+        if let Some(last_row) = rows.last_mut() {
+            if let Some(new_row) = last_row.add(row_number, splits_to_store, &parent_to_store) {
+                rows.push(new_row);
             }
         } else {
-            self.row_group_to_rows[column_idx][row_idx].push(Row {
+            rows.push(Row {
                 row: row_number,
                 additional_rows: 0,
-                splits_matched: split_match_bit,
-                parent_keyword: parent_keyword.clone(),
+                splits_matched: splits_to_store,
+                parent_keyword: parent_to_store,
             });
         }
     }
@@ -301,7 +340,17 @@ impl KeywordOneFile {
         split_match_bit: u16,
         parent_keyword: &Option<Rc<str>>,
     ) {
-        self.splits_matched |= split_match_bit;
+        // Update splits_matched bitmask
+        match (self.splits_matched, NonZeroU16::new(split_match_bit)) {
+            (Some(existing), Some(new)) => {
+                self.splits_matched = NonZeroU16::new(existing.get() | new.get());
+            }
+            (None, _) | (_, None) => {
+                // If split info has been eliminated, keep it eliminated
+                self.splits_matched = None;
+            }
+        }
+
         match self.column_references.iter().position(|&c| c == column_reference) {
             Some(idx) => {
                 // Check if parent tracking is enabled for this column
@@ -310,13 +359,22 @@ impl KeywordOneFile {
                 } else {
                     &None  // Don't track parent - allows Row object merging
                 };
-                self.add_group(idx, row_group, row_number, split_match_bit, parent_to_use);
+
+                // Check if split tracking is enabled for this column
+                let split_to_use = if self.splits_tracking_enabled[idx] {
+                    split_match_bit
+                } else {
+                    0  // Don't track splits - allows Row object merging
+                };
+
+                self.add_group(idx, row_group, row_number, split_to_use, parent_to_use);
             }
             None => {
                 self.column_references.push(column_reference);
                 self.row_groups.push(SmallVec::new());
                 self.row_group_to_rows.push(Vec::new());
                 self.parent_tracking_enabled.push(true);  // Start with parent tracking enabled
+                self.splits_tracking_enabled.push(true);  // Start with split tracking enabled
                 let new_idx = self.column_references.len() - 1;
                 self.add_group(new_idx, row_group, row_number, split_match_bit, parent_keyword);
             }
@@ -422,6 +480,107 @@ impl KeywordOneFile {
             column_idx, count_before, count_after, reduction, reduction_pct
         );
     }
+
+    /// Reconsolidates Row objects for a specific column after eliminating split match information.
+    ///
+    /// This method is called when a keyword exceeds the split elimination threshold for a column.
+    /// It clears all splits_matched references (sets to None) and merges all consecutive Row objects
+    /// regardless of their original split levels, since that information is now eliminated.
+    ///
+    /// # Arguments
+    ///
+    /// * `column_idx` - Internal column index in the row_group_to_rows structure
+    ///
+    /// # Process
+    ///
+    /// 1. Clear all splits_matched references (set to None)
+    /// 2. Merge all consecutive/overlapping rows regardless of split level
+    ///
+    /// # Memory Impact
+    ///
+    /// This optimization provides additional memory reduction beyond parent elimination.
+    /// Keywords that still have many Row objects after parent elimination can be further
+    /// consolidated by removing split-level distinctions.
+    pub(crate) fn reconsolidate_column_rows_eliminate_splits(&mut self, column_idx: usize) {
+        // CRITICAL: Disable split tracking for this column to prevent new rows from adding splits
+        // Without this flag, subsequent row groups would add rows with splits_matched = Some(...)
+        self.splits_tracking_enabled[column_idx] = false;
+
+        // Count Row objects before reconsolidation
+        let count_before: usize = self.row_group_to_rows[column_idx]
+            .iter()
+            .map(|row_group| row_group.len())
+            .sum();
+
+        for row_group_rows in &mut self.row_group_to_rows[column_idx] {
+            // Step 1: Clear all splits_matched references
+            for row in row_group_rows.iter_mut() {
+                row.splits_matched = None;
+            }
+
+            // Step 2: Merge all consecutive and overlapping rows (no split level check)
+            let mut i = 0;
+            while i < row_group_rows.len().saturating_sub(1) {
+                let current_end = row_group_rows[i].row + row_group_rows[i].additional_rows as u32;
+                let next_start = row_group_rows[i + 1].row;
+                let next_end = next_start + row_group_rows[i + 1].additional_rows as u32;
+
+                // Merge if consecutive or overlapping (no splits_matched check needed - all None)
+                if current_end + 1 >= next_start {
+                    // Merge: take the maximum extent of both rows
+                    let merged_end = current_end.max(next_end);
+                    let new_additional = (merged_end - row_group_rows[i].row) as u16;
+
+                    if new_additional <= ADDITIONAL_ROWS_CAP {
+                        // Normal merge: expand current row's range and remove next
+                        row_group_rows[i].additional_rows = new_additional;
+                        row_group_rows.remove(i + 1);
+                        // Don't increment i - check if we can merge with next row too
+                        continue;
+                    } else {
+                        // Hit cap: fill current row to capacity and adjust next row
+                        row_group_rows[i].additional_rows = ADDITIONAL_ROWS_CAP;
+                        let new_next_start = row_group_rows[i].row + ADDITIONAL_ROWS_CAP as u32 + 1;
+
+                        // Adjust next row to start where we left off
+                        let next_original_end = next_end;
+                        row_group_rows[i + 1].row = new_next_start;
+
+                        if new_next_start <= next_original_end {
+                            row_group_rows[i + 1].additional_rows = (next_original_end - new_next_start) as u16;
+                        } else {
+                            // Next row was completely consumed, remove it
+                            row_group_rows.remove(i + 1);
+                            continue;
+                        }
+
+                        // Move to next row
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // Count Row objects after reconsolidation
+        let count_after: usize = self.row_group_to_rows[column_idx]
+            .iter()
+            .map(|row_group| row_group.len())
+            .sum();
+
+        let reduction = count_before.saturating_sub(count_after);
+        let reduction_pct = if count_before > 0 {
+            (reduction as f64 / count_before as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        println!(
+            "Reconsolidate (eliminate splits) column_idx {}: {} → {} Row objects ({} reduced, {:.1}% reduction)",
+            column_idx, count_before, count_after, reduction, reduction_pct
+        );
+    }
 }
 
 /// Creates a new KeywordOneFile instance with initial data.
@@ -450,7 +609,7 @@ fn create_new_keyword_one_file(
     parent_keyword: &Option<Rc<str>>
 ) -> KeywordOneFile {
     KeywordOneFile {
-        splits_matched: split_match_bit,
+        splits_matched: NonZeroU16::new(split_match_bit),
         column_references: smallvec![0, column_reference],  // Global bucket + this column
         row_groups: vec![
             smallvec![row_group],
@@ -460,17 +619,18 @@ fn create_new_keyword_one_file(
             vec![vec![Row {
                 row: row_number,
                 additional_rows: 0,
-                splits_matched: split_match_bit,
+                splits_matched: NonZeroU16::new(split_match_bit),
                 parent_keyword: parent_keyword.clone(),
             }]],
             vec![vec![Row {
                 row: row_number,
                 additional_rows: 0,
-                splits_matched: split_match_bit,
+                splits_matched: NonZeroU16::new(split_match_bit),
                 parent_keyword: parent_keyword.clone(),
             }]]
         ],
         parent_tracking_enabled: vec![true, true],  // Start with parent tracking enabled for both columns
+        splits_tracking_enabled: vec![true, true],  // Start with split tracking enabled for both columns
     }
 }
 

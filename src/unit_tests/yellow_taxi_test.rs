@@ -290,7 +290,8 @@ mod yellow_taxi_index_test {
             None,  // split_chars (use default)
             Some(true),  // store_full_keyword_default
             None,  // full_keyword_column_exceptions
-            Some(0.1),  // parent_tracking_threshold (disable parent for keywords in >20% of rows)
+            Some(0.2),  // parent_tracking_threshold (disable parent for keywords in >20% of rows)
+            Some(0.2)   // split_elimination_threshold (disable split information for keywords in >20% of rows)
         ).await.expect("Failed to process parquet file");
 
         // ======================================================================

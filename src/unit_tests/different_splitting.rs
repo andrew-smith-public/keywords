@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
     use crate::keyword_shred::{default_split_lookup, perform_split, SplitLookup};
     use hashbrown::HashMap;
 
@@ -104,7 +105,7 @@ mod tests {
 
         // Verify full keyword has bit 0 set (splits_matched = 1)
         let full_entry = keyword_map.get("user@example.com").unwrap();
-        assert_eq!(full_entry.splits_matched & 1, 1,
+        assert_eq!(full_entry.splits_matched.unwrap().get() & NonZeroU16::new(1).unwrap().get(), 1,
                    "Full keyword should have bit 0 set");
     }
 

@@ -20,7 +20,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //!     // Build an index with default compression
-//!     build_and_save_index("data.parquet", None, None, None, None, None, None, None, None, None).await?;
+//!     build_and_save_index("data.parquet", None, None, None, None, None, None, None, None, None, None).await?;
 //!
 //!     // Search for a keyword
 //!     let result = search("data.parquet", "example", None, true).await?;
@@ -182,7 +182,8 @@ pub async fn build_and_save_index(
     split_chars: Option<Vec<Vec<char>>>,
     store_full_keyword_default: Option<bool>,
     full_keyword_column_exceptions: Option<StdHashSet<String>>,
-    parent_tracking_threshold: Option<f64>
+    parent_tracking_threshold: Option<f64>,
+    split_elimination_threshold: Option<f64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let error_rate = error_rate.unwrap_or(0.01);
     let keywords_compression = keywords_compression.unwrap_or(CompressionAlgorithm::Zstd { level: 8 });
@@ -214,7 +215,8 @@ pub async fn build_and_save_index(
         Some(split_chars_vec.clone()),
         store_full_keyword_default,
         full_keyword_column_exceptions,
-        parent_tracking_threshold
+        parent_tracking_threshold,
+        split_elimination_threshold,
     ).await?;
 
     println!("Building distributed index...");
@@ -526,7 +528,8 @@ pub async fn build_index_in_memory(
     split_chars: Option<Vec<Vec<char>>>,
     store_full_keyword_default: Option<bool>,
     full_keyword_column_exceptions: Option<StdHashSet<String>>,
-    parent_tracking_threshold: Option<f64>
+    parent_tracking_threshold: Option<f64>,
+    split_elimination_threshold: Option<f64>,
 ) -> Result<KeywordSearcher, Box<dyn std::error::Error + Send + Sync>> {
     use crate::utils::file_interaction_local_and_cloud::register_memory_file;
 
@@ -579,7 +582,8 @@ pub async fn build_index_in_memory(
         Some(split_chars_vec.clone()),
         store_full_keyword_default,
         full_keyword_column_exceptions,
-        parent_tracking_threshold
+        parent_tracking_threshold,
+        split_elimination_threshold,
     ).await?;
     let files = build_distributed_index(&result, &ParquetSource::Path(memory_path.clone()), error_rate, keywords_compression, data_compression, &split_chars_vec).await?;
 

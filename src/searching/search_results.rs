@@ -168,10 +168,11 @@ pub struct SearchResult {
 ///
 /// ```no_run
 /// # use keywords::searching::search_results::KeywordLocationData;
+/// # use std::num::NonZeroU16;
 /// # let data = KeywordLocationData {
 /// #     columns: vec!["email".to_string(), "notes".to_string()],
 /// #     total_occurrences: 127,
-/// #     splits_matched: 0b0110,
+/// #     splits_matched: NonZeroU16::new(6),
 /// #     column_details: vec![],
 /// # };
 /// // Check which columns have the keyword
@@ -180,7 +181,7 @@ pub struct SearchResult {
 /// }
 ///
 /// // Check split levels
-/// if data.splits_matched & 0b0010 != 0 {
+/// if data.splits_matched.unwrap().get() & NonZeroU16::new(2).unwrap().get() != 0 {
 ///     println!("Matched at level 1 (whitespace/punctuation splits)");
 /// }
 /// ```
@@ -208,7 +209,10 @@ pub struct KeywordLocationData {
     /// - `0b10000` (16): Split by quaternary delimiters (-, _)
     ///
     /// Multiple bits can be set if the keyword appears at multiple split levels.
-    pub splits_matched: u16,
+    ///
+    /// `None` indicates split-level information was eliminated (due to high occurrence count)
+    /// to reduce index size. In this case, the keyword exists but split level is unknown.
+    pub splits_matched: Option<std::num::NonZeroU16>,
 
     /// Detailed location information for each column.
     ///
@@ -321,10 +325,11 @@ pub struct RowGroupLocation {
 ///
 /// ```no_run
 /// # use keywords::searching::search_results::RowRange;
+/// # use std::num::NonZeroU16;
 /// # let range = RowRange {
 /// #     start_row: 100,
 /// #     end_row: 103,
-/// #     splits_matched: 0b0010,
+/// #     splits_matched: NonZeroU16::new(2),
 /// #     parent_chunk: None,
 /// #     parent_position: None,
 /// # };
@@ -355,7 +360,10 @@ pub struct RowRange {
     ///
     /// Same encoding as `KeywordLocationData::splits_matched`. All rows in this
     /// range have the same split pattern.
-    pub splits_matched: u16,
+    ///
+    /// `None` indicates split-level information was eliminated (due to high occurrence count)
+    /// to reduce index size.
+    pub splits_matched: Option<std::num::NonZeroU16>,
 
     /// Parent keyword chunk number (0-indexed).
     ///

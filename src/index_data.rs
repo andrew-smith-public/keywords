@@ -138,7 +138,7 @@ pub struct ChunkInfo {
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 pub struct KeywordDataFlat {
     pub columns: Vec<ColumnDataFlat>,
-    pub splits_matched: u16,
+    pub splits_matched: Option<std::num::NonZeroU16>,
 }
 
 /// Per-column data for a keyword
@@ -164,7 +164,7 @@ pub struct RowGroupDataFlat {
 pub struct FlatRow {
     pub row: u32,
     pub additional_rows: u32,
-    pub splits_matched: u16,
+    pub splits_matched: Option<std::num::NonZeroU16>,
 
     /// Parent keyword chunk number (which chunk contains the parent)
     /// For parent lookup: chunk_index[parent_chunk] gives the chunk location
@@ -343,7 +343,7 @@ fn convert_to_flat(
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
 ///     let split_chars: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE.iter().map(|&chars| chars.to_vec()).collect();
-///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None, Some(0.2)).await.unwrap();
+///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None, Some(0.2), None).await.unwrap();
 ///
 ///     // Build with default compression
 ///     let index_files = build_distributed_index(
@@ -670,7 +670,7 @@ pub struct DistributedIndexFiles {
 ///     // Generate test parquet data in memory
 ///     let parquet_bytes = vec![/* generated parquet data */];
 ///     let split_chars: Vec<Vec<char>> = SPLIT_CHARS_INCLUSIVE.iter().map(|&chars| chars.to_vec()).collect();
-///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None, Some(0.2)).await.unwrap();
+///     let result = process_parquet_file(ParquetSource::from(parquet_bytes.clone()), None, None, Some(split_chars.clone()), None, None, Some(0.2), None).await.unwrap();
 ///
 ///     let index_files = build_distributed_index(
 ///         &result,
