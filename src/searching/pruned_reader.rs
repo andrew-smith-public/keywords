@@ -163,6 +163,40 @@ fn build_row_selection(
     Some(RowSelection::from(selectors))
 }
 
+/// Collect row ranges from a KeywordLocationData into per-row-group sorted,
+/// non-overlapping ranges.  Merges overlapping or adjacent ranges so each
+/// physical row appears at most once, even when the same row matches in
+/// multiple columns.
+fn collect_merged_ranges(
+    data: &crate::searching::search_results::KeywordLocationData,
+    row_groups_to_read: &mut std::collections::HashSet<usize>,
+    row_group_ranges: &mut std::collections::HashMap<u16, Vec<(u32, u32)>>,
+) {
+    for col_detail in &data.column_details {
+        for rg in &col_detail.row_groups {
+            row_groups_to_read.insert(rg.row_group_id as usize);
+            let ranges = row_group_ranges.entry(rg.row_group_id).or_insert_with(Vec::new);
+            for range in &rg.row_ranges {
+                ranges.push((range.start_row, range.end_row));
+            }
+        }
+    }
+
+    // Sort and merge overlapping/adjacent ranges per row group
+    for ranges in row_group_ranges.values_mut() {
+        ranges.sort_unstable();
+        let mut write = 0;
+        for read in 1..ranges.len() {
+            if ranges[read].0 <= ranges[write].1 + 1 {
+                ranges[write].1 = ranges[write].1.max(ranges[read].1);
+            } else {
+                write += 1;
+                ranges[write] = ranges[read];
+            }
+        }
+        ranges.truncate(write + 1);
+    }
+}
 
 impl PrunedParquetReader {
     /// Create a new pruned Parquet reader for the specified source.
@@ -352,21 +386,10 @@ impl PrunedParquetReader {
         let data = search_result.verified_matches.as_ref()
             .ok_or("Search result has no data")?;
 
-        // Collect all row groups that contain the keyword
         let mut row_groups_to_read = std::collections::HashSet::new();
         let mut row_group_ranges: std::collections::HashMap<u16, Vec<(u32, u32)>> =
             std::collections::HashMap::new();
-
-        for col_detail in &data.column_details {
-            for rg in &col_detail.row_groups {
-                row_groups_to_read.insert(rg.row_group_id as usize);
-
-                let ranges = row_group_ranges.entry(rg.row_group_id).or_insert_with(Vec::new);
-                for range in &rg.row_ranges {
-                    ranges.push((range.start_row, range.end_row));
-                }
-            }
-        }
+        collect_merged_ranges(data, &mut row_groups_to_read, &mut row_group_ranges);
 
         if row_groups_to_read.is_empty() {
             return Ok(Vec::new());
@@ -477,41 +500,80 @@ impl PrunedParquetReader {
             return Ok(Vec::new());
         }
 
-        // Collect row groups and ranges from both verified and needs_verification
-        let mut row_groups_to_read = std::collections::HashSet::new();
-        let mut row_group_ranges: std::collections::HashMap<u16, Vec<(u32, u32)>> =
-            std::collections::HashMap::new();
+        let mut batches = Vec::new();
 
-        // Process verified matches
+        // Read verified matches — confirmed correct, return as-is
         if let Some(verified) = &search_result.verified_matches {
-            for col_detail in &verified.column_details {
-                for rg in &col_detail.row_groups {
-                    row_groups_to_read.insert(rg.row_group_id as usize);
-
-                    let ranges = row_group_ranges.entry(rg.row_group_id).or_insert_with(Vec::new);
-                    for range in &rg.row_ranges {
-                        ranges.push((range.start_row, range.end_row));
-                    }
-                }
+            let mut rg_set = std::collections::HashSet::new();
+            let mut rg_ranges = std::collections::HashMap::new();
+            collect_merged_ranges(verified, &mut rg_set, &mut rg_ranges);
+            if !rg_set.is_empty() {
+                let mut verified_batches = self.read_row_groups_and_ranges(
+                    rg_set, rg_ranges, columns.clone(),
+                ).await?;
+                batches.append(&mut verified_batches);
             }
         }
 
-        // Process needs_verification matches
+        // Read needs_verification matches — verify against actual parquet values
         if let Some(needs_check) = &search_result.needs_verification {
-            for col_detail in &needs_check.column_details {
-                for rg in &col_detail.row_groups {
-                    row_groups_to_read.insert(rg.row_group_id as usize);
+            let mut rg_set = std::collections::HashSet::new();
+            let mut rg_ranges = std::collections::HashMap::new();
+            collect_merged_ranges(needs_check, &mut rg_set, &mut rg_ranges);
+            if !rg_set.is_empty() {
+                let unverified_batches = self.read_row_groups_and_ranges(
+                    rg_set, rg_ranges, columns,
+                ).await?;
 
-                    let ranges = row_group_ranges.entry(rg.row_group_id).or_insert_with(Vec::new);
-                    for range in &rg.row_ranges {
-                        ranges.push((range.start_row, range.end_row));
+                let query = &search_result.query;
+                let check_columns = &needs_check.columns;
+
+                for batch in unverified_batches {
+                    let filtered = Self::filter_batch_by_query(&batch, query, check_columns)?;
+                    if filtered.num_rows() > 0 {
+                        batches.push(filtered);
                     }
                 }
             }
         }
 
-        // Use existing read logic
-        self.read_row_groups_and_ranges(row_groups_to_read, row_group_ranges, columns).await
+        Ok(batches)
+    }
+
+    /// Filter a RecordBatch to only rows where at least one of the specified columns
+    /// has a value that, when converted to string using the same logic as indexing,
+    /// matches the query.
+    fn filter_batch_by_query(
+        batch: &RecordBatch,
+        query: &str,
+        check_columns: &[String],
+    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        use arrow::array::{Array, BooleanArray};
+        use arrow::compute::filter_record_batch;
+        use crate::column_parquet_reader::array_to_string_smart;
+
+        let num_rows = batch.num_rows();
+        let mut mask = vec![false; num_rows];
+
+        for col_name in check_columns {
+            if let Some(col_idx) = batch.schema().fields().iter().position(|f| f.name() == col_name) {
+                let array = batch.column(col_idx);
+                let string_array = array_to_string_smart(array);
+                let string_arr = string_array.as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("array_to_string_smart must return StringArray");
+
+                for row in 0..num_rows {
+                    if !mask[row] && !string_arr.is_null(row) && string_arr.value(row) == query {
+                        mask[row] = true;
+                    }
+                }
+            }
+        }
+
+        let boolean_array = BooleanArray::from(mask);
+        let filtered = filter_record_batch(batch, &boolean_array)?;
+        Ok(filtered)
     }
 
 

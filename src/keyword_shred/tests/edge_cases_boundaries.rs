@@ -171,3 +171,70 @@ fn test_boundary_additional_rows_near_cap() {
         "Should create new Row when exceeding cap"
     );
 }
+
+#[test]
+fn test_reconsolidate_merging_two_max_cap_rows() {
+    // Two consecutive max-cap Row objects. Before the u16-overflow fix,
+    // reconsolidate cast the merged span (131,069) to u16 (yielding 65,533),
+    // which is ≤ ADDITIONAL_ROWS_CAP, so the "normal merge" branch silently
+    // deleted Row B and Row A's coverage was truncated to [0..=65533],
+    // losing rows 65534..=131069.
+    //
+    // After the fix the span is compared as u32, hitting the cap branch and
+    // leaving both rows untouched.
+    let row_a = Row {
+        row: 0,
+        additional_rows: ADDITIONAL_ROWS_CAP,  // covers 0..=65534
+        splits_matched: None,
+        parent_keyword: None,
+    };
+    let row_b = Row {
+        row: ADDITIONAL_ROWS_CAP as u32 + 1,   // 65535; covers 65535..=131069
+        additional_rows: ADDITIONAL_ROWS_CAP,
+        splits_matched: None,
+        parent_keyword: None,
+    };
+
+    let mut kof = KeywordOneFile {
+        splits_matched: None,
+        column_references: smallvec![0],
+        row_groups: vec![smallvec![0]],
+        row_group_to_rows: vec![vec![vec![row_a, row_b]]],
+        parent_tracking_enabled: vec![false],
+        splits_tracking_enabled: vec![false],
+    };
+
+    kof.reconsolidate_column_rows(0);
+
+    let rows = &kof.row_group_to_rows[0][0];
+    assert_eq!(
+        rows.len(),
+        2,
+        "Two max-cap consecutive rows must NOT collapse into one (u16 overflow fix)"
+    );
+
+    // Row A must be unchanged — starts at 0, still covers ADDITIONAL_ROWS_CAP rows
+    assert_eq!(rows[0].row, 0, "Row A start must remain 0");
+    assert_eq!(
+        rows[0].additional_rows,
+        ADDITIONAL_ROWS_CAP,
+        "Row A must keep its full cap coverage"
+    );
+
+    // Row B must start immediately after Row A's last covered row
+    let expected_row_b_start = ADDITIONAL_ROWS_CAP as u32 + 1;
+    assert_eq!(rows[1].row, expected_row_b_start, "Row B start must be ADDITIONAL_ROWS_CAP+1");
+    assert_eq!(
+        rows[1].additional_rows,
+        ADDITIONAL_ROWS_CAP,
+        "Row B must keep its full cap coverage"
+    );
+
+    // Sanity: total row coverage spans [0, 131069] with no gap
+    let total_covered = rows[0].additional_rows as u32 + 1 + rows[1].additional_rows as u32 + 1;
+    assert_eq!(
+        total_covered,
+        131070,
+        "Total coverage must be 2 × (ADDITIONAL_ROWS_CAP+1) = 131070 rows"
+    );
+}

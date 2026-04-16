@@ -23,7 +23,7 @@
 //!     build_and_save_index("data.parquet", None, None, None, None, None, None, None, None, None, None).await?;
 //!
 //!     // Search for a keyword
-//!     let result = search("data.parquet", "example", None, true).await?;
+//!     let result = search("data.parquet", "example", None, true, false).await?;
 //!     if let Some(data) = result.verified_matches {
 //!         println!("Found in columns: {:?}", data.columns);
 //!     }
@@ -59,7 +59,7 @@ use crate::column_parquet_reader::process_parquet_file;
 use crate::index_structure::index_files::{index_filename, IndexFile};
 use crate::keyword_shred::KeywordOneFile;
 use crate::searching::keyword_search::KeywordSearcher;
-use crate::searching::search_results::SearchResult;
+use crate::searching::search_results::{SearchResult, SearchMode};
 use crate::utils::file_interaction_local_and_cloud::get_object_store;
 
 // ============================================================================
@@ -375,7 +375,7 @@ pub async fn get_index_info(
 /// ```no_run
 /// # use keywords::search;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-/// let result = search("data.parquet", "alice", None, true).await?;
+/// let result = search("data.parquet", "alice", None, true, false).await?;
 ///
 /// if let Some(verified) = result.verified_matches {
 ///     println!("Found in columns: {:?}", verified.columns);
@@ -388,7 +388,7 @@ pub async fn get_index_info(
 /// ```no_run
 /// # use keywords::search;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-/// let result = search("data.parquet", "user@example.com", None, false).await?;
+/// let result = search("data.parquet", "user@example.com", None, false, false).await?;
 ///
 /// if let Some(verified) = result.verified_matches {
 ///     println!("Verified matches: {}", verified.total_occurrences);
@@ -406,7 +406,7 @@ pub async fn get_index_info(
 /// ```no_run
 /// # use keywords::search;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-/// let result = search("data.parquet", "admin", Some("username"), false).await?;
+/// let result = search("data.parquet", "admin", Some("username"), false, false).await?;
 ///
 /// if result.found {
 ///     println!("Found 'admin' in username column");
@@ -419,11 +419,64 @@ pub async fn search(
     search_for: &str,
     in_columns: Option<&str>,
     keyword_only: bool,
+    exact_match: bool,
 ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+    let mode = if exact_match { SearchMode::Equals } else { SearchMode::Contains };
     let searcher = KeywordSearcher::load(parquet_path, None).await?;
-    searcher.search(search_for, in_columns, keyword_only).await
+    searcher.search_with_mode(search_for, in_columns, keyword_only, mode).await
 }
 
+/// Search for a keyword and return the matching rows from the Parquet file.
+///
+/// This is the end-to-end search function: it queries the index to find which rows
+/// match, then reads those rows from the Parquet file using pruned I/O.
+///
+/// # TODO
+/// When the search result contains data that can be fully answered from the index
+/// alone (e.g. `SELECT col WHERE col = 'keyword'` — every returned value is the
+/// keyword itself, or `SELECT COUNT(*) WHERE col = 'keyword'`), we could skip the
+/// Parquet read entirely. For now we always read the Parquet file to return the
+/// actual row data.
+///
+/// # Arguments
+///
+/// * `parquet_path` - Path to the Parquet file (index at `{parquet_path}.index/`)
+/// * `search_for` - The text to search for
+/// * `in_columns` - Optional column name to restrict search to
+/// * `keyword_only` - `true` for exact keyword, `false` for phrase search
+/// * `exact_match` - `true` to only match rows where the column value exactly equals the
+///   search term, `false` (default) to also match rows where the search term appears as a
+///   sub-token from hierarchical splitting
+///
+/// # Returns
+///
+/// A tuple of `(SearchResult, Vec<RecordBatch>)`:
+/// - The `SearchResult` with index metadata (columns, row ranges, occurrence counts)
+/// - The `Vec<RecordBatch>` containing the actual Parquet rows that matched
+///
+/// If the keyword is not found, the `Vec<RecordBatch>` will be empty.
+pub async fn search_and_read(
+    parquet_path: &str,
+    search_for: &str,
+    in_columns: Option<&str>,
+    keyword_only: bool,
+    exact_match: bool,
+) -> Result<(SearchResult, Vec<arrow::record_batch::RecordBatch>), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::searching::pruned_reader::PrunedParquetReader;
+
+    let mode = if exact_match { SearchMode::Equals } else { SearchMode::Contains };
+    let searcher = KeywordSearcher::load(parquet_path, None).await?;
+    let result = searcher.search_with_mode(search_for, in_columns, keyword_only, mode).await?;
+
+    if !result.found {
+        return Ok((result, Vec::new()));
+    }
+
+    let reader = PrunedParquetReader::from_path(parquet_path);
+    let batches = reader.read_search_result(&result, None).await?;
+
+    Ok((result, batches))
+}
 
 /// Check if the index exists and is up-to-date with the parquet file
 ///

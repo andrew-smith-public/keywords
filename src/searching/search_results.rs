@@ -52,6 +52,35 @@
 //! ```
 
 
+/// Controls whether a search matches exact column values or any token derived from splitting.
+///
+/// During indexing, column values are split hierarchically (e.g., "1.5" splits at the dot
+/// into tokens "1" and "5"). This enum controls which matches are returned:
+///
+/// - `Contains` — returns all rows where the keyword appears, including as a sub-token.
+///   Searching for "bbc" finds rows with value "https://www.bbc.co.uk".
+/// - `Equals` — returns only rows where the column value exactly equals the keyword.
+///   Searching for "1" does NOT match rows where the value is "1.5".
+///
+/// `Equals` uses the `splits_matched` bitmask on each row range: bit 0 indicates the keyword
+/// was stored as the original unsplit value.  Row ranges where `splits_matched` has been
+/// eliminated (set to `None` by split elimination) go into `needs_verification` since
+/// equality cannot be confirmed from the index alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Match the keyword wherever it appears, including as a sub-token of a split value.
+    /// This is the default and matches the existing behaviour.
+    Contains,
+    /// Match only rows where the column value exactly equals the keyword.
+    Equals,
+}
+
+impl Default for SearchMode {
+    fn default() -> Self {
+        SearchMode::Contains
+    }
+}
+
 /// Unified search result for all search operations.
 ///
 /// This is the primary return type for all search operations in the keyword index,

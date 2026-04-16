@@ -461,9 +461,11 @@ mod split_match_nullification_tests {
         let mut emails = vec![];
         let mut usernames = vec![];
 
-        // Add many rows where "common" appears in both columns
+        // Add many rows where "common" appears in both columns.
+        // Email format: "common@test{i}.com" — the "@" split produces "common" as a token.
+        // Username format: "common_user" — the "_" split produces "common" as a token.
         for i in 0..100 {
-            emails.push(format!("common{}@test.com", i));
+            emails.push(format!("common@test{}.com", i));
             usernames.push("common_user".to_string());
         }
 
@@ -486,8 +488,8 @@ mod split_match_nullification_tests {
             None,
             None,
             None,
-            None,
-            Some(0.05), // 5% threshold
+            Some(0.05), // parent_tracking_threshold (required for split elimination to run)
+            Some(0.05), // split_elimination_threshold
         ).await.unwrap();
 
         let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE
@@ -504,22 +506,23 @@ mod split_match_nullification_tests {
             &split_chars,
         ).await.unwrap();
 
-        let searcher = KeywordSearcher::from_serialized(
-            &crate::index_data::DistributedIndexFiles {
-                filters: index_files.filters,
-                data: index_files.data,
-            },
-            "test.parquet.index".to_string(),
-            None,
-        ).unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let memory_path = format!("memory://test-multi-col-{}.parquet", ts);
+        crate::index_data::save_distributed_index(&index_files, &memory_path, None).await.unwrap();
+        let searcher = KeywordSearcher::load(&memory_path, None).await.unwrap();
 
         // Search for "common" which appears in both columns
         let result = searcher.search("common", None, true).await.unwrap();
         assert!(result.found);
 
         if let Some(verified) = &result.verified_matches {
-            // Should have nullified splits for this common keyword
-            assert!(verified.splits_matched.is_none());
+            // The keyword-level splits_matched (KeywordOneFile) records how the keyword
+            // was derived by splitting — it is never nullified, only row-level splits are.
+            assert!(verified.splits_matched.is_some(),
+                    "Keyword-level splits_matched should be Some (records split derivation)");
 
             // Should have both columns
             assert_eq!(verified.columns.len(), 2,
@@ -628,8 +631,10 @@ mod split_match_nullification_tests {
 
         let source = ParquetSource::Bytes(Bytes::from(parquet_bytes));
 
-        // Use very low threshold (1% of 80 = 0.8 rows)
-        // "common" keyword appears in way more than 0.8 rows, so will trigger elimination
+        // Use very low threshold (1% of 80 = 0.8 rows → 0 as usize).
+        // "common" has 1 Row object per row group (40 consecutive rows RLE'd), total = 2.
+        // 2 > 0 triggers elimination. parent_tracking_threshold must be set to activate
+        // check_and_reconsolidate_if_needed, which gates both parent and split elimination.
         let result = process_parquet_file(
             source.clone(),
             None,
@@ -637,8 +642,8 @@ mod split_match_nullification_tests {
             None,
             None,
             None,
-            None,
-            Some(0.01),  // 1% threshold
+            Some(0.01),  // parent_tracking_threshold (required to activate elimination check)
+            Some(0.01),  // split_elimination_threshold
         ).await.unwrap();
 
         let split_chars: Vec<Vec<char>> = crate::keyword_shred::SPLIT_CHARS_INCLUSIVE
@@ -655,14 +660,13 @@ mod split_match_nullification_tests {
             &split_chars,
         ).await.unwrap();
 
-        let searcher = KeywordSearcher::from_serialized(
-            &crate::index_data::DistributedIndexFiles {
-                filters: index_files.filters,
-                data: index_files.data,
-            },
-            "test.parquet.index".to_string(),
-            None,
-        ).unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let memory_path = format!("memory://test-splits-not-readded-{}.parquet", ts);
+        crate::index_data::save_distributed_index(&index_files, &memory_path, None).await.unwrap();
+        let searcher = KeywordSearcher::load(&memory_path, None).await.unwrap();
 
         let search_result = searcher.search("common", None, true).await.unwrap();
         assert!(search_result.found, "Should find 'common' keyword");
@@ -751,14 +755,13 @@ mod split_match_nullification_tests {
             &split_chars,
         ).await.unwrap();
 
-        let searcher = KeywordSearcher::from_serialized(
-            &crate::index_data::DistributedIndexFiles {
-                filters: index_files.filters,
-                data: index_files.data,
-            },
-            "test.parquet.index".to_string(),
-            None,
-        ).unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let memory_path = format!("memory://test-splits-preserved-{}.parquet", ts);
+        crate::index_data::save_distributed_index(&index_files, &memory_path, None).await.unwrap();
+        let searcher = KeywordSearcher::load(&memory_path, None).await.unwrap();
 
         let search_result = searcher.search("rare", None, true).await.unwrap();
         assert!(search_result.found);
@@ -780,5 +783,145 @@ mod split_match_nullification_tests {
 
             println!("✓ Splits correctly preserved when below threshold");
         }
+    }
+
+    /// Split elimination is tracked independently per column.  A keyword that appears in
+    /// many non-consecutive rows in `frequent_col` has its row-level `splits_matched`
+    /// eliminated (→ `None`), while the same keyword in `rare_col` (few consecutive rows,
+    /// well below threshold) keeps its split information (→ `Some`).
+    ///
+    /// Dataset (100 rows):
+    /// - `frequent_col`: "shared" on even rows 0,2,…,98 → 50 non-consecutive Row objects.
+    /// - `rare_col`: "shared" on rows 0-4 only → 1 Row object (RLE merges 5 consecutive).
+    ///
+    /// Threshold 10% of 100 = 10 objects.
+    /// - `frequent_col`: 50 > 10 → elimination → `splits_matched = None`
+    /// - `rare_col`:      1 ≤ 10 → no change   → `splits_matched = Some`
+    #[tokio::test]
+    async fn test_per_column_split_elimination_is_independent() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("frequent_col", DataType::Utf8, false),
+            Field::new("rare_col",     DataType::Utf8, false),
+        ]));
+
+        let frequent: Vec<String> = (0..100)
+            .map(|i| if i % 2 == 0 { "shared".to_string() } else { "other".to_string() })
+            .collect();
+        let rare: Vec<String> = (0..100)
+            .map(|i| if i < 5 { "shared".to_string() } else { "unrelated".to_string() })
+            .collect();
+
+        let props = WriterProperties::builder().build();
+        let frequent_arr: ArrayRef = Arc::new(StringArray::from(frequent));
+        let rare_arr: ArrayRef     = Arc::new(StringArray::from(rare));
+        let batch = RecordBatch::try_new(schema.clone(), vec![frequent_arr, rare_arr]).unwrap();
+        let parquet_bytes = write_parquet_to_bytes(schema, batch, props);
+
+        // Both thresholds must be Some for elimination to run (see CLAUDE.md).
+        let searcher = build_index_in_memory(
+            ParquetSource::Bytes(Bytes::from(parquet_bytes)),
+            None, Some(0.01), None, None, None, None, None,
+            Some(0.1),  // parent_tracking_threshold  → threshold_count = 10
+            Some(0.1),  // split_elimination_threshold
+        ).await.unwrap();
+
+        // frequent_col: every range must have splits_matched = None
+        let result = searcher.search("shared", Some("frequent_col"), true).await.unwrap();
+        assert!(result.found, "'shared' must be found in frequent_col");
+        let data = result.verified_matches.unwrap();
+        assert_eq!(data.total_occurrences, 50, "frequent_col has 50 occurrences");
+        for col in &data.column_details {
+            for rg in &col.row_groups {
+                for range in &rg.row_ranges {
+                    assert!(
+                        range.splits_matched.is_none(),
+                        "frequent_col [{}-{}]: expected splits_matched=None after elimination",
+                        range.start_row, range.end_row
+                    );
+                }
+            }
+        }
+
+        // rare_col: every range must still have splits_matched = Some
+        let result = searcher.search("shared", Some("rare_col"), true).await.unwrap();
+        assert!(result.found, "'shared' must be found in rare_col");
+        let data = result.verified_matches.unwrap();
+        assert_eq!(data.total_occurrences, 5, "rare_col has 5 occurrences");
+        for col in &data.column_details {
+            for rg in &col.row_groups {
+                for range in &rg.row_ranges {
+                    assert!(
+                        range.splits_matched.is_some(),
+                        "rare_col [{}-{}]: expected splits_matched=Some (below threshold)",
+                        range.start_row, range.end_row
+                    );
+                }
+            }
+        }
+    }
+
+    /// Phrase search must fall back to `needs_verification` when any token's row-level
+    /// `splits_matched` has been eliminated (set to `None`).
+    ///
+    /// # Scenario
+    ///
+    /// 100 rows alternating "alpha-beta" (even rows) and "gamma-delta" (odd rows).
+    /// Threshold 10% of 100 rows = 10 Row objects.  "alpha-beta", "alpha", and "beta"
+    /// each appear in 50 **non-consecutive** rows, yielding 50 Row objects each —
+    /// all well above the 10-object threshold.  Split elimination therefore runs and
+    /// sets row-level `splits_matched = None` for every Row object.
+    ///
+    /// When the phrase "alpha-beta" is searched, `split_phrase` expands it to
+    /// `["alpha", "alpha-beta", "beta"]`.  All three tokens are found in the index,
+    /// and all three occur in the same 50 rows.  Because every token in those rows
+    /// carries `splits_matched = None`, the phrase-verification logic detects
+    /// missing split info and emits `NeedsVerification` for every row — it cannot
+    /// confirm the match without reading the Parquet file.
+    ///
+    /// # Assertions
+    ///
+    /// * `result.found` — matches exist (just unconfirmed)
+    /// * `result.needs_verification.is_some()` — hard assert (not an `if`)
+    /// * `total_occurrences == 50` — all 50 rows land in needs_verification
+    /// * `result.verified_matches.is_none()` — nothing confirmed without Parquet read
+    #[tokio::test]
+    async fn test_phrase_search_falls_back_to_needs_verification_when_splits_eliminated() {
+        // 100 rows: even rows "alpha-beta", odd rows "gamma-delta".
+        // "alpha-beta", "alpha", "beta" each appear in 50 non-consecutive rows
+        // → 50 Row objects each → exceeds the 10% threshold (= 10 objects).
+        let data: Vec<String> = (0..100)
+            .map(|i| if i % 2 == 0 { "alpha-beta".to_string() } else { "gamma-delta".to_string() })
+            .collect();
+
+        // Threshold 10% → threshold_count = (100 * 0.1) as usize = 10.
+        // 50 Row objects > 10 → split elimination runs on "alpha", "beta", "alpha-beta".
+        let searcher = create_test_index_with_thresholds(data, Some(0.1)).await;
+
+        // Phrase search (keyword_only=false) — must NOT use keyword_only=true, which
+        // would bypass the parent/split verification path entirely.
+        let result = searcher.search("alpha-beta", None, false).await.unwrap();
+
+        assert!(result.found, "Phrase 'alpha-beta' must be found (in needs_verification)");
+
+        // Hard assert — not guarded by `if`
+        assert!(
+            result.needs_verification.is_some(),
+            "Eliminated splits must force all rows into needs_verification, got: {:?}",
+            result.needs_verification
+        );
+
+        let needs_check = result.needs_verification.as_ref().unwrap();
+        assert_eq!(
+            needs_check.total_occurrences, 50,
+            "All 50 matching rows should land in needs_verification (got {})",
+            needs_check.total_occurrences
+        );
+
+        assert!(
+            result.verified_matches.is_none(),
+            "With all splits eliminated, no row can be confirmed without reading Parquet; \
+             got verified_matches: {:?}",
+            result.verified_matches
+        );
     }
 }

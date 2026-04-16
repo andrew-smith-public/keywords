@@ -186,12 +186,12 @@ struct KeywordLocation {
 /// Converts a KeywordOneFile to a flattened KeywordDataFlat structure for serialization.
 ///
 /// This function transforms the hierarchical keyword data structure into a flat, serializable
-/// format. It processes each column (skipping the global aggregate at index 0), extracts
+/// format. It processes all columns (including the aggregate column at index 0), extracts
 /// row group and row information, and converts parent keyword string references to
 /// chunk+position pairs using the provided keyword location mapping.
 ///
 /// The flattening process:
-/// 1. Iterates through all columns except the aggregate bucket
+/// 1. Iterates through all columns (including the aggregate bucket at index 0)
 /// 2. For each column, processes all row groups
 /// 3. For each row group, converts all rows to FlatRow format
 /// 4. Converts parent keyword Rc<str> references to (chunk, position) pairs
@@ -219,7 +219,7 @@ fn convert_to_flat(
 ) -> KeywordDataFlat {
     let mut columns = Vec::new();
 
-    // Iterate through columns (skip index 0 which is the aggregate)
+    // Iterate through all columns (index 0 is the aggregate bucket, included here)
     for (col_idx, &column_id) in keyword_data.column_references.iter().enumerate() {
         let mut row_groups = Vec::new();
 
@@ -498,21 +498,40 @@ pub async fn build_distributed_index(
     // Pass 2: Build keyword → location mapping based on determined chunks
     // =========================================================================
 
+    assert!(
+        chunk_boundaries.len() <= u16::MAX as usize,
+        "Too many chunks ({}): chunk_number is stored as u16 (max {}). \
+         Reduce MAX_CHUNK_SIZE_BYTES or split the dataset across multiple files.",
+        chunk_boundaries.len(), u16::MAX
+    );
+
     let keyword_to_location: HashMap<&str, KeywordLocation> = sorted_keywords.iter()
         .enumerate()
         .map(|(idx, (keyword, _))| {
             // Find which chunk this keyword belongs to
             let chunk_number = chunk_boundaries.iter()
                 .position(|(start, end)| idx >= *start && idx < *end)
-                .unwrap() as u16;
+                .unwrap();
 
             // Position within that chunk
-            let chunk_start = chunk_boundaries[chunk_number as usize].0;
-            let position_in_chunk = (idx - chunk_start) as u16;
+            let chunk_start = chunk_boundaries[chunk_number].0;
+            let position_in_chunk = idx - chunk_start;
+
+            assert!(
+                chunk_number <= u16::MAX as usize,
+                "Chunk number {} overflows u16", chunk_number
+            );
+            assert!(
+                position_in_chunk <= u16::MAX as usize,
+                "Position in chunk {} overflows u16 for keyword '{}'", position_in_chunk, keyword
+            );
 
             (
                 keyword.as_ref(),
-                KeywordLocation { chunk_number, position_in_chunk }
+                KeywordLocation {
+                    chunk_number: chunk_number as u16,
+                    position_in_chunk: position_in_chunk as u16,
+                }
             )
         })
         .collect();
@@ -558,6 +577,12 @@ pub async fn build_distributed_index(
         data_file.extend_from_slice(&compressed_data);
 
         let total_length = keyword_list_length + data_length;
+        assert!(
+            keywords_in_chunk.len() <= u16::MAX as usize,
+            "Chunk has {} keywords, which overflows u16 (max {}). \
+             Reduce MAX_CHUNK_SIZE_BYTES.",
+            keywords_in_chunk.len(), u16::MAX
+        );
         let chunk_count = keywords_in_chunk.len() as u16;
 
         // Add to chunk index

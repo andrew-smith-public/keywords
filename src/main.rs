@@ -431,7 +431,7 @@ async fn handle_search(file_path: &str, keyword: &str) {
 
     println!("Searching for '{}' in {}", keyword, file_path);
 
-    match keywords::search(file_path, keyword, None, false).await {
+    match keywords::search(file_path, keyword, None, false, false).await {
         Ok(result) => {
             if result.found {
                 println!("\n✓ Keyword found!");

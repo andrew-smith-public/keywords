@@ -578,7 +578,7 @@ async fn reader_task(
 
 /// Converts an Arrow array to StringArray with smart float formatting.
 /// Floats that are whole numbers (e.g., 1.0) are formatted without decimals (e.g., "1").
-fn array_to_string_smart(array: &ArrayRef) -> ArrayRef {
+pub(crate) fn array_to_string_smart(array: &ArrayRef) -> ArrayRef {
     match array.data_type() {
         DataType::Float32 => {
             let float_array = array.as_any().downcast_ref::<Float32Array>().unwrap();

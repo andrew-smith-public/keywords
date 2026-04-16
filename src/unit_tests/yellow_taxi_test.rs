@@ -553,4 +553,251 @@ mod yellow_taxi_index_test {
         println!("without needing to scan the entire parquet file.");
         println!("=============================================================\n");
     }
+
+    /// Compares keyword index vs DataFusion for a single-column search on real taxi data.
+    ///
+    /// Both sides search passenger_count for value '1' and read matching rows.
+    /// This is an apples-to-apples comparison demonstrating performance parity on
+    /// a high-frequency keyword (~70% of rows match).
+    #[tokio::test]
+    async fn test_yellow_taxi_single_column_vs_datafusion() {
+        use std::time::Instant;
+        use std::collections::HashSet;
+        use crate::build_and_save_index;
+        use datafusion::prelude::*;
+
+        println!("\n=============================================================");
+        println!("NYC YELLOW TAXI — SINGLE COLUMN SEARCH vs DATAFUSION");
+        println!("=============================================================");
+        println!("Keyword: '1' in passenger_count column");
+        println!();
+
+        // ── Step 1: Download ────────────────────────────────────────────────
+        println!("Step 1: Downloading parquet…");
+        let response = reqwest::get(YELLOW_TAXI_URL).await
+            .expect("Failed to download yellow taxi parquet");
+        let parquet_bytes = response.bytes().await
+            .expect("Failed to read response bytes");
+        println!("  {:.2} MB received", parquet_bytes.len() as f64 / (1024.0 * 1024.0));
+
+        let temp_path = std::env::temp_dir()
+            .join("yellow_taxi_single_col_perf_test.parquet");
+        let temp_path_str = temp_path.to_str().unwrap().to_string();
+        std::fs::write(&temp_path, &parquet_bytes)
+            .expect("Failed to write temp parquet");
+
+        // ── Step 2: Build index ──────────────────────────────────────────────
+        println!("\nStep 2: Building index…");
+        let build_start = Instant::now();
+        build_and_save_index(
+            &temp_path_str,
+            Some(HashSet::from([
+                "tpep_pickup_datetime".to_string(),
+                "tpep_dropoff_datetime".to_string(),
+            ])),
+            Some(0.01), None, None, None, None, Some(true), None,
+            Some(0.2), Some(0.2),
+        ).await.expect("Index build failed");
+        println!("  Index built in {:.2?}", build_start.elapsed());
+
+        // ── Step 3: Keyword index search + read rows ─────────────────────────
+        println!("\nStep 3: Keyword index search_and_read for '1' in passenger_count…");
+        let ki_start = Instant::now();
+        let (ki_result, ki_batches) = crate::search_and_read(
+            &temp_path_str, "1", Some("passenger_count"), false, true,
+        ).await.expect("search_and_read failed");
+        let ki_time = ki_start.elapsed();
+        assert!(ki_result.found, "Keyword '1' must be found in passenger_count");
+        let ki_rows: usize = ki_batches.iter().map(|b| b.num_rows()).sum();
+        println!("  Found: {} rows in {:.2?}", ki_rows, ki_time);
+
+        // ── Step 4: DataFusion search ────────────────────────────────────────
+        println!("\nStep 4: DataFusion search (\"passenger_count\" = 1)…");
+        let df_start = Instant::now();
+        let ctx = SessionContext::new();
+        ctx.register_parquet("data", &temp_path_str, Default::default()).await
+            .expect("DataFusion parquet registration failed");
+        let df = ctx.sql("SELECT * FROM data WHERE \"passenger_count\" = 1").await
+            .expect("DataFusion query failed");
+        let df_batches = df.collect().await.expect("DataFusion collect failed");
+        let df_rows: usize = df_batches.iter().map(|b| b.num_rows()).sum();
+        let df_time = df_start.elapsed();
+        println!("  Found: {} rows in {:.2?}", df_rows, df_time);
+
+        // ── Step 5: Summary ──────────────────────────────────────────────────
+        println!();
+        println!("=============================================================");
+        println!("RESULTS  (both search passenger_count = '1' and read rows)");
+        println!("=============================================================");
+        println!();
+        println!("┌──────────────────────────────────────┬────────────┬────────────┐");
+        println!("│ Approach                             │ Time       │ Rows       │");
+        println!("├──────────────────────────────────────┼────────────┼────────────┤");
+        println!("│ Keyword index + pruned read          │ {:>10.2?} │ {:>10} │",
+                 ki_time, ki_rows);
+        println!("│ DataFusion (predicate pushdown)      │ {:>10.2?} │ {:>10} │",
+                 df_time, df_rows);
+        println!("└──────────────────────────────────────┴────────────┴────────────┘");
+        println!();
+        let ratio = df_time.as_secs_f64() / ki_time.as_secs_f64();
+        if ratio >= 1.0 {
+            println!("Keyword index is {:.2}x faster than DataFusion", ratio);
+        } else {
+            println!("Keyword index is {:.2}x slower than DataFusion", 1.0 / ratio);
+        }
+
+        // Row counts must match
+        assert_eq!(ki_rows, df_rows,
+            "Keyword index and DataFusion must return the same number of rows");
+
+        // ── Cleanup ──────────────────────────────────────────────────────────
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_dir_all(format!("{}.index", temp_path_str));
+    }
+
+    /// Compares keyword index vs DataFusion searching ALL columns for '1'.
+    ///
+    /// The keyword index searches all columns at once (no column filter), which uses
+    /// the aggregate column 0 where split elimination fires heavily for '1'.
+    /// DataFusion must cast each column to string and check with OR across all columns.
+    ///
+    /// This test confirms that even with split elimination applied (splits_matched = None
+    /// on the aggregate column), the keyword index performs comparably to DataFusion
+    /// when both must scan the full file.
+    #[tokio::test]
+    async fn test_yellow_taxi_all_columns_split_elimination_vs_datafusion() {
+        use std::time::Instant;
+        use std::collections::HashSet;
+        use crate::build_and_save_index;
+        use datafusion::prelude::*;
+
+        println!("\n=============================================================");
+        println!("NYC YELLOW TAXI — ALL-COLUMN SEARCH WITH SPLIT ELIMINATION");
+        println!("=============================================================");
+        println!("Keyword: '1' across all indexed columns");
+        println!("Split elimination threshold: 0.2");
+        println!();
+
+        // ── Step 1: Download ────────────────────────────────────────────────
+        println!("Step 1: Downloading parquet…");
+        let response = reqwest::get(YELLOW_TAXI_URL).await
+            .expect("Failed to download yellow taxi parquet");
+        let parquet_bytes = response.bytes().await
+            .expect("Failed to read response bytes");
+        println!("  {:.2} MB received", parquet_bytes.len() as f64 / (1024.0 * 1024.0));
+
+        let temp_path = std::env::temp_dir()
+            .join("yellow_taxi_all_cols_perf_test.parquet");
+        let temp_path_str = temp_path.to_str().unwrap().to_string();
+        std::fs::write(&temp_path, &parquet_bytes)
+            .expect("Failed to write temp parquet");
+
+        // ── Step 2: Build index with split elimination ───────────────────────
+        println!("\nStep 2: Building index (split_elimination_threshold = 0.2)…");
+        let build_start = Instant::now();
+        build_and_save_index(
+            &temp_path_str,
+            Some(HashSet::from([
+                "tpep_pickup_datetime".to_string(),
+                "tpep_dropoff_datetime".to_string(),
+            ])),
+            Some(0.01), None, None, None, None, Some(true), None,
+            Some(0.2), Some(0.2),
+        ).await.expect("Index build failed");
+        println!("  Index built in {:.2?}", build_start.elapsed());
+
+        // ── Step 3: Keyword index search all columns + read rows ─────────────
+        println!("\nStep 3: Keyword index search_and_read for '1' (all columns)…");
+        let ki_start = Instant::now();
+        let (ki_result, ki_batches) = crate::search_and_read(
+            &temp_path_str, "1", None, false, true,
+        ).await.expect("search_and_read failed");
+        let ki_time = ki_start.elapsed();
+        assert!(ki_result.found, "Keyword '1' must be found");
+        let ki_rows: usize = ki_batches.iter().map(|b| b.num_rows()).sum();
+
+        // With exact_match=true and split elimination on the aggregate column,
+        // rows with splits_matched=None go to needs_verification (can't confirm equality
+        // from the index alone).  Rows with splits_matched bit 0 go to verified_matches.
+        let verified_count = ki_result.verified_matches.as_ref()
+            .map(|v| v.total_occurrences).unwrap_or(0);
+        let needs_verif_count = ki_result.needs_verification.as_ref()
+            .map(|v| v.total_occurrences).unwrap_or(0);
+        let splits_eliminated = ki_result.needs_verification.is_some();
+
+        println!("  Found: {} rows in {:.2?}", ki_rows, ki_time);
+        println!("  Verified: {}, Needs verification: {} (split-eliminated)", verified_count, needs_verif_count);
+        println!("  Split elimination applied: {}", splits_eliminated);
+
+        // ── Step 4: DataFusion search all columns ────────────────────────────
+        // Build an equivalent query: WHERE any indexed column cast to string = '1'
+        println!("\nStep 4: DataFusion search (all columns cast to string = '1')…");
+        let df_start = Instant::now();
+        let ctx = SessionContext::new();
+        ctx.register_parquet("data", &temp_path_str, Default::default()).await
+            .expect("DataFusion parquet registration failed");
+
+        // Build OR predicates for all indexed columns.
+        // Use numeric comparison (= 1) rather than CAST to VARCHAR, because
+        // Rust's f64::to_string() for 1.0 produces "1" while DataFusion's
+        // CAST(1.0 AS VARCHAR) produces "1.0", causing a mismatch.
+        let indexed_columns = ki_result.verified_matches.as_ref()
+            .or(ki_result.needs_verification.as_ref())
+            .map(|v| &v.columns)
+            .expect("Search found results but both verified and needs_verification are None");
+        let predicates: Vec<String> = indexed_columns.iter()
+            .map(|col| {
+                if col == "store_and_fwd_flag" {
+                    format!("\"{}\" = '1'", col)
+                } else {
+                    format!("\"{}\" = 1", col)
+                }
+            })
+            .collect();
+        let where_clause = predicates.join(" OR ");
+        let sql = format!("SELECT * FROM data WHERE {}", where_clause);
+        println!("  SQL: {}", sql);
+
+        let df = ctx.sql(&sql).await
+            .expect("DataFusion query failed");
+        let df_batches = df.collect().await.expect("DataFusion collect failed");
+        let df_rows: usize = df_batches.iter().map(|b| b.num_rows()).sum();
+        let df_time = df_start.elapsed();
+        println!("  Found: {} rows in {:.2?}", df_rows, df_time);
+
+        // ── Step 5: Summary ──────────────────────────────────────────────────
+        println!();
+        println!("=============================================================");
+        println!("RESULTS  (both search all columns for '1' and read rows)");
+        println!("=============================================================");
+        println!();
+        println!("┌──────────────────────────────────────┬────────────┬────────────┐");
+        println!("│ Approach                             │ Time       │ Rows       │");
+        println!("├──────────────────────────────────────┼────────────┼────────────┤");
+        println!("│ Keyword index + pruned read          │ {:>10.2?} │ {:>10} │",
+                 ki_time, ki_rows);
+        println!("│ DataFusion (all-column OR scan)      │ {:>10.2?} │ {:>10} │",
+                 df_time, df_rows);
+        println!("└──────────────────────────────────────┴────────────┴────────────┘");
+        println!();
+        let ratio = df_time.as_secs_f64() / ki_time.as_secs_f64();
+        if ratio >= 1.0 {
+            println!("Keyword index is {:.2}x faster than DataFusion", ratio);
+        } else {
+            println!("Keyword index is {:.2}x slower than DataFusion", 1.0 / ratio);
+        }
+        println!();
+        println!("Split elimination applied: {}", splits_eliminated);
+
+        assert!(splits_eliminated,
+            "Expected split elimination on aggregate column for keyword '1' at threshold 0.2");
+
+        assert_eq!(ki_rows, df_rows,
+            "Keyword index and DataFusion must return the same number of rows \
+             when using exact_match=true (Equals mode)");
+
+        // ── Cleanup ──────────────────────────────────────────────────────────
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_dir_all(format!("{}.index", temp_path_str));
+    }
 }

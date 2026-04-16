@@ -1432,6 +1432,190 @@ mod column_filter_integration_tests {
 
         let found_notes = searcher.search_in_column("alice", "notes").await.expect("Search failed");
         assert!(!found_notes, "alice should not be found in notes column");
-
     }
+
+    // =========================================================================
+    // Test C: exclude_columns filters results end-to-end
+    // =========================================================================
+
+    /// Keywords present only in an excluded column must be absent from the index.
+    /// Keywords present in both an included and excluded column must report only the
+    /// included column in search results.
+    ///
+    /// Schema: keep_col (indexed), drop_col (excluded).
+    /// Row 0: keep_col="only-in-keep",  drop_col="only-in-drop"
+    /// Row 1: keep_col="shared-keyword", drop_col="shared-keyword"
+    #[tokio::test]
+    async fn test_exclude_columns_end_to_end() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keep_col", DataType::Utf8, false),
+            Field::new("drop_col", DataType::Utf8, false),
+        ]));
+        let keep_arr = StringArray::from(vec!["only-in-keep", "shared-keyword"]);
+        let drop_arr = StringArray::from(vec!["only-in-drop",  "shared-keyword"]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(keep_arr), Arc::new(drop_arr)],
+        ).unwrap();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert("drop_col".to_string());
+
+        let searcher = build_index_in_memory(
+            ParquetSource::Bytes(Bytes::from(buf)),
+            Some(exclude), Some(0.01), None, None, None, None, None, None, None,
+        ).await.unwrap();
+
+        // Keyword that only exists in the excluded column must not be found.
+        let result = searcher.search("only-in-drop", None, true).await.unwrap();
+        assert!(!result.found,
+            "'only-in-drop' lives exclusively in drop_col (excluded) — must not be indexed");
+
+        // Keyword unique to keep_col must be found in keep_col only.
+        let result = searcher.search("only-in-keep", None, true).await.unwrap();
+        assert!(result.found, "'only-in-keep' must be found in keep_col");
+        let data = result.verified_matches.unwrap();
+        assert_eq!(data.columns.len(), 1, "only keep_col should be present");
+        assert_eq!(data.columns[0], "keep_col");
+
+        // Keyword shared between both columns: after exclusion only keep_col must appear.
+        let result = searcher.search("shared-keyword", None, true).await.unwrap();
+        assert!(result.found, "'shared-keyword' must be found via keep_col");
+        let data = result.verified_matches.unwrap();
+        assert_eq!(data.columns.len(), 1,
+            "drop_col was excluded so only keep_col should appear, got {:?}", data.columns);
+        assert_eq!(data.columns[0], "keep_col");
+    }
+
+    // =========================================================================
+    // Test F: single keyword exceeding MAX_CHUNK_SIZE_BYTES gets its own chunk
+    // =========================================================================
+
+    /// When `keyword_bytes + data_bytes > MAX_CHUNK_SIZE_BYTES` (1 MB) for a single
+    /// keyword, the chunking pass places it alone in a dedicated chunk rather than
+    /// bundling it with others.
+    ///
+    /// A 1,000,001-byte ASCII string has `keyword_bytes = 1_000_001 > MAX_CHUNK_SIZE_BYTES`.
+    /// With a second keyword "zzz" in the same file the index must produce exactly 2 chunks.
+    /// Both keywords must still be findable, and searching "zzz" exercises the `Ok(1)` branch
+    /// of `find_chunk_for_keyword` because "zzz" exactly equals chunk 1's `start_keyword`.
+    #[tokio::test]
+    async fn test_single_keyword_exceeding_chunk_size_gets_own_chunk() {
+        let big_keyword = "a".repeat(1_000_001);   // > MAX_CHUNK_SIZE_BYTES = 1_000_000
+        let normal_keyword = "zzz";                // 'z' > 'a', so this lands in chunk 1
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let array = StringArray::from(vec![big_keyword.clone(), normal_keyword.to_string()]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let searcher = build_index_in_memory(
+            ParquetSource::Bytes(Bytes::from(buf)),
+            None, Some(0.01), None, None, None, None, None, None, None,
+        ).await.unwrap();
+
+        // Exactly 2 chunks: big keyword alone in chunk 0, "zzz" alone in chunk 1.
+        assert_eq!(searcher.filters.chunk_index.len(), 2,
+            "Expected 2 chunks: one for the >1 MB keyword, one for 'zzz'");
+
+        // Chunk 0: the big keyword (lexicographically first: 'a' < 'z').
+        assert_eq!(searcher.filters.chunk_index[0].start_keyword, big_keyword,
+            "Chunk 0 start_keyword must be the big keyword");
+
+        // Chunk 1: "zzz" — binary_search_by returns Ok(1) for this exact match.
+        assert_eq!(searcher.filters.chunk_index[1].start_keyword, "zzz",
+            "Chunk 1 start_keyword must be 'zzz'");
+
+        // Big keyword is findable from its own chunk.
+        let result = searcher.search(&big_keyword, None, true).await.unwrap();
+        assert!(result.found, "Big keyword must be findable after getting its own chunk");
+        assert_eq!(result.verified_matches.unwrap().total_occurrences, 1);
+
+        // "zzz" is findable.
+        let result = searcher.search("zzz", None, true).await.unwrap();
+        assert!(result.found, "'zzz' must be findable from chunk 1");
+        assert_eq!(result.verified_matches.unwrap().total_occurrences, 1);
+    }
+
+    // =========================================================================
+    // Test G: build_and_save_index disk API round-trip
+    // =========================================================================
+
+    /// `build_and_save_index` writes the index to `{parquet_path}.index/` on disk.
+    /// Verifies the full round-trip: write Parquet → build index → load metadata via
+    /// `get_index_info` → search returns correct results via the public `search()` fn.
+    ///
+    /// A RAII guard ensures the temp file and index directory are removed even if the
+    /// test panics.
+    #[tokio::test]
+    async fn test_build_and_save_index_disk_api_round_trip() {
+        let tmp_dir = std::env::temp_dir();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parquet_path = tmp_dir.join(format!("keywords_disk_test_{}.parquet", ts));
+        let parquet_str  = parquet_path.to_str().unwrap().to_string();
+        let index_dir    = format!("{}.index", parquet_str);
+
+        // Write a minimal Parquet file to disk.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let array = StringArray::from(vec!["alice", "bob", "charlie"]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        std::fs::write(&parquet_path, &buf).expect("Failed to write temp parquet");
+
+        // RAII cleanup — runs even on panic.
+        struct Cleanup { parquet: String, index: String }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.parquet);
+                let _ = std::fs::remove_dir_all(&self.index);
+            }
+        }
+        let _guard = Cleanup { parquet: parquet_str.clone(), index: index_dir.clone() };
+
+        // Build and save the index.
+        crate::build_and_save_index(
+            &parquet_str, None, None, None, None, None, None, None, None, None, None,
+        ).await.expect("build_and_save_index must succeed");
+
+        // The index directory must now exist.
+        assert!(std::path::Path::new(&index_dir).is_dir(),
+            "Index directory '{}' must be created", index_dir);
+
+        // Metadata via get_index_info.
+        let info = crate::get_index_info(&parquet_str, None).await
+            .expect("get_index_info must succeed");
+        assert_eq!(info.num_columns, 1, "One string column was indexed");
+        assert!(info.total_keywords > 0, "At least one keyword must exist");
+        assert!(info.num_chunks > 0, "At least one chunk must exist");
+
+        // Search via the public convenience function.
+        let result = crate::search(&parquet_str, "alice", None, true, false).await
+            .expect("search must succeed");
+        assert!(result.found, "'alice' must be found in the disk-backed index");
+        assert_eq!(result.verified_matches.unwrap().total_occurrences, 1);
+
+        let result = crate::search(&parquet_str, "dave", None, true, false).await
+            .expect("search for absent keyword must not error");
+        assert!(!result.found, "'dave' was never indexed");
+    }
+
 }

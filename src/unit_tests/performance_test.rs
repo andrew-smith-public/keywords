@@ -895,7 +895,7 @@ mod tests {
         println!("Building keyword index...");
         let index_start = Instant::now();
 
-        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None, None, None, None, None).await?;
+        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None, None, None, None, None, None).await?;
 
         let index_time = index_start.elapsed();
         println!("Index built in: {:?}\n", index_time);
@@ -1222,7 +1222,7 @@ mod tests {
                     row_ranges.push(RowRange {
                         start_row: flat_row.row.to_native(),  // Convert from archived
                         end_row: flat_row.row.to_native() + flat_row.additional_rows.to_native(),
-                        splits_matched: flat_row.splits_matched.to_native(),
+                        splits_matched: flat_row.splits_matched.as_ref().map(|v| v.to_native()),
                         parent_chunk: flat_row.parent_chunk.as_ref().map(|c| c.to_native()),
                         parent_position: flat_row.parent_position.as_ref().map(|p| p.to_native()),
                     });
@@ -1658,7 +1658,7 @@ mod tests {
         println!("Building keyword index...");
         let index_start = Instant::now();
 
-        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None, None, None, None, None).await?;
+        build_and_save_index(&file_path, None, Some(0.01), index_file_prefix, None, None, None, None, None, None, None).await?;
 
         let index_time = index_start.elapsed();
         println!("Index built in: {:?}\n", index_time);
@@ -1984,7 +1984,7 @@ mod tests {
                     row_ranges.push(RowRange {
                         start_row: flat_row.row.to_native(),  // Convert from archived
                         end_row: flat_row.row.to_native() + flat_row.additional_rows.to_native(),
-                        splits_matched: flat_row.splits_matched.to_native(),
+                        splits_matched: flat_row.splits_matched.as_ref().map(|v| v.to_native()),
                         parent_chunk: flat_row.parent_chunk.as_ref().map(|c| c.to_native()),
                         parent_position: flat_row.parent_position.as_ref().map(|p| p.to_native()),
                     });

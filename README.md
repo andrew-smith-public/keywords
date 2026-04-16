@@ -79,20 +79,27 @@ keywords --help
 ### Library Usage
 
 ```rust
-use keywords::{build_and_save_index, search};
+use keywords::{build_and_save_index, search, search_and_read};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Build an index
-    build_and_save_index("data.parquet", None, None, None).await?;
+    // Build an index (all optional parameters set to None for defaults)
+    build_and_save_index("data.parquet", None, None, None, None, None, None, None, None, None, None).await?;
 
-    // Search for a keyword
-    let result = search("data.parquet", "example", None, true).await?;
+    // Search for a keyword (contains mode — finds "example" even in "user@example.com")
+    let result = search("data.parquet", "example", None, true, false).await?;
 
     if let Some(data) = result.verified_matches {
         println!("Found in columns: {:?}", data.columns);
         println!("Total occurrences: {}", data.total_occurrences);
     }
+
+    // Search with exact match (equals mode — only finds rows where value IS "example")
+    let result = search("data.parquet", "example", None, true, true).await?;
+
+    // Search and read matching rows from the Parquet file in one call
+    let (result, batches) = search_and_read("data.parquet", "example", None, true, false).await?;
+    println!("Read {} matching rows", batches.iter().map(|b| b.num_rows()).sum::<usize>());
 
     Ok(())
 }
@@ -132,6 +139,12 @@ data.parquet.index/
 - Binary search for chunk location
 - Exact match within chunks
 - Parent keyword verification for phrases
+- Two search modes via `SearchMode`: Contains (default, matches sub-tokens) and Equals (matches only exact column values using `splits_matched` bit 0 filtering)
+
+#### 3b. **Pruned Reader** (`searching/pruned_reader.rs`)
+- Reads only the Parquet rows identified by the search
+- Deduplicates overlapping row ranges across columns
+- Verifies `needs_verification` rows against actual Parquet column values using the same string conversion as indexing
 
 #### 4. **Column Filters** (`index_structure/column_filter.rs`)
 - Automatic selection between Bloom filter and HashSet
@@ -301,10 +314,13 @@ A **129x** speedup
 - Binary search to locate data chunks
 - Parent keyword verification without Parquet access
 - Configurable column filtering
+- **Two search modes**: Contains (find keyword anywhere, including as a sub-token) and Equals (find only rows where the column value exactly matches the keyword)
+- **End-to-end search+read**: `search_and_read` queries the index and reads matching Parquet rows in one call, with automatic verification of `needs_verification` rows against actual column values
 
 ### Phrase Search
 - Multi-token phrase matching using parent relationships
 - Can verify some multi-token matches without reading the Parquet file
+- When the search phrase itself is stored as a keyword, the search uses a direct keyword lookup (fast path) rather than multi-token parent verification
 
 ### Cloud Storage Support
 - Architecture designed for cloud storage (S3, Azure, GCP via `object_store` crate)
@@ -393,66 +409,56 @@ Current implementation has the following constraints (appropriate for POC phase)
 
 High-cardinality columns with many rows per keyword can create excessively large indexes that provide minimal performance benefit over direct Parquet filtering. When a keyword appears in many rows, storing detailed row-level information for each occurrence may cause the index to grow disproportionately to the benefit provided.
 
-### Current Behavior
-
-The index currently stores complete row-level detail for every keyword occurrence, including:
-- Row numbers with run-length encoding
-- Row group mappings
-- Parent keyword relationships for phrase search
-- Split-level metadata
-- Block compression in data.bin
-
-For keywords appearing in a small to moderate number of rows, this provides excellent search performance with minimal overhead. However, for very common keywords appearing across many rows, the index size can grow substantially while providing diminishing returns.
-
-### Planned Solution
+### What's Implemented
 
 A threshold-based approach that gracefully degrades behavior for high-frequency keywords:
 
-**1. Row Information Threshold** (configurable parameter requiring profiling)
-- Keywords below threshold: Store full row details (current behavior)
-- Keywords above threshold: Switch to summary-only storage
+**1. Row Information Thresholds** (complete)
+- Keywords below threshold: Store full row details with parent tracking and split-level information
+- Keywords above threshold: Parent tracking and split-level information eliminated, rows merged aggressively via RLE
+- Configurable via `parent_tracking_threshold` and `split_elimination_threshold` parameters
 
-The optimal threshold value depends on the specific dataset characteristics and would need to be determined through profiling and measurement.
+**2. Search Behavior Adaptation** (complete)
+- **Selective keywords** (below threshold): Use indexed row details for instant verified results
+- **Common keywords** (above threshold): Row-level `splits_matched` set to `None`, search classifies these as `needs_verification`
+- **Automatic verification**: `search_and_read` reads `needs_verification` rows from the Parquet file and verifies them against actual column values
+- **Clear result indication**: `SearchResult` distinguishes between `verified_matches` (confirmed from index) and `needs_verification` (requires Parquet read)
 
-**2. Degraded Storage Mode** (for keywords exceeding threshold)
-Instead of storing every row occurrence, store only:
-- Keyword existence in column (bloom filter - already present)
-- Approximate occurrence count
-- Row group statistics (which row groups contain the keyword, not individual rows)
-- Indication that this keyword is in "high-frequency mode"
+**3. Contains vs Equals search modes** (complete)
+- Contains mode (default): Finds keywords wherever they appear, including as sub-tokens of split values
+- Equals mode: Only matches rows where the column value exactly equals the search term, using `splits_matched` bit 0 filtering
 
-**3. Search Behavior Adaptation**
-- **Selective keywords** (below threshold): Use indexed row details for instant results
-- **Common keywords** (above threshold): Return indication that Parquet-level filtering is needed
-- **Clear result indication**: `SearchResult` distinguishes between verified matches (from index) and high-frequency keywords requiring verification
+### What's Still Needed
 
-**4. Trade-off Analysis**
+**4. Per-column data reduction for eliminated keywords** (future)
+- When split elimination fires on the aggregate column (column 0), per-column row data is still stored in full in `data.bin`, leading to large chunk sizes for high-frequency keywords (e.g. 6MB for keyword "1" in NYC Taxi data)
+- Stripping per-column row data for keywords where the aggregate has been split-eliminated would dramatically reduce `data.bin` size
 
-This approach provides several benefits:
-
-| Aspect | Benefit |
-|--------|---------|
-| **Index Size** | Prevents index from growing larger than the Parquet file itself |
-| **Memory** | Keeps memory requirements predictable and bounded |
-| **Search Speed** | Maintains fast searches for selective queries while being honest about limitations for common terms |
-| **Practicality** | Very common keywords typically indicate the term isn't selective enough for index optimization anyway |
-
-The system would provide clear user feedback when searches encounter high-frequency keywords, suggesting either Parquet-level filtering or more specific search terms.
+**5. Index size vs Parquet size ratio** (future)
+- For numeric-heavy data where most values become searchable keywords, the index can exceed the Parquet file size
+- Further work is needed on selective indexing strategies and storage trade-offs to keep the index proportional
 
 ### Implementation Status
 
-**Current State**: All keywords store full row detail regardless of frequency. The system works well for datasets with moderate keyword frequencies.
+**Current State**: Threshold-based parent tracking and split elimination are fully implemented via the `parent_tracking_threshold` and `split_elimination_threshold` parameters on `build_and_save_index` and `build_index_in_memory`.
 
-**Threshold Approach**: Designed but not yet implemented. The architecture already supports different storage strategies (bloom filter vs HashSet based on size), making this enhancement a natural extension.
+**How It Works**:
+- `parent_tracking_threshold`: A fraction (0.0–1.0) of total rows. Keywords whose Row object count exceeds `threshold × total_rows` have their per-row parent references (`Row.splits_matched`) nullified, causing phrase searches to fall back to a `needs_verification` path rather than being resolved entirely from the index.
+- `split_elimination_threshold`: Same fraction; keywords exceeding this count lose their row-level split detail but are still found by exact-token searches.
+- Both thresholds must be set together — setting only one has no effect (split elimination is gated on the parent threshold check).
 
-**When to Consider Implementing**:
-- If monitoring shows indexes growing disproportionately large relative to Parquet files
-- If common queries frequently return very large result sets
-- If memory constraints during indexing become problematic for production workloads
+**When to Enable**:
+- High-frequency keywords (e.g. common words like "the", "active") cause large Row lists that dominate index size.
+- Set both thresholds to e.g. `Some(0.01)` (1% of rows) to cap row detail for very common keywords.
 
-For the current POC phase, the full-detail approach provides valuable insights into real-world cardinality distributions and helps validate whether the threshold-based approach would provide meaningful benefits for production use cases.
-
-**With Additional Development Time**: Profiling on representative production datasets would inform specific threshold values and validate the memory/performance trade-offs. Additionally, benchmark testing across different data distributions (uniform vs. power-law keyword frequencies) would help quantify when the threshold approach provides meaningful benefits versus the current full-detail implementation.
+```rust
+build_and_save_index(
+    "data.parquet",
+    None, None, None, None, None, None, None, None,
+    Some(0.01),  // parent_tracking_threshold
+    Some(0.01),  // split_elimination_threshold
+).await?;
+```
 
 ---
 
@@ -476,7 +482,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let error_rate = Some(0.001);
     let exclude_columns = None;
 
-    build_and_save_index("data.parquet", exclude_columns, error_rate, None).await?;
+    build_and_save_index("data.parquet", exclude_columns, error_rate, None, None, None, None, None, None, None, None).await?;
 
     Ok(())
 }
@@ -504,7 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     exclude.insert("updated_at".to_string());       // Time field
     exclude.insert("internal_metadata".to_string()); // Raw JSON, not useful for keyword search
 
-    build_and_save_index("data.parquet", Some(exclude), None, None).await?;
+    build_and_save_index("data.parquet", Some(exclude), None, None, None, None, None, None, None, None, None).await?;
 
     Ok(())
 }
@@ -560,7 +566,7 @@ Single-threaded was chosen for the POC phase to reduce complexity while establis
 - Plain text with line-based processing
 
 **Testing & Validation:**
-- Test on large public datasets (e.g., NYC Taxi Trip Data)
+- ~~Test on large public datasets (e.g., NYC Taxi Trip Data)~~ Completed: NYC Yellow Taxi April 2020 data tested with DataFusion comparison
 - Comprehensive benchmarking suite
 - Memory profiling and optimization
 - Cost analysis (storage vs compute trade-offs)

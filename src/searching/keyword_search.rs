@@ -606,20 +606,31 @@ impl KeywordSearcher {
         in_columns: Option<&str>,
         keyword_only: bool,
     ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.search_with_mode(search_for, in_columns, keyword_only, SearchMode::Contains).await
+    }
+
+    /// Search with explicit match mode (Contains or Equals).
+    ///
+    /// See [`SearchMode`] for the difference between modes.
+    pub async fn search_with_mode(
+        &self,
+        search_for: &str,
+        in_columns: Option<&str>,
+        keyword_only: bool,
+        mode: SearchMode,
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         if keyword_only {
-            // Exact keyword search - all matches are verified
-            let old_result = self.search_keyword_internal_zerocopy(search_for, in_columns).await?;
+            let result = self.search_keyword_internal_zerocopy(search_for, in_columns, mode).await?;
 
             Ok(SearchResult {
                 query: search_for.to_string(),
-                found: old_result.found,
+                found: result.found,
                 tokens: vec![search_for.to_string()],
-                verified_matches: old_result.verified_matches,
-                needs_verification: None,
+                verified_matches: result.verified_matches,
+                needs_verification: result.needs_verification,
             })
         } else {
-            // Phrase search - split tokens and verify
-            self.search_phrase_internal(search_for, in_columns).await
+            self.search_phrase_internal(search_for, in_columns, mode).await
         }
     }
 
@@ -659,7 +670,8 @@ impl KeywordSearcher {
     async fn search_keyword_internal_zerocopy(
         &self,
         keyword: &str,
-        column_filter: Option<&str>
+        column_filter: Option<&str>,
+        mode: SearchMode,
     ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         // Step 1: Check appropriate filter
         if let Some(col_name) = column_filter {
@@ -763,6 +775,24 @@ impl KeywordSearcher {
         // Get only the one item we need (still zero-copy)
         let archived_item = &archived_data[position];
 
+        // For Equals mode: check keyword-level splits_matched for bit 0.
+        // If bit 0 is not set, this keyword was never a root value — it only ever
+        // appeared as a sub-token from splitting.  Return not found.
+        if mode == SearchMode::Equals {
+            let keyword_has_root = archived_item.splits_matched.as_ref()
+                .map(|s| s.to_native().get() & 1 != 0)
+                .unwrap_or(false);
+            if !keyword_has_root {
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
+                    found: false,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
+                });
+            }
+        }
+
         // Determine which column(s) to process
         let filter_to_column_id: Option<u32> = if let Some(col_name) = column_filter {
             let found_id = archived_item.columns.iter()
@@ -792,7 +822,9 @@ impl KeywordSearcher {
 
         // Step 5: Build result - convert ONLY this one keyword's data
         let mut column_details = Vec::new();
+        let mut needs_verif_column_details = Vec::new();
         let mut total_occurrences = 0u64;
+        let mut needs_verif_occurrences = 0u64;
 
         let all_column_ids: Vec<u32> = archived_item.columns.iter()
             .map(|col| col.column_id.to_native())
@@ -817,10 +849,12 @@ impl KeywordSearcher {
             };
 
             let mut row_groups = Vec::new();
+            let mut needs_verif_row_groups = Vec::new();
 
             for rg in col.row_groups.iter() {
                 let row_group_id: u16 = rg.row_group_id.to_native();
                 let mut row_ranges = Vec::new();
+                let mut needs_verif_ranges = Vec::new();
 
                 for flat_row in rg.rows.iter() {
                     let row: u32 = flat_row.row.to_native();
@@ -830,36 +864,86 @@ impl KeywordSearcher {
                     let parent_chunk: Option<u16> = flat_row.parent_chunk.as_ref().map(|c| c.to_native());
                     let parent_position: Option<u16> = flat_row.parent_position.as_ref().map(|p| p.to_native());
 
-                    row_ranges.push(RowRange {
+                    let range = RowRange {
                         start_row: row,
                         end_row: row + additional_rows,
                         splits_matched,
                         parent_chunk,
                         parent_position,
-                    });
+                    };
+                    let num_rows = additional_rows as u64 + 1;
 
-                    total_occurrences = total_occurrences.saturating_add(additional_rows as u64 + 1);
+                    if mode == SearchMode::Equals {
+                        match splits_matched {
+                            Some(sm) if sm.get() & 1 != 0 => {
+                                // Bit 0 set: this is a root value → verified equals
+                                row_ranges.push(range);
+                                total_occurrences = total_occurrences.saturating_add(num_rows);
+                            }
+                            None => {
+                                // Split-eliminated: can't tell → needs verification
+                                needs_verif_ranges.push(range);
+                                needs_verif_occurrences = needs_verif_occurrences.saturating_add(num_rows);
+                            }
+                            _ => {
+                                // No bit 0: sub-token only → skip
+                            }
+                        }
+                    } else {
+                        row_ranges.push(range);
+                        total_occurrences = total_occurrences.saturating_add(num_rows);
+                    }
                 }
 
-                row_groups.push(RowGroupLocation {
-                    row_group_id,
-                    row_ranges,
-                });
+                if !row_ranges.is_empty() {
+                    row_groups.push(RowGroupLocation {
+                        row_group_id,
+                        row_ranges,
+                    });
+                }
+                if !needs_verif_ranges.is_empty() {
+                    needs_verif_row_groups.push(RowGroupLocation {
+                        row_group_id,
+                        row_ranges: needs_verif_ranges,
+                    });
+                }
             }
 
-            column_details.push(ColumnLocation {
-                column_name,
-                row_groups,
-            });
+            if !row_groups.is_empty() {
+                column_details.push(ColumnLocation {
+                    column_name: column_name.clone(),
+                    row_groups,
+                });
+            }
+            if !needs_verif_row_groups.is_empty() {
+                needs_verif_column_details.push(ColumnLocation {
+                    column_name,
+                    row_groups: needs_verif_row_groups,
+                });
+            }
         }
 
         if filter_to_column_id == Some(0) && !column_details.is_empty() {
             let aggregate_row_groups = column_details[0].row_groups.clone();
             column_details.clear();
 
-            for column_id in all_column_ids {
-                if let Some(column_name) = self.filters.column_pool.get(column_id) {
+            for column_id in &all_column_ids {
+                if let Some(column_name) = self.filters.column_pool.get(*column_id) {
                     column_details.push(ColumnLocation {
+                        column_name: column_name.to_string(),
+                        row_groups: aggregate_row_groups.clone(),
+                    });
+                }
+            }
+        }
+
+        if filter_to_column_id == Some(0) && !needs_verif_column_details.is_empty() {
+            let aggregate_row_groups = needs_verif_column_details[0].row_groups.clone();
+            needs_verif_column_details.clear();
+
+            for column_id in &all_column_ids {
+                if let Some(column_name) = self.filters.column_pool.get(*column_id) {
+                    needs_verif_column_details.push(ColumnLocation {
                         column_name: column_name.to_string(),
                         row_groups: aggregate_row_groups.clone(),
                     });
@@ -880,18 +964,39 @@ impl KeywordSearcher {
                 .collect()
         };
 
+        let keyword_splits = archived_item.splits_matched.as_ref()
+            .map(|s| s.to_native());
+
+        let found = !column_details.is_empty() || !needs_verif_column_details.is_empty();
+
+        let verified = if !column_details.is_empty() {
+            Some(KeywordLocationData {
+                columns: columns.clone(),
+                total_occurrences,
+                splits_matched: keyword_splits,
+                column_details,
+            })
+        } else {
+            None
+        };
+
+        let needs_verification = if !needs_verif_column_details.is_empty() {
+            Some(KeywordLocationData {
+                columns,
+                total_occurrences: needs_verif_occurrences,
+                splits_matched: keyword_splits,
+                column_details: needs_verif_column_details,
+            })
+        } else {
+            None
+        };
+
         Ok(SearchResult {
             query: keyword.to_string(),
-            found: true,
+            found,
             tokens: vec![keyword.to_string()],
-            verified_matches: Some(KeywordLocationData {
-                columns,
-                total_occurrences,
-                splits_matched: archived_item.splits_matched.as_ref()
-                    .map(|s| s.to_native()),
-                column_details,
-            }),
-            needs_verification: None,
+            verified_matches: verified,
+            needs_verification,
         })
     }
 
@@ -926,7 +1031,16 @@ impl KeywordSearcher {
     async fn search_keyword_internal(
         &self,
         keyword: &str,
-        column_filter: Option<&str>
+        column_filter: Option<&str>,
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.search_keyword_internal_with_mode(keyword, column_filter, SearchMode::Contains).await
+    }
+
+    async fn search_keyword_internal_with_mode(
+        &self,
+        keyword: &str,
+        column_filter: Option<&str>,
+        mode: SearchMode,
     ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         // Step 1: Check appropriate filter based on whether we have a column filter
         if let Some(col_name) = column_filter {
@@ -1001,6 +1115,22 @@ impl KeywordSearcher {
         // Step 4: Get the keyword data
         let archived_data = &chunk_data[position];
 
+        // For Equals mode: check keyword-level splits_matched for bit 0.
+        if mode == SearchMode::Equals {
+            let keyword_has_root = archived_data.splits_matched
+                .map(|s| s.get() & 1 != 0)
+                .unwrap_or(false);
+            if !keyword_has_root {
+                return Ok(SearchResult {
+                    query: keyword.to_string(),
+                    found: false,
+                    tokens: vec![keyword.to_string()],
+                    verified_matches: None,
+                    needs_verification: None,
+                });
+            }
+        }
+
         // Determine which column(s) to process
         // When column_filter is None, use column_id 0 (aggregate of all columns)
         // When column_filter is Some, process only that specific column
@@ -1037,7 +1167,9 @@ impl KeywordSearcher {
 
         // Step 5: Convert to owned types and build result
         let mut column_details = Vec::new();
+        let mut needs_verif_column_details = Vec::new();
         let mut total_occurrences = 0u64;
+        let mut needs_verif_occurrences = 0u64;
 
         // Collect all column IDs for later expansion if using aggregate
         let all_column_ids: Vec<u32> = archived_data.columns.iter()
@@ -1048,16 +1180,13 @@ impl KeywordSearcher {
         for col in &archived_data.columns {
             let column_id: u32 = col.column_id;
 
-            // Apply column filter
             if let Some(target_id) = filter_to_column_id {
                 if column_id != target_id {
                     continue;
                 }
             }
 
-            // Get column name
             let column_name = if column_id == 0 {
-                // Column 0 is the aggregate - use a special name
                 "_all_columns_aggregate_".to_string()
             } else {
                 self.filters.column_pool.get(column_id)
@@ -1066,39 +1195,55 @@ impl KeywordSearcher {
             };
 
             let mut row_groups = Vec::new();
+            let mut needs_verif_row_groups = Vec::new();
 
             for rg in &col.row_groups {
                 let row_group_id: u16 = rg.row_group_id;
                 let mut row_ranges = Vec::new();
+                let mut needs_verif_ranges = Vec::new();
 
                 for flat_row in &rg.rows {
-                    let row: u32 = flat_row.row;
-                    let additional_rows: u32 = flat_row.additional_rows;
-                    let splits_matched: Option<std::num::NonZeroU16> = flat_row.splits_matched;
-                    let parent_chunk: Option<u16> = flat_row.parent_chunk;
-                    let parent_position: Option<u16> = flat_row.parent_position;
+                    let range = RowRange {
+                        start_row: flat_row.row,
+                        end_row: flat_row.row + flat_row.additional_rows,
+                        splits_matched: flat_row.splits_matched,
+                        parent_chunk: flat_row.parent_chunk,
+                        parent_position: flat_row.parent_position,
+                    };
+                    let num_rows = flat_row.additional_rows as u64 + 1;
 
-                    row_ranges.push(RowRange {
-                        start_row: row,
-                        end_row: row + additional_rows,
-                        splits_matched,
-                        parent_chunk,
-                        parent_position,
-                    });
-
-                    total_occurrences = total_occurrences.saturating_add(additional_rows as u64 + 1);
+                    if mode == SearchMode::Equals {
+                        match flat_row.splits_matched {
+                            Some(sm) if sm.get() & 1 != 0 => {
+                                row_ranges.push(range);
+                                total_occurrences = total_occurrences.saturating_add(num_rows);
+                            }
+                            None => {
+                                needs_verif_ranges.push(range);
+                                needs_verif_occurrences = needs_verif_occurrences.saturating_add(num_rows);
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        row_ranges.push(range);
+                        total_occurrences = total_occurrences.saturating_add(num_rows);
+                    }
                 }
 
-                row_groups.push(RowGroupLocation {
-                    row_group_id,
-                    row_ranges,
-                });
+                if !row_ranges.is_empty() {
+                    row_groups.push(RowGroupLocation { row_group_id, row_ranges });
+                }
+                if !needs_verif_ranges.is_empty() {
+                    needs_verif_row_groups.push(RowGroupLocation { row_group_id, row_ranges: needs_verif_ranges });
+                }
             }
 
-            column_details.push(ColumnLocation {
-                column_name,
-                row_groups,
-            });
+            if !row_groups.is_empty() {
+                column_details.push(ColumnLocation { column_name: column_name.clone(), row_groups });
+            }
+            if !needs_verif_row_groups.is_empty() {
+                needs_verif_column_details.push(ColumnLocation { column_name, row_groups: needs_verif_row_groups });
+            }
         }
 
         // TODO: Performance Optimization - Reduce memory duplication when expanding aggregate
@@ -1119,16 +1264,11 @@ impl KeywordSearcher {
         // This is negligible compared to index I/O (ms scale) and acceptable for POC.
         // Profile before optimizing!
 
-        // If we used column_id 0 (aggregate), expand it to actual columns
-        // This ensures column_details has entries for each actual column, not just "_all_columns_aggregate_"
         if filter_to_column_id == Some(0) && !column_details.is_empty() {
-            // Extract the aggregate row group data
             let aggregate_row_groups = column_details[0].row_groups.clone();
             column_details.clear();
-
-            // Create one ColumnLocation per actual column, all sharing the same row group data
-            for column_id in all_column_ids {
-                if let Some(column_name) = self.filters.column_pool.get(column_id) {
+            for column_id in &all_column_ids {
+                if let Some(column_name) = self.filters.column_pool.get(*column_id) {
                     column_details.push(ColumnLocation {
                         column_name: column_name.to_string(),
                         row_groups: aggregate_row_groups.clone(),
@@ -1136,37 +1276,63 @@ impl KeywordSearcher {
                 }
             }
         }
+        if filter_to_column_id == Some(0) && !needs_verif_column_details.is_empty() {
+            let aggregate_row_groups = needs_verif_column_details[0].row_groups.clone();
+            needs_verif_column_details.clear();
+            for column_id in &all_column_ids {
+                if let Some(column_name) = self.filters.column_pool.get(*column_id) {
+                    needs_verif_column_details.push(ColumnLocation {
+                        column_name: column_name.to_string(),
+                        row_groups: aggregate_row_groups.clone(),
+                    });
+                }
+            }
+        }
 
-
-        // Build column list
-        // When we used column_id 0, we need to get the actual column names from archived_data.columns
-        // When we used a specific column, we already have it in column_details
         let columns: Vec<String> = if filter_to_column_id == Some(0) {
-            // We used the aggregate (column_id 0), so get actual column names
             archived_data.columns.iter()
                 .map(|col| col.column_id)
-                .filter(|&id| id != 0)  // Skip column_id 0
+                .filter(|&id| id != 0)
                 .filter_map(|id| self.filters.column_pool.get(id))
                 .map(|s| s.to_string())
                 .collect()
         } else {
-            // We used a specific column, get it from column_details
             column_details.iter()
                 .map(|cd| cd.column_name.clone())
                 .collect()
         };
 
+        let keyword_splits = archived_data.splits_matched;
+        let found = !column_details.is_empty() || !needs_verif_column_details.is_empty();
+
+        let verified = if !column_details.is_empty() {
+            Some(KeywordLocationData {
+                columns: columns.clone(),
+                total_occurrences,
+                splits_matched: keyword_splits,
+                column_details,
+            })
+        } else {
+            None
+        };
+
+        let needs_verification = if !needs_verif_column_details.is_empty() {
+            Some(KeywordLocationData {
+                columns,
+                total_occurrences: needs_verif_occurrences,
+                splits_matched: keyword_splits,
+                column_details: needs_verif_column_details,
+            })
+        } else {
+            None
+        };
+
         Ok(SearchResult {
             query: keyword.to_string(),
-            found: true,
+            found,
             tokens: vec![keyword.to_string()],
-            verified_matches: Some(KeywordLocationData {
-                columns,
-                total_occurrences,
-                splits_matched: archived_data.splits_matched,
-                column_details,
-            }),
-            needs_verification: None,
+            verified_matches: verified,
+            needs_verification,
         })
     }
 
@@ -1214,14 +1380,18 @@ impl KeywordSearcher {
         match self.filters.chunk_index.binary_search_by(|chunk| {
             chunk.start_keyword.as_str().cmp(keyword)
         }) {
-            Ok(idx) => Some((idx as u16, &self.filters.chunk_index[idx])),
+            Ok(idx) => {
+                assert!(idx <= u16::MAX as usize, "Chunk index {} overflows u16", idx);
+                Some((idx as u16, &self.filters.chunk_index[idx]))
+            }
             Err(idx) => {
                 if idx == 0 {
                     // Keyword is before first chunk - still check first chunk
                     Some((0, &self.filters.chunk_index[0]))
                 } else {
-                    // Keyword belongs to previous chunk
-                    Some(((idx - 1) as u16, &self.filters.chunk_index[idx - 1]))
+                    let chunk_idx = idx - 1;
+                    assert!(chunk_idx <= u16::MAX as usize, "Chunk index {} overflows u16", chunk_idx);
+                    Some((chunk_idx as u16, &self.filters.chunk_index[chunk_idx]))
                 }
             }
         }
@@ -1886,7 +2056,7 @@ impl KeywordSearcher {
     ///     Ok(())
     /// }
     /// ```
-    async fn search_phrase_internal(&self, phrase: &str, column_filter: Option<&str>) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn search_phrase_internal(&self, phrase: &str, column_filter: Option<&str>, mode: SearchMode) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         // Split the phrase using the same logic as the index
         let tokens = self.split_phrase(phrase);
 
@@ -1900,27 +2070,58 @@ impl KeywordSearcher {
             });
         }
 
-        // If single token, use regular search
+        // If single token, use the mode-aware keyword search
         if tokens.len() == 1 {
-            let result = self.search_keyword_internal(&tokens[0], column_filter).await?;
+            let result = self.search_keyword_internal_with_mode(&tokens[0], column_filter, mode).await?;
 
-            // Single token always returns verified matches
             return Ok(SearchResult {
                 query: phrase.to_string(),
                 tokens,
                 found: result.found,
                 verified_matches: result.verified_matches,
-                needs_verification: None,
+                needs_verification: result.needs_verification,
             });
         }
 
-        // Search for each token
-        // Note: We don't fail if a token isn't found - it might be an intermediate
-        // parent that wasn't indexed separately. We'll find it through parent verification.
+        // If the phrase itself is one of the tokens (e.g., "user-name" splits into
+        // ["name", "user", "user-name"]), search for it directly as a keyword.
+        //
+        // For Equals mode: this is a fast path — we only want rows where the value IS
+        // the phrase, so the direct keyword lookup with Equals filtering is sufficient.
+        //
+        // For Contains mode: the multi-token path below handles everything, including
+        // rows where the value IS the phrase (via the parent-skip fix in
+        // find_and_verify_multi_token_matches) and rows where a larger value contains
+        // the phrase.  No shortcut needed.
+        if mode == SearchMode::Equals && tokens.contains(&phrase.to_string()) {
+            let result = self.search_keyword_internal_with_mode(phrase, column_filter, mode).await?;
+            if result.found {
+                return Ok(SearchResult {
+                    query: phrase.to_string(),
+                    tokens,
+                    found: true,
+                    verified_matches: result.verified_matches,
+                    needs_verification: result.needs_verification,
+                });
+            }
+        }
+
+        // Multi-token phrase search always uses Contains for individual token lookups —
+        // the mode (Equals vs Contains) applies to the overall phrase verification below.
         let mut token_results = Vec::new();
         let mut found_tokens = Vec::new();
 
         for token in &tokens {
+            // Skip the phrase token itself in the multi-token search.  When the phrase
+            // is stored as a keyword (store_full_keyword=true), including it causes two
+            // problems: (1) it has parent=None which breaks the "all same parent" check,
+            // and (2) it only exists for rows where the value IS the phrase, so the "all
+            // tokens in row" intersection excludes containment matches (e.g., "user-name"
+            // keyword doesn't exist for value "user-name-extra").  The sub-tokens alone
+            // are sufficient for parent-chain verification.
+            if token == phrase {
+                continue;
+            }
             let result = self.search_keyword_internal(token, column_filter).await?;
             if result.found {
                 token_results.push(result);
@@ -1941,7 +2142,7 @@ impl KeywordSearcher {
 
         // Find rows where ALL tokens exist in the same column and check parents
         let (confirmed, needs_verification) =
-            self.find_and_verify_multi_token_matches(phrase, &token_results).await?;
+            self.find_and_verify_multi_token_matches(phrase, &token_results, mode).await?;
 
         let found = !confirmed.is_empty() || !needs_verification.is_empty();
 
@@ -2188,6 +2389,7 @@ impl KeywordSearcher {
         &self,
         phrase: &str,
         token_results: &[SearchResult],
+        mode: SearchMode,
     ) -> Result<(Vec<PotentialMatch>, Vec<PotentialMatch>), Box<dyn std::error::Error + Send + Sync>> {
         let mut confirmed_matches = Vec::new();
         let mut needs_verification = Vec::new();
@@ -2336,17 +2538,16 @@ impl KeywordSearcher {
                                 .any(|s| s.is_none());
 
                             let status = if any_split_info_missing {
-                                // If split info is missing for any token, we can't reliably verify
-                                // Must read Parquet to confirm match
                                 MatchStatus::NeedsVerification {
                                     reason: "Split-level information unavailable for one or more tokens".to_string()
                                 }
                             } else {
-                                // All tokens have split info - verify using parent keywords
+                                // All non-phrase tokens have split info - verify using parent keywords
                                 self.verify_match_with_parent(
                                     phrase,
                                     &all_parent_refs,
                                     &parent_keywords,
+                                    mode,
                                 ).await
                             };
 
@@ -2461,6 +2662,7 @@ impl KeywordSearcher {
         phrase: &str,
         parent_refs: &[(Option<u16>, Option<u16>)],
         parent_keywords: &HashMap<(u16, u16), String>,
+        mode: SearchMode,
     ) -> MatchStatus {
         // Check if all tokens have the same parent
         let first_parent = parent_refs[0];
@@ -2477,13 +2679,27 @@ impl KeywordSearcher {
                 // Look up parent keyword from batch results
                 match parent_keywords.get(&(chunk, position)) {
                     Some(parent_keyword) => {
-                        // Check if the phrase exists as substring in parent
-                        if parent_keyword.contains(phrase) {
+                        // For Equals mode: parent must exactly equal the phrase
+                        // For Contains mode: parent must contain the phrase as substring
+                        let matches = if mode == SearchMode::Equals {
+                            parent_keyword == phrase
+                        } else {
+                            parent_keyword.contains(phrase)
+                        };
+
+                        if matches {
                             MatchStatus::Confirmed {
                                 parent_keyword: parent_keyword.clone(),
                             }
+                        } else if mode == SearchMode::Equals {
+                            // For Equals: if parent doesn't equal phrase, this is not a match.
+                            // No need to check grandparents — a grandparent can only be larger.
+                            MatchStatus::Rejected {
+                                parent_keyword: parent_keyword.clone(),
+                                reason: "Parent does not equal phrase".to_string(),
+                            }
                         } else {
-                            // Recurse to check grandparents
+                            // For Contains: recurse to check grandparents
                             let min_phrase_level = self.get_min_phrase_split_level(phrase);
                             self.verify_match_with_ancestors(phrase, parent_keyword, min_phrase_level, 0).await
                         }
@@ -2496,6 +2712,8 @@ impl KeywordSearcher {
                 }
             }
             _ => {
+                // No parent = root token.  For Equals mode on a multi-token phrase,
+                // root tokens with no parent can't form a verified phrase match.
                 MatchStatus::NeedsVerification {
                     reason: "No parent information (root token)".to_string(),
                 }

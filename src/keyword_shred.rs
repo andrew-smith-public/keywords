@@ -415,7 +415,11 @@ impl KeywordOneFile {
                 row.parent_keyword = None;
             }
 
-            // Step 2: Merge duplicate, consecutive, and overlapping rows
+            // Step 2: Sort by row number — rows from different columns may have been
+            // appended out of order (e.g., col_a adds rows 0-4,6-8 then col_b adds row 5)
+            row_group_rows.sort_by_key(|r| r.row);
+
+            // Step 3: Merge duplicate, consecutive, and overlapping rows
             let mut i = 0;
             while i < row_group_rows.len().saturating_sub(1) {
                 let current_end = row_group_rows[i].row + row_group_rows[i].additional_rows as u32;
@@ -425,13 +429,15 @@ impl KeywordOneFile {
                 if current_end + 1 >= next_start
                     && row_group_rows[i].splits_matched == row_group_rows[i + 1].splits_matched
                 {
-                    // Merge: take the maximum extent of both rows
+                    // Merge: take the maximum extent of both rows.
+                    // Keep diff as u32 before comparing against the cap to avoid
+                    // silent truncation when the combined span exceeds u16::MAX.
                     let merged_end = current_end.max(next_end);
-                    let new_additional = (merged_end - row_group_rows[i].row) as u16;
+                    let diff = merged_end - row_group_rows[i].row; // u32
 
-                    if new_additional <= ADDITIONAL_ROWS_CAP {
+                    if diff <= ADDITIONAL_ROWS_CAP as u32 {
                         // Normal merge: expand current row's range and remove next
-                        row_group_rows[i].additional_rows = new_additional;
+                        row_group_rows[i].additional_rows = diff as u16;
                         row_group_rows.remove(i + 1);
                         // Don't increment i - check if we can merge with next row too
                         continue;
@@ -446,7 +452,8 @@ impl KeywordOneFile {
                         row_group_rows[i + 1].row = new_next_start;
 
                         if new_next_start <= next_original_end {
-                            row_group_rows[i + 1].additional_rows = (next_original_end - new_next_start) as u16;
+                            let remaining = next_original_end - new_next_start; // u32
+                            row_group_rows[i + 1].additional_rows = remaining.min(ADDITIONAL_ROWS_CAP as u32) as u16;
                         } else {
                             // Next row was completely consumed, remove it
                             row_group_rows.remove(i + 1);
@@ -512,13 +519,17 @@ impl KeywordOneFile {
             .map(|row_group| row_group.len())
             .sum();
 
-        for row_group_rows in &mut self.row_group_to_rows[column_idx] {
+        for row_group_rows in self.row_group_to_rows[column_idx].iter_mut() {
             // Step 1: Clear all splits_matched references
             for row in row_group_rows.iter_mut() {
                 row.splits_matched = None;
             }
 
-            // Step 2: Merge all consecutive and overlapping rows (no split level check)
+            // Step 2: Sort by row number — rows from different columns may have been
+            // appended out of order (e.g., col_a adds rows 0-4,6-8 then col_b adds row 5)
+            row_group_rows.sort_by_key(|r| r.row);
+
+            // Step 3: Merge all consecutive and overlapping rows (no split level check)
             let mut i = 0;
             while i < row_group_rows.len().saturating_sub(1) {
                 let current_end = row_group_rows[i].row + row_group_rows[i].additional_rows as u32;
@@ -527,13 +538,15 @@ impl KeywordOneFile {
 
                 // Merge if consecutive or overlapping (no splits_matched check needed - all None)
                 if current_end + 1 >= next_start {
-                    // Merge: take the maximum extent of both rows
+                    // Merge: take the maximum extent of both rows.
+                    // Keep diff as u32 before comparing against the cap to avoid
+                    // silent truncation when the combined span exceeds u16::MAX.
                     let merged_end = current_end.max(next_end);
-                    let new_additional = (merged_end - row_group_rows[i].row) as u16;
+                    let diff = merged_end - row_group_rows[i].row; // u32
 
-                    if new_additional <= ADDITIONAL_ROWS_CAP {
+                    if diff <= ADDITIONAL_ROWS_CAP as u32 {
                         // Normal merge: expand current row's range and remove next
-                        row_group_rows[i].additional_rows = new_additional;
+                        row_group_rows[i].additional_rows = diff as u16;
                         row_group_rows.remove(i + 1);
                         // Don't increment i - check if we can merge with next row too
                         continue;
@@ -547,7 +560,8 @@ impl KeywordOneFile {
                         row_group_rows[i + 1].row = new_next_start;
 
                         if new_next_start <= next_original_end {
-                            row_group_rows[i + 1].additional_rows = (next_original_end - new_next_start) as u16;
+                            let remaining = next_original_end - new_next_start; // u32
+                            row_group_rows[i + 1].additional_rows = remaining.min(ADDITIONAL_ROWS_CAP as u32) as u16;
                         } else {
                             // Next row was completely consumed, remove it
                             row_group_rows.remove(i + 1);
@@ -580,6 +594,7 @@ impl KeywordOneFile {
             "Reconsolidate (eliminate splits) column_idx {}: {} → {} Row objects ({} reduced, {:.1}% reduction)",
             column_idx, count_before, count_after, reduction, reduction_pct
         );
+
     }
 }
 
