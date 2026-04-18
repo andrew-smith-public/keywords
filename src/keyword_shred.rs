@@ -197,6 +197,13 @@ pub struct KeywordOneFile {
     pub(crate) row_group_to_rows: Vec<Vec<Vec<Row>>>,
     pub(crate) parent_tracking_enabled: Vec<bool>,    // Parallel to column_references - tracks if parent is stored
     pub(crate) splits_tracking_enabled: Vec<bool>,    // Parallel to column_references - tracks if splits is stored
+    /// Parallel to `row_group_to_rows`. `sorted_prefix_end[col_idx][rg_idx]`
+    /// is the index up to which `rows` is guaranteed to be sorted + merged.
+    /// New appends go past this boundary; at column-chunk boundaries, once
+    /// both parent and split tracking are disabled for a slot, the tail
+    /// (already sorted by construction) is linearly merged into the prefix
+    /// so col 0 doesn't accumulate cross-column duplicates.
+    pub(crate) sorted_prefix_end: Vec<Vec<usize>>,
 }
 
 impl std::fmt::Display for KeywordOneFile {
@@ -311,6 +318,7 @@ impl KeywordOneFile {
                     {
                         self.row_groups[column_idx_u].push(row_group);
                         self.row_group_to_rows[column_idx_u].push(Vec::new());
+                        self.sorted_prefix_end[column_idx_u].push(0);
                         let new_idx = self.row_groups[column_idx_u].len() - 1;
                         self.add_row(column_idx_u, new_idx, row_number, split_match_bit, parent_keyword);
                     }
@@ -375,6 +383,7 @@ impl KeywordOneFile {
                 self.row_group_to_rows.push(Vec::new());
                 self.parent_tracking_enabled.push(true);  // Start with parent tracking enabled
                 self.splits_tracking_enabled.push(true);  // Start with split tracking enabled
+                self.sorted_prefix_end.push(Vec::new());
                 let new_idx = self.column_references.len() - 1;
                 self.add_group(new_idx, row_group, row_number, split_match_bit, parent_keyword);
             }
@@ -486,6 +495,12 @@ impl KeywordOneFile {
             "Reconsolidate column_idx {}: {} → {} Row objects ({} reduced, {:.1}% reduction)",
             column_idx, count_before, count_after, reduction, reduction_pct
         );
+
+        // The slot is now fully sorted and merged — record the prefix boundary
+        // so later tail appends can be merged into it without re-sorting.
+        for (rg_idx, rg_rows) in self.row_group_to_rows[column_idx].iter().enumerate() {
+            self.sorted_prefix_end[column_idx][rg_idx] = rg_rows.len();
+        }
     }
 
     /// Reconsolidates Row objects for a specific column after eliminating split match information.
@@ -595,6 +610,109 @@ impl KeywordOneFile {
             column_idx, count_before, count_after, reduction, reduction_pct
         );
 
+        // Slot fully sorted + merged — record the prefix boundary.
+        for (rg_idx, rg_rows) in self.row_group_to_rows[column_idx].iter().enumerate() {
+            self.sorted_prefix_end[column_idx][rg_idx] = rg_rows.len();
+        }
+    }
+
+    /// Linearly merge the unsorted tail that accumulated from cross-column
+    /// appends into the already-sorted prefix. Assumes both halves are each
+    /// sorted by `row` ascending (true by construction: the prefix is the
+    /// output of a previous sort/merge; the tail is appended by `add_row`
+    /// in parquet row order within a single column's processing pass).
+    ///
+    /// Total work per row group: O(|prefix| + |tail|). No allocation beyond
+    /// the fresh output `Vec`; `Row` clones are trivial post-elimination
+    /// (`splits_matched = None`, `parent_keyword = None`).
+    ///
+    /// Callers must only invoke this when both `parent_tracking_enabled[col_idx]`
+    /// and `splits_tracking_enabled[col_idx]` are false, otherwise the merge
+    /// would drop distinguishing split/parent metadata.
+    pub(crate) fn merge_sorted_tail(&mut self, column_idx: usize) {
+        for rg_idx in 0..self.row_group_to_rows[column_idx].len() {
+            let boundary = self.sorted_prefix_end[column_idx][rg_idx];
+            let len = self.row_group_to_rows[column_idx][rg_idx].len();
+            if boundary >= len {
+                continue; // no tail to merge
+            }
+
+            let rows = std::mem::take(&mut self.row_group_to_rows[column_idx][rg_idx]);
+            let mut new_rows: Vec<Row> = Vec::with_capacity(rows.len());
+            let mut i = 0;
+            let mut j = boundary;
+
+            // Two-way merge of rows[0..boundary] and rows[boundary..].
+            while i < boundary && j < len {
+                if rows[i].row <= rows[j].row {
+                    push_or_merge_row(&mut new_rows, &rows[i]);
+                    i += 1;
+                } else {
+                    push_or_merge_row(&mut new_rows, &rows[j]);
+                    j += 1;
+                }
+            }
+            while i < boundary {
+                push_or_merge_row(&mut new_rows, &rows[i]);
+                i += 1;
+            }
+            while j < len {
+                push_or_merge_row(&mut new_rows, &rows[j]);
+                j += 1;
+            }
+
+            self.sorted_prefix_end[column_idx][rg_idx] = new_rows.len();
+            self.row_group_to_rows[column_idx][rg_idx] = new_rows;
+        }
+    }
+}
+
+/// Push a row onto the output Vec, merging into the tail entry when adjacent
+/// or overlapping and splitting on `ADDITIONAL_ROWS_CAP`. Assumes post-
+/// elimination rows: `splits_matched = None` and `parent_keyword = None`;
+/// preserves those on any new rows emitted by a cap split.
+fn push_or_merge_row(out: &mut Vec<Row>, row: &Row) {
+    let mut start = row.row;
+    let end = row.row + row.additional_rows as u32;
+
+    if let Some(last) = out.last_mut() {
+        let last_end = last.row + last.additional_rows as u32;
+        if last_end + 1 >= start {
+            // Adjacent or overlapping — try to extend `last`.
+            let merged_end = last_end.max(end);
+            let diff = merged_end - last.row;
+            if diff <= ADDITIONAL_ROWS_CAP as u32 {
+                last.additional_rows = diff as u16;
+                return;
+            }
+            // Cap hit: fill `last` to the cap and push the overflow.
+            last.additional_rows = ADDITIONAL_ROWS_CAP;
+            start = last.row + ADDITIONAL_ROWS_CAP as u32 + 1;
+            // Push remaining runs bounded by the cap.
+            while start <= merged_end {
+                let chunk_len = (merged_end - start).min(ADDITIONAL_ROWS_CAP as u32) as u16;
+                out.push(Row {
+                    row: start,
+                    additional_rows: chunk_len,
+                    splits_matched: None,
+                    parent_keyword: None,
+                });
+                start = start + chunk_len as u32 + 1;
+            }
+            return;
+        }
+    }
+
+    // No merge with tail — push the row, splitting on cap if needed.
+    while start <= end {
+        let chunk_len = (end - start).min(ADDITIONAL_ROWS_CAP as u32) as u16;
+        out.push(Row {
+            row: start,
+            additional_rows: chunk_len,
+            splits_matched: None,
+            parent_keyword: None,
+        });
+        start = start + chunk_len as u32 + 1;
     }
 }
 
@@ -646,6 +764,9 @@ fn create_new_keyword_one_file(
         ],
         parent_tracking_enabled: vec![true, true],  // Start with parent tracking enabled for both columns
         splits_tracking_enabled: vec![true, true],  // Start with split tracking enabled for both columns
+        // Initial sorted prefix is empty — the single initial row counts as
+        // tail. Gets populated as soon as a reconsolidation fires.
+        sorted_prefix_end: vec![vec![0], vec![0]],
     }
 }
 

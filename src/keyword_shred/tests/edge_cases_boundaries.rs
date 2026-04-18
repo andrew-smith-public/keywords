@@ -202,6 +202,7 @@ fn test_reconsolidate_merging_two_max_cap_rows() {
         row_group_to_rows: vec![vec![vec![row_a, row_b]]],
         parent_tracking_enabled: vec![false],
         splits_tracking_enabled: vec![false],
+        sorted_prefix_end: vec![vec![0]],
     };
 
     kof.reconsolidate_column_rows(0);

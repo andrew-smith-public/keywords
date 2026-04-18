@@ -702,6 +702,31 @@ fn check_and_reconsolidate_if_needed(
                         // Exceeded split threshold! Eliminate split info and reconsolidate
                         keyword_data.reconsolidate_column_rows_eliminate_splits(col_idx);
                     }
+                } else if !keyword_data.parent_tracking_enabled[col_idx]
+                    && !keyword_data.splits_tracking_enabled[col_idx]
+                {
+                    // Step 3: Cross-column tail merge. After both eliminations have
+                    // fired for this slot, subsequent columns' processing keeps
+                    // appending rows to the tail — `add_row` only compares against
+                    // the last entry so it can't detect duplicates from earlier
+                    // columns' already-sorted prefix.
+                    //
+                    // Must fire at EVERY column boundary (when any tail exists),
+                    // not behind a size threshold: the linear two-way merge
+                    // requires the tail to be sorted, which is true only for a
+                    // single column's sequential appends. Letting multi-column
+                    // tails accumulate would violate the sortedness assumption
+                    // and produce incorrect output.
+                    let has_tail = keyword_data
+                        .row_group_to_rows[col_idx]
+                        .iter()
+                        .enumerate()
+                        .any(|(rg_idx, rg_rows)| {
+                            rg_rows.len() > keyword_data.sorted_prefix_end[col_idx][rg_idx]
+                        });
+                    if has_tail {
+                        keyword_data.merge_sorted_tail(col_idx);
+                    }
                 }
             }
         }
