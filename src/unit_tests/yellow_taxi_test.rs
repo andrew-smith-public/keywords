@@ -601,49 +601,92 @@ mod yellow_taxi_index_test {
         println!("  Index built in {:.2?}", build_start.elapsed());
 
         // ── Step 3: Keyword index search + read rows ─────────────────────────
-        println!("\nStep 3: Keyword index search_and_read for '1' in passenger_count…");
-        let ki_start = Instant::now();
-        let (ki_result, ki_batches) = crate::search_and_read(
-            &temp_path_str, "1", Some("passenger_count"), false, true,
-        ).await.expect("search_and_read failed");
-        let ki_time = ki_start.elapsed();
+        // Split timing into three phases so we can compare scan-to-scan with
+        // DataFusion: load (setup), index (unique keyword-index work, no
+        // DataFusion equivalent), and scan (parquet read + filter).
+        println!("\nStep 3: Keyword index search+read for '1' in passenger_count…");
+        use crate::searching::keyword_search::KeywordSearcher;
+        use crate::searching::search_results::SearchMode;
+        use crate::searching::pruned_reader::PrunedParquetReader;
+
+        let ki_load_start = Instant::now();
+        let searcher = KeywordSearcher::load(&temp_path_str, None).await
+            .expect("KeywordSearcher::load failed");
+        let ki_load_time = ki_load_start.elapsed();
+
+        let ki_index_start = Instant::now();
+        let ki_result = searcher.search_with_mode(
+            "1", Some("passenger_count"), false, SearchMode::Equals,
+        ).await.expect("search_with_mode failed");
+        let ki_index_time = ki_index_start.elapsed();
         assert!(ki_result.found, "Keyword '1' must be found in passenger_count");
+
+        let ki_scan_start = Instant::now();
+        let reader = PrunedParquetReader::from_path(&temp_path_str).with_metadata_cache(
+            searcher.filters.parquet_metadata_offset,
+            searcher.filters.parquet_metadata_length,
+        );
+        let ki_batches = reader.read_search_result(&ki_result, None).await
+            .expect("read_search_result failed");
+        let ki_scan_time = ki_scan_start.elapsed();
+
+        let ki_total = ki_load_time + ki_index_time + ki_scan_time;
         let ki_rows: usize = ki_batches.iter().map(|b| b.num_rows()).sum();
-        println!("  Found: {} rows in {:.2?}", ki_rows, ki_time);
+        println!(
+            "  load={:.2?}  index={:.2?}  scan={:.2?}  total={:.2?}  rows={}",
+            ki_load_time, ki_index_time, ki_scan_time, ki_total, ki_rows
+        );
 
         // ── Step 4: DataFusion search ────────────────────────────────────────
+        // Split into register (setup — analogous to our load) and scan (execute).
         println!("\nStep 4: DataFusion search (\"passenger_count\" = 1)…");
-        let df_start = Instant::now();
+        let df_reg_start = Instant::now();
         let ctx = SessionContext::new();
         ctx.register_parquet("data", &temp_path_str, Default::default()).await
             .expect("DataFusion parquet registration failed");
+        let df_reg_time = df_reg_start.elapsed();
+
+        let df_scan_start = Instant::now();
         let df = ctx.sql("SELECT * FROM data WHERE \"passenger_count\" = 1").await
             .expect("DataFusion query failed");
         let df_batches = df.collect().await.expect("DataFusion collect failed");
+        let df_scan_time = df_scan_start.elapsed();
+
         let df_rows: usize = df_batches.iter().map(|b| b.num_rows()).sum();
-        let df_time = df_start.elapsed();
-        println!("  Found: {} rows in {:.2?}", df_rows, df_time);
+        let df_total = df_reg_time + df_scan_time;
+        println!(
+            "  register={:.2?}  scan={:.2?}  total={:.2?}  rows={}",
+            df_reg_time, df_scan_time, df_total, df_rows
+        );
 
         // ── Step 5: Summary ──────────────────────────────────────────────────
         println!();
         println!("=============================================================");
-        println!("RESULTS  (both search passenger_count = '1' and read rows)");
+        println!("RESULTS  (passenger_count = '1')");
         println!("=============================================================");
         println!();
-        println!("┌──────────────────────────────────────┬────────────┬────────────┐");
-        println!("│ Approach                             │ Time       │ Rows       │");
-        println!("├──────────────────────────────────────┼────────────┼────────────┤");
-        println!("│ Keyword index + pruned read          │ {:>10.2?} │ {:>10} │",
-                 ki_time, ki_rows);
-        println!("│ DataFusion (predicate pushdown)      │ {:>10.2?} │ {:>10} │",
-                 df_time, df_rows);
-        println!("└──────────────────────────────────────┴────────────┴────────────┘");
+        println!("┌──────────────────────────────┬────────────┬────────────┬────────────┬────────────┐");
+        println!("│ Approach                     │ Setup      │ Index      │ Scan       │ Total      │");
+        println!("├──────────────────────────────┼────────────┼────────────┼────────────┼────────────┤");
+        println!("│ Keyword index                │ {:>10.2?} │ {:>10.2?} │ {:>10.2?} │ {:>10.2?} │",
+                 ki_load_time, ki_index_time, ki_scan_time, ki_total);
+        println!("│ DataFusion                   │ {:>10.2?} │ {:>10}   │ {:>10.2?} │ {:>10.2?} │",
+                 df_reg_time, "n/a", df_scan_time, df_total);
+        println!("└──────────────────────────────┴────────────┴────────────┴────────────┴────────────┘");
         println!();
-        let ratio = df_time.as_secs_f64() / ki_time.as_secs_f64();
-        if ratio >= 1.0 {
-            println!("Keyword index is {:.2}x faster than DataFusion", ratio);
+
+        // Scan-to-scan is the fair comparison; scan == parquet read + filter.
+        let scan_ratio = df_scan_time.as_secs_f64() / ki_scan_time.as_secs_f64();
+        if scan_ratio >= 1.0 {
+            println!("Scan-only: keyword index is {:.2}x FASTER than DataFusion", scan_ratio);
         } else {
-            println!("Keyword index is {:.2}x slower than DataFusion", 1.0 / ratio);
+            println!("Scan-only: keyword index is {:.2}x slower than DataFusion", 1.0 / scan_ratio);
+        }
+        let total_ratio = df_total.as_secs_f64() / ki_total.as_secs_f64();
+        if total_ratio >= 1.0 {
+            println!("End-to-end: keyword index is {:.2}x FASTER than DataFusion", total_ratio);
+        } else {
+            println!("End-to-end: keyword index is {:.2}x slower than DataFusion", 1.0 / total_ratio);
         }
 
         // Row counts must match
@@ -707,35 +750,58 @@ mod yellow_taxi_index_test {
         println!("  Index built in {:.2?}", build_start.elapsed());
 
         // ── Step 3: Keyword index search all columns + read rows ─────────────
-        println!("\nStep 3: Keyword index search_and_read for '1' (all columns)…");
-        let ki_start = Instant::now();
-        let (ki_result, ki_batches) = crate::search_and_read(
-            &temp_path_str, "1", None, false, true,
-        ).await.expect("search_and_read failed");
-        let ki_time = ki_start.elapsed();
+        // Split timing: load (setup), index (unique keyword-index work, no
+        // DataFusion equivalent), scan (parquet read + filter).
+        println!("\nStep 3: Keyword index search+read for '1' (all columns)…");
+        use crate::searching::keyword_search::KeywordSearcher;
+        use crate::searching::search_results::SearchMode;
+        use crate::searching::pruned_reader::PrunedParquetReader;
+
+        let ki_load_start = Instant::now();
+        let searcher = KeywordSearcher::load(&temp_path_str, None).await
+            .expect("KeywordSearcher::load failed");
+        let ki_load_time = ki_load_start.elapsed();
+
+        let ki_index_start = Instant::now();
+        let ki_result = searcher.search_with_mode(
+            "1", None, false, SearchMode::Equals,
+        ).await.expect("search_with_mode failed");
+        let ki_index_time = ki_index_start.elapsed();
         assert!(ki_result.found, "Keyword '1' must be found");
+
+        let ki_scan_start = Instant::now();
+        let reader = PrunedParquetReader::from_path(&temp_path_str).with_metadata_cache(
+            searcher.filters.parquet_metadata_offset,
+            searcher.filters.parquet_metadata_length,
+        );
+        let ki_batches = reader.read_search_result(&ki_result, None).await
+            .expect("read_search_result failed");
+        let ki_scan_time = ki_scan_start.elapsed();
+
+        let ki_total = ki_load_time + ki_index_time + ki_scan_time;
         let ki_rows: usize = ki_batches.iter().map(|b| b.num_rows()).sum();
 
-        // With exact_match=true and split elimination on the aggregate column,
-        // rows with splits_matched=None go to needs_verification (can't confirm equality
-        // from the index alone).  Rows with splits_matched bit 0 go to verified_matches.
         let verified_count = ki_result.verified_matches.as_ref()
             .map(|v| v.total_occurrences).unwrap_or(0);
         let needs_verif_count = ki_result.needs_verification.as_ref()
             .map(|v| v.total_occurrences).unwrap_or(0);
         let splits_eliminated = ki_result.needs_verification.is_some();
 
-        println!("  Found: {} rows in {:.2?}", ki_rows, ki_time);
+        println!(
+            "  load={:.2?}  index={:.2?}  scan={:.2?}  total={:.2?}  rows={}",
+            ki_load_time, ki_index_time, ki_scan_time, ki_total, ki_rows
+        );
         println!("  Verified: {}, Needs verification: {} (split-eliminated)", verified_count, needs_verif_count);
         println!("  Split elimination applied: {}", splits_eliminated);
 
         // ── Step 4: DataFusion search all columns ────────────────────────────
-        // Build an equivalent query: WHERE any indexed column cast to string = '1'
+        // Split into register (setup — analogous to our load) and scan (execute).
         println!("\nStep 4: DataFusion search (all columns cast to string = '1')…");
-        let df_start = Instant::now();
+        let df_reg_start = Instant::now();
         let ctx = SessionContext::new();
         ctx.register_parquet("data", &temp_path_str, Default::default()).await
             .expect("DataFusion parquet registration failed");
+        let df_reg_time = df_reg_start.elapsed();
 
         // Build OR predicates for all indexed columns.
         // Use numeric comparison (= 1) rather than CAST to VARCHAR, because
@@ -758,33 +824,46 @@ mod yellow_taxi_index_test {
         let sql = format!("SELECT * FROM data WHERE {}", where_clause);
         println!("  SQL: {}", sql);
 
+        let df_scan_start = Instant::now();
         let df = ctx.sql(&sql).await
             .expect("DataFusion query failed");
         let df_batches = df.collect().await.expect("DataFusion collect failed");
+        let df_scan_time = df_scan_start.elapsed();
+
         let df_rows: usize = df_batches.iter().map(|b| b.num_rows()).sum();
-        let df_time = df_start.elapsed();
-        println!("  Found: {} rows in {:.2?}", df_rows, df_time);
+        let df_total = df_reg_time + df_scan_time;
+        println!(
+            "  register={:.2?}  scan={:.2?}  total={:.2?}  rows={}",
+            df_reg_time, df_scan_time, df_total, df_rows
+        );
 
         // ── Step 5: Summary ──────────────────────────────────────────────────
         println!();
         println!("=============================================================");
-        println!("RESULTS  (both search all columns for '1' and read rows)");
+        println!("RESULTS  (all columns = '1')");
         println!("=============================================================");
         println!();
-        println!("┌──────────────────────────────────────┬────────────┬────────────┐");
-        println!("│ Approach                             │ Time       │ Rows       │");
-        println!("├──────────────────────────────────────┼────────────┼────────────┤");
-        println!("│ Keyword index + pruned read          │ {:>10.2?} │ {:>10} │",
-                 ki_time, ki_rows);
-        println!("│ DataFusion (all-column OR scan)      │ {:>10.2?} │ {:>10} │",
-                 df_time, df_rows);
-        println!("└──────────────────────────────────────┴────────────┴────────────┘");
+        println!("┌──────────────────────────────┬────────────┬────────────┬────────────┬────────────┐");
+        println!("│ Approach                     │ Setup      │ Index      │ Scan       │ Total      │");
+        println!("├──────────────────────────────┼────────────┼────────────┼────────────┼────────────┤");
+        println!("│ Keyword index                │ {:>10.2?} │ {:>10.2?} │ {:>10.2?} │ {:>10.2?} │",
+                 ki_load_time, ki_index_time, ki_scan_time, ki_total);
+        println!("│ DataFusion                   │ {:>10.2?} │ {:>10}   │ {:>10.2?} │ {:>10.2?} │",
+                 df_reg_time, "n/a", df_scan_time, df_total);
+        println!("└──────────────────────────────┴────────────┴────────────┴────────────┴────────────┘");
         println!();
-        let ratio = df_time.as_secs_f64() / ki_time.as_secs_f64();
-        if ratio >= 1.0 {
-            println!("Keyword index is {:.2}x faster than DataFusion", ratio);
+
+        let scan_ratio = df_scan_time.as_secs_f64() / ki_scan_time.as_secs_f64();
+        if scan_ratio >= 1.0 {
+            println!("Scan-only: keyword index is {:.2}x FASTER than DataFusion", scan_ratio);
         } else {
-            println!("Keyword index is {:.2}x slower than DataFusion", 1.0 / ratio);
+            println!("Scan-only: keyword index is {:.2}x slower than DataFusion", 1.0 / scan_ratio);
+        }
+        let total_ratio = df_total.as_secs_f64() / ki_total.as_secs_f64();
+        if total_ratio >= 1.0 {
+            println!("End-to-end: keyword index is {:.2}x FASTER than DataFusion", total_ratio);
+        } else {
+            println!("End-to-end: keyword index is {:.2}x slower than DataFusion", 1.0 / total_ratio);
         }
         println!();
         println!("Split elimination applied: {}", splits_eliminated);

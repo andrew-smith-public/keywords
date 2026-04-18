@@ -472,7 +472,10 @@ pub async fn search_and_read(
         return Ok((result, Vec::new()));
     }
 
-    let reader = PrunedParquetReader::from_path(parquet_path);
+    let reader = PrunedParquetReader::from_path(parquet_path).with_metadata_cache(
+        searcher.filters.parquet_metadata_offset,
+        searcher.filters.parquet_metadata_length,
+    );
     let batches = reader.read_search_result(&result, None).await?;
 
     Ok((result, batches))

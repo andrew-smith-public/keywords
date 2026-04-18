@@ -34,12 +34,24 @@
 //! }
 //! ```
 
-use arrow::array::RecordBatch;
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, LargeStringArray, RecordBatch, Scalar, StringArray,
+    UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+};
+use arrow::compute::kernels::boolean::or_kleene;
+use arrow::compute::kernels::cmp;
+use arrow::datatypes::DataType;
+use arrow::error::ArrowError;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
+    RowSelection, RowSelector,
+};
 use parquet::file::reader::FileReader;
 use futures::StreamExt;
+use crate::column_parquet_reader::array_to_string_smart;
 use crate::searching::search_results::{SearchResult, CombinedSearchResult};
 use crate::utils::file_interaction_local_and_cloud::get_object_store;
 use crate::ParquetSource;
@@ -75,7 +87,23 @@ use object_store::path::Path as ObjectPath;
 /// ```
 pub struct PrunedParquetReader {
     source: ParquetSource,
+    /// Optional (offset, length) of the parquet footer, stored in the keyword
+    /// index at build time. When set, lets the reader construct
+    /// `ArrowReaderMetadata` once from a bounded range request instead of
+    /// re-discovering the footer per parallel decode task.
+    metadata_cache: Option<(u64, u64)>,
+    /// Minimum skipped-rows-per-range for parquet `RowSelection` to be worth
+    /// using. Below this, we decode the row group contiguously and apply the
+    /// index ranges as a post-decode positional filter — the selector
+    /// bookkeeping overhead of many tiny ranges outweighs the decode it avoids.
+    /// Tune via [`PrunedParquetReader::with_row_selection_min_skip_per_range`].
+    row_selection_min_skip_per_range: usize,
 }
+
+/// Default threshold for the `RowSelection` fragmentation heuristic. A range
+/// earns its place only if, on average, it causes at least this many rows to
+/// be skipped by the decoder. Tuned empirically; override per-reader.
+pub const DEFAULT_ROW_SELECTION_MIN_SKIP_PER_RANGE: usize = 32;
 
 /// Convert row ranges to a RowSelection for efficient row-level pruning.
 ///
@@ -163,22 +191,342 @@ fn build_row_selection(
     Some(RowSelection::from(selectors))
 }
 
+/// The query string parsed into each native form that might match a column.
+/// Built once per verification read and captured by the predicate closure.
+#[derive(Clone)]
+struct ParsedQuery {
+    raw: Arc<str>,
+    as_i64: Option<i64>,
+    as_u64: Option<u64>,
+    as_bool: Option<bool>,
+}
+
+impl ParsedQuery {
+    fn new(q: &str) -> Self {
+        Self {
+            raw: Arc::from(q),
+            as_i64: q.parse().ok(),
+            as_u64: q.parse().ok(),
+            as_bool: match q {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A predicate compiled against a concrete batch schema — computed once per
+/// task, applied every batch. Pre-resolves:
+/// - each check column's index in the decoded batch (avoids linear field-name
+///   scans every batch),
+/// - each column's query value parsed into its native type (avoids re-parsing
+///   decimals / re-canonicalising floats every batch),
+/// - columns the query can't possibly match are dropped up-front (skipped
+///   entirely at evaluation time).
+#[derive(Clone)]
+struct CompiledPredicate {
+    entries: Vec<CompiledEntry>,
+    raw_query: Arc<str>,
+}
+
+#[derive(Clone)]
+struct CompiledEntry {
+    batch_col_idx: usize,
+    value: CompiledValue,
+}
+
+#[derive(Clone)]
+enum CompiledValue {
+    Utf8,
+    LargeUtf8,
+    Boolean(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    UInt8(u8),
+    UInt16(u16),
+    UInt32(u32),
+    UInt64(u64),
+    Decimal128 { precision: u8, scale: i8, raw: i128 },
+    Float32(f32),
+    Float64(f64),
+    /// Fall back to `array_to_string_smart` comparison at evaluation time —
+    /// used for Decimal256 / Date / Timestamp / Binary and for NaN float
+    /// queries where native eq diverges from index parity.
+    Fallback,
+}
+
+impl CompiledPredicate {
+    fn from_query(
+        schema: &arrow::datatypes::Schema,
+        query: &ParsedQuery,
+        check_columns: &[String],
+    ) -> Self {
+        let mut entries = Vec::with_capacity(check_columns.len());
+        for name in check_columns {
+            let Some(idx) = schema.fields().iter().position(|f| f.name() == name) else {
+                continue;
+            };
+            let dtype = schema.field(idx).data_type();
+            if let Some(value) = CompiledValue::from_type_and_query(dtype, query) {
+                entries.push(CompiledEntry { batch_col_idx: idx, value });
+            }
+        }
+        Self { entries, raw_query: query.raw.clone() }
+    }
+}
+
+impl CompiledValue {
+    fn from_type_and_query(dtype: &DataType, query: &ParsedQuery) -> Option<Self> {
+        let value = match dtype {
+            DataType::Utf8 => Self::Utf8,
+            DataType::LargeUtf8 => Self::LargeUtf8,
+            DataType::Boolean => Self::Boolean(query.as_bool?),
+            DataType::Int8 => Self::Int8(query.as_i64.and_then(|v| i8::try_from(v).ok())?),
+            DataType::Int16 => Self::Int16(query.as_i64.and_then(|v| i16::try_from(v).ok())?),
+            DataType::Int32 => Self::Int32(query.as_i64.and_then(|v| i32::try_from(v).ok())?),
+            DataType::Int64 => Self::Int64(query.as_i64?),
+            DataType::UInt8 => Self::UInt8(query.as_u64.and_then(|v| u8::try_from(v).ok())?),
+            DataType::UInt16 => Self::UInt16(query.as_u64.and_then(|v| u16::try_from(v).ok())?),
+            DataType::UInt32 => Self::UInt32(query.as_u64.and_then(|v| u32::try_from(v).ok())?),
+            DataType::UInt64 => Self::UInt64(query.as_u64?),
+            DataType::Decimal128(precision, scale) => {
+                let raw = parse_decimal_to_i128(query.raw.as_ref(), *scale)?;
+                Self::Decimal128 { precision: *precision, scale: *scale, raw }
+            }
+            DataType::Float32 => {
+                let f = query.raw.parse::<f32>().ok()?;
+                if f.is_nan() {
+                    return Some(Self::Fallback);
+                }
+                let canonical = if f.fract() == 0.0 && f.is_finite() {
+                    format!("{:.0}", f)
+                } else {
+                    f.to_string()
+                };
+                if canonical != query.raw.as_ref() {
+                    return None;
+                }
+                Self::Float32(f)
+            }
+            DataType::Float64 => {
+                let f = query.raw.parse::<f64>().ok()?;
+                if f.is_nan() {
+                    return Some(Self::Fallback);
+                }
+                let canonical = if f.fract() == 0.0 && f.is_finite() {
+                    format!("{:.0}", f)
+                } else {
+                    f.to_string()
+                };
+                if canonical != query.raw.as_ref() {
+                    return None;
+                }
+                Self::Float64(f)
+            }
+            _ => Self::Fallback,
+        };
+        Some(value)
+    }
+}
+
+/// Parse a decimal-text query into its raw `i128` representation at `scale`
+/// decimal digits. Returns `None` when the query can't possibly match: bad
+/// digits, signs in the fractional part, or a fractional part longer than the
+/// column's scale (which would require precision the column doesn't have).
+fn parse_decimal_to_i128(s: &str, scale: i8) -> Option<i128> {
+    if scale < 0 {
+        return None;
+    }
+    let scale = scale as usize;
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = rest.split_once('.').unwrap_or((rest, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !frac_part.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if frac_part.len() > scale {
+        return None;
+    }
+    let mut combined = String::with_capacity(int_part.len() + scale);
+    combined.push_str(int_part);
+    combined.push_str(frac_part);
+    for _ in 0..(scale - frac_part.len()) {
+        combined.push('0');
+    }
+    let mut v: i128 = combined.parse().ok()?;
+    if neg {
+        v = -v;
+    }
+    Some(v)
+}
+
+/// Vectorised equality between a column and a `CompiledValue` scalar.
+fn eq_compiled(
+    array: &ArrayRef,
+    value: &CompiledValue,
+    raw_query: &str,
+) -> Result<BooleanArray, ArrowError> {
+    let lhs: &dyn Array = array.as_ref();
+    let mask = match value {
+        CompiledValue::Utf8 => {
+            let rhs = StringArray::new_scalar(raw_query);
+            cmp::eq(&lhs, &rhs)?
+        }
+        CompiledValue::LargeUtf8 => {
+            let rhs = LargeStringArray::new_scalar(raw_query);
+            cmp::eq(&lhs, &rhs)?
+        }
+        CompiledValue::Boolean(b) => cmp::eq(&lhs, &BooleanArray::new_scalar(*b))?,
+        CompiledValue::Int8(v) => cmp::eq(&lhs, &Int8Array::new_scalar(*v))?,
+        CompiledValue::Int16(v) => cmp::eq(&lhs, &Int16Array::new_scalar(*v))?,
+        CompiledValue::Int32(v) => cmp::eq(&lhs, &Int32Array::new_scalar(*v))?,
+        CompiledValue::Int64(v) => cmp::eq(&lhs, &Int64Array::new_scalar(*v))?,
+        CompiledValue::UInt8(v) => cmp::eq(&lhs, &UInt8Array::new_scalar(*v))?,
+        CompiledValue::UInt16(v) => cmp::eq(&lhs, &UInt16Array::new_scalar(*v))?,
+        CompiledValue::UInt32(v) => cmp::eq(&lhs, &UInt32Array::new_scalar(*v))?,
+        CompiledValue::UInt64(v) => cmp::eq(&lhs, &UInt64Array::new_scalar(*v))?,
+        CompiledValue::Decimal128 { precision, scale, raw } => {
+            let scalar_arr = Decimal128Array::from_iter_values([*raw])
+                .with_precision_and_scale(*precision, *scale)?;
+            let scalar = Scalar::new(scalar_arr);
+            cmp::eq(&lhs, &scalar)?
+        }
+        CompiledValue::Float32(v) => cmp::eq(&lhs, &Float32Array::new_scalar(*v))?,
+        CompiledValue::Float64(v) => cmp::eq(&lhs, &Float64Array::new_scalar(*v))?,
+        CompiledValue::Fallback => {
+            let tmp = array_to_string_smart(array);
+            let tmp_ref: &dyn Array = tmp.as_ref();
+            let rhs = StringArray::new_scalar(raw_query);
+            cmp::eq(&tmp_ref, &rhs)?
+        }
+    };
+    Ok(mask)
+}
+
+/// Compute the OR-of-equality mask for a batch without materialising a filtered
+/// batch. Returned mask is null-safe: a row with NULL in every check column
+/// gets a NULL bit, which `filter_record_batch` treats as exclude. Callers can
+/// combine this with other masks via `and_kleene` before applying.
+///
+/// Short-circuits once every cell is definitely true (`true_count == len`) —
+/// a later `eq` cannot flip anything and the `or_kleene` work would be wasted.
+fn compute_predicate_mask(
+    batch: &RecordBatch,
+    predicate: &CompiledPredicate,
+) -> Result<BooleanArray, ArrowError> {
+    let mut acc: Option<BooleanArray> = None;
+    for entry in &predicate.entries {
+        let column = batch.column(entry.batch_col_idx);
+        let m = eq_compiled(column, &entry.value, predicate.raw_query.as_ref())?;
+        acc = Some(match acc.take() {
+            None => m,
+            Some(prev) => or_kleene(&prev, &m)?,
+        });
+        if acc.as_ref().map_or(false, |a| a.true_count() == a.len()) {
+            break;
+        }
+    }
+    Ok(acc.unwrap_or_else(|| BooleanArray::from(vec![false; batch.num_rows()])))
+}
+
+/// Build a positional BooleanArray for a batch whose rows start at absolute
+/// row-group position `batch_row_offset`. Bit `i` is set iff `(batch_row_offset + i)`
+/// falls inside one of the index ranges. Used when `RowSelection` has been
+/// skipped for fragmentation reasons — this recovers the same positional
+/// filter the decoder would have applied, just one stage later.
+fn build_range_mask_for_batch(
+    batch_row_offset: u32,
+    batch_len: usize,
+    ranges: &[(u32, u32)],
+) -> BooleanArray {
+    let batch_end = batch_row_offset as usize + batch_len;
+    let mut bits = vec![false; batch_len];
+    for &(start, end) in ranges {
+        let start = start as usize;
+        let end_exclusive = end as usize + 1;
+        if end_exclusive <= batch_row_offset as usize || start >= batch_end {
+            continue;
+        }
+        let local_start = start.saturating_sub(batch_row_offset as usize);
+        let local_end = (end_exclusive - batch_row_offset as usize).min(batch_len);
+        for bit in &mut bits[local_start..local_end] {
+            *bit = true;
+        }
+    }
+    BooleanArray::from(bits)
+}
+
+
+/// Load `ArrowReaderMetadata` once so it can be shared across parallel decode
+/// tasks via `ParquetRecordBatchStreamBuilder::new_with_metadata` — each task
+/// then skips its own footer-read + metadata-parse.
+///
+/// Prefers the keyword index's stored `(offset, length)` when available (one
+/// bounded range request for the footer bytes — matches the existing pattern
+/// used by `read_combined_rows_with_metadata`). Falls back to probing via
+/// `ParquetRecordBatchStreamBuilder::new` when no cache is provided, or when
+/// the source is in-memory bytes and we can't cheaply reach the backing store.
+async fn load_arrow_metadata(
+    source: &ParquetSource,
+    metadata_cache: Option<(u64, u64)>,
+    fallback_reader: ParquetObjectReader,
+) -> Result<ArrowReaderMetadata, Box<dyn std::error::Error + Send + Sync>> {
+    if let (Some((offset, length)), ParquetSource::Path(p)) = (metadata_cache, source) {
+        let (store, path) = get_object_store(p).await?;
+        let range = offset..(offset + length);
+        let bytes = store.get_range(&path, range).await?;
+        let reader = parquet::file::reader::SerializedFileReader::new(bytes)?;
+        let parquet_metadata = reader.metadata().clone();
+        return Ok(ArrowReaderMetadata::try_new(
+            Arc::new(parquet_metadata),
+            ArrowReaderOptions::new(),
+        )?);
+    }
+
+    // Fallback: probe the file via a throwaway builder.
+    let builder = ParquetRecordBatchStreamBuilder::new(fallback_reader).await?;
+    Ok(ArrowReaderMetadata::try_new(
+        builder.metadata().clone(),
+        ArrowReaderOptions::new(),
+    )?)
+}
+
 /// Collect row ranges from a KeywordLocationData into per-row-group sorted,
-/// non-overlapping ranges.  Merges overlapping or adjacent ranges so each
-/// physical row appears at most once, even when the same row matches in
-/// multiple columns.
+/// non-overlapping ranges. Merges overlapping or adjacent ranges so each
+/// physical row appears at most once.
+///
+/// Only `column_details[0]` is consumed. Safe in every search mode:
+/// - Specific-column search (`keyword_search.rs:1163-1187`): the column loop
+///   `continue`s past every non-target column, so `column_details` has exactly
+///   one entry with that column's ranges.
+/// - Aggregate search (`keyword_search.rs:1267-1290`): column 0's single entry
+///   is cloned N times into per-column slots for API shape. Every clone holds
+///   identical range data — iterating all N would push the same ranges N times
+///   into the merge vec and inflate `sort_unstable` for zero new information.
 fn collect_merged_ranges(
     data: &crate::searching::search_results::KeywordLocationData,
     row_groups_to_read: &mut std::collections::HashSet<usize>,
     row_group_ranges: &mut std::collections::HashMap<u16, Vec<(u32, u32)>>,
 ) {
-    for col_detail in &data.column_details {
-        for rg in &col_detail.row_groups {
-            row_groups_to_read.insert(rg.row_group_id as usize);
-            let ranges = row_group_ranges.entry(rg.row_group_id).or_insert_with(Vec::new);
-            for range in &rg.row_ranges {
-                ranges.push((range.start_row, range.end_row));
-            }
+    let Some(col_detail) = data.column_details.first() else {
+        return;
+    };
+    for rg in &col_detail.row_groups {
+        row_groups_to_read.insert(rg.row_group_id as usize);
+        let ranges = row_group_ranges.entry(rg.row_group_id).or_insert_with(Vec::new);
+        for range in &rg.row_ranges {
+            ranges.push((range.start_row, range.end_row));
         }
     }
 
@@ -196,6 +544,65 @@ fn collect_merged_ranges(
         }
         ranges.truncate(write + 1);
     }
+}
+
+/// Build a parquet `ArrowPredicate` that evaluates the same equality predicate
+/// as `filter_batch_natively`, but during decode so the reader can skip the
+/// non-predicate output columns for rows that fail. Returns `None` when none
+/// of `check_columns` exist in the schema (no rows can match).
+///
+/// Used selectively: only when `check_columns` are a small share of the output
+/// projection, so the double-decode of predicate columns (once to evaluate,
+/// once for output) is outweighed by saved decode on the other columns.
+fn build_row_filter_predicate(
+    file_schema: &arrow::datatypes::Schema,
+    schema_descr: &parquet::schema::types::SchemaDescriptor,
+    check_columns: &[String],
+    parsed_query: &ParsedQuery,
+) -> Option<Box<dyn ArrowPredicate>> {
+    // Resolve check_column names to file indices. The parquet reader emits
+    // predicate columns in file-index order regardless of what we pass, so
+    // sort+dedupe here and build `CompiledPredicate` against that order.
+    let mut file_indices: Vec<usize> = check_columns
+        .iter()
+        .filter_map(|name| file_schema.fields().iter().position(|f| f.name() == name))
+        .collect();
+    file_indices.sort_unstable();
+    file_indices.dedup();
+    if file_indices.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    for (batch_pos, &file_idx) in file_indices.iter().enumerate() {
+        let dtype = file_schema.field(file_idx).data_type();
+        if let Some(value) = CompiledValue::from_type_and_query(dtype, parsed_query) {
+            entries.push(CompiledEntry { batch_col_idx: batch_pos, value });
+        }
+    }
+    let compiled = CompiledPredicate {
+        entries,
+        raw_query: parsed_query.raw.clone(),
+    };
+
+    let mask = ProjectionMask::roots(schema_descr, file_indices);
+
+    let predicate = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+        let mut acc: Option<BooleanArray> = None;
+        for entry in &compiled.entries {
+            let column = batch.column(entry.batch_col_idx);
+            let m = eq_compiled(column, &entry.value, compiled.raw_query.as_ref())?;
+            acc = Some(match acc.take() {
+                None => m,
+                Some(prev) => or_kleene(&prev, &m)?,
+            });
+            if acc.as_ref().map_or(false, |a| a.true_count() == a.len()) {
+                break;
+            }
+        }
+        Ok(acc.unwrap_or_else(|| BooleanArray::from(vec![false; batch.num_rows()])))
+    });
+    Some(Box::new(predicate))
 }
 
 impl PrunedParquetReader {
@@ -229,7 +636,34 @@ impl PrunedParquetReader {
     /// let reader = PrunedParquetReader::new(ParquetSource::from(parquet_bytes));
     /// ```
     pub fn new(source: ParquetSource) -> Self {
-        Self { source }
+        Self {
+            source,
+            metadata_cache: None,
+            row_selection_min_skip_per_range: DEFAULT_ROW_SELECTION_MIN_SKIP_PER_RANGE,
+        }
+    }
+
+    /// Register the parquet footer's byte offset + length so the reader can
+    /// construct `ArrowReaderMetadata` once from a bounded range request and
+    /// reuse it across parallel decode tasks. Values come from the keyword
+    /// index (`filters.parquet_metadata_offset` / `parquet_metadata_length`).
+    pub fn with_metadata_cache(mut self, offset: u64, length: u64) -> Self {
+        self.metadata_cache = Some((offset, length));
+        self
+    }
+
+    /// Override the `RowSelection` fragmentation threshold. Per row group,
+    /// `RowSelection` is used iff `(rg_size - total_selected) / num_ranges`
+    /// meets or exceeds this value — i.e. each range must cause at least this
+    /// many rows of decode to be skipped. Below the threshold, the index
+    /// ranges are applied as a post-decode positional filter instead.
+    ///
+    /// Setting to `0` always uses `RowSelection`. A very high value always
+    /// uses post-decode filtering. Default:
+    /// [`DEFAULT_ROW_SELECTION_MIN_SKIP_PER_RANGE`].
+    pub fn with_row_selection_min_skip_per_range(mut self, min: usize) -> Self {
+        self.row_selection_min_skip_per_range = min;
+        self
     }
 
     /// Create a reader from a file path (convenience method).
@@ -502,78 +936,42 @@ impl PrunedParquetReader {
 
         let mut batches = Vec::new();
 
-        // Read verified matches — confirmed correct, return as-is
+        // Read verified matches — confirmed correct, return as-is.
         if let Some(verified) = &search_result.verified_matches {
             let mut rg_set = std::collections::HashSet::new();
             let mut rg_ranges = std::collections::HashMap::new();
             collect_merged_ranges(verified, &mut rg_set, &mut rg_ranges);
             if !rg_set.is_empty() {
-                let mut verified_batches = self.read_row_groups_and_ranges(
-                    rg_set, rg_ranges, columns.clone(),
-                ).await?;
+                let rgs: Vec<usize> = rg_set.into_iter().collect();
+                let mut verified_batches = self
+                    .read_row_groups_filtered(&rgs, &rg_ranges, columns.clone(), None)
+                    .await?;
                 batches.append(&mut verified_batches);
             }
         }
 
-        // Read needs_verification matches — verify against actual parquet values
+        // Read needs_verification matches and filter them inline as each batch
+        // streams off the decoder. Split-elimination fires only on frequent
+        // keywords, so the predicate's match rate is high — a parquet
+        // `RowFilter` would double-decode the check columns with little pruning
+        // benefit. Inline native filtering per batch avoids that double decode
+        // and lets decode/filter pipeline via the stream's await points.
         if let Some(needs_check) = &search_result.needs_verification {
             let mut rg_set = std::collections::HashSet::new();
             let mut rg_ranges = std::collections::HashMap::new();
             collect_merged_ranges(needs_check, &mut rg_set, &mut rg_ranges);
             if !rg_set.is_empty() {
-                let unverified_batches = self.read_row_groups_and_ranges(
-                    rg_set, rg_ranges, columns,
-                ).await?;
-
-                let query = &search_result.query;
-                let check_columns = &needs_check.columns;
-
-                for batch in unverified_batches {
-                    let filtered = Self::filter_batch_by_query(&batch, query, check_columns)?;
-                    if filtered.num_rows() > 0 {
-                        batches.push(filtered);
-                    }
-                }
+                let rgs: Vec<usize> = rg_set.into_iter().collect();
+                let verification =
+                    Some((ParsedQuery::new(&search_result.query), needs_check.columns.clone()));
+                let mut filtered_batches = self
+                    .read_row_groups_filtered(&rgs, &rg_ranges, columns, verification)
+                    .await?;
+                batches.append(&mut filtered_batches);
             }
         }
 
         Ok(batches)
-    }
-
-    /// Filter a RecordBatch to only rows where at least one of the specified columns
-    /// has a value that, when converted to string using the same logic as indexing,
-    /// matches the query.
-    fn filter_batch_by_query(
-        batch: &RecordBatch,
-        query: &str,
-        check_columns: &[String],
-    ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        use arrow::array::{Array, BooleanArray};
-        use arrow::compute::filter_record_batch;
-        use crate::column_parquet_reader::array_to_string_smart;
-
-        let num_rows = batch.num_rows();
-        let mut mask = vec![false; num_rows];
-
-        for col_name in check_columns {
-            if let Some(col_idx) = batch.schema().fields().iter().position(|f| f.name() == col_name) {
-                let array = batch.column(col_idx);
-                let string_array = array_to_string_smart(array);
-                let string_arr = string_array.as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .expect("array_to_string_smart must return StringArray");
-
-                for row in 0..num_rows {
-                    if !mask[row] && !string_arr.is_null(row) && string_arr.value(row) == query {
-                        mask[row] = true;
-                    }
-                }
-            }
-        }
-
-        let boolean_array = BooleanArray::from(mask);
-        let filtered = filter_record_batch(batch, &boolean_array)?;
-        Ok(filtered)
     }
 
 
@@ -1026,87 +1424,257 @@ impl PrunedParquetReader {
         })
     }
 
-    /// Internal helper to read specific row groups and ranges.
-    async fn read_row_groups_and_ranges(
+    /// Read specific row groups restricted to the given per-row-group indexed
+    /// ranges. Uses parquet `RowSelection` so only the ranges are decoded.
+    ///
+    /// Row groups are decoded concurrently: parquet column decode and
+    /// decompression are independent across row groups, and DataFusion gets
+    /// most of its wall-time advantage from exploiting that. We match it by
+    /// driving up to `available_parallelism()` row groups in flight via
+    /// `buffer_unordered`.
+    /// Read specific row groups restricted to the given per-row-group indexed
+    /// ranges. Uses parquet `RowSelection` for row-level pruning.
+    ///
+    /// Decodes one stream per row group concurrently via `buffer_unordered`
+    /// (bounded by `available_parallelism`). Matches DataFusion's partitioning
+    /// model: row groups are the unit of parallelism, never split. `ArrowReaderMetadata`
+    /// is loaded once and shared across tasks so no task pays for a footer parse.
+    ///
+    /// When `verification` is provided, each batch is passed through the native
+    /// equality filter inline with decode — this keeps memory bounded and lets
+    /// decode of batch N+1 overlap with filter of batch N on multi-core runtimes.
+    async fn read_row_groups_filtered(
         &self,
-        row_groups_to_read: std::collections::HashSet<usize>,
-        row_group_ranges: std::collections::HashMap<u16, Vec<(u32, u32)>>,
+        row_groups_vec: &[usize],
+        row_group_ranges: &std::collections::HashMap<u16, Vec<(u32, u32)>>,
         columns: Option<Vec<String>>,
+        verification: Option<(ParsedQuery, Vec<String>)>,
     ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
-        let reader = self.create_object_reader().await?;
-        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+        if row_groups_vec.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let metadata = builder.metadata().clone();
-        let schema = builder.schema().clone();
+        let object_reader = self.create_object_reader().await?;
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
 
-        let projection_mask = if let Some(ref cols) = columns {
-            let indices: Vec<usize> = cols.iter()
-                .filter_map(|col_name| {
-                    schema.fields().iter().position(|f| f.name() == col_name)
-                })
-                .collect();
-            ProjectionMask::roots(metadata.file_metadata().schema_descr(), indices)
-        } else {
-            ProjectionMask::all()
-        };
+        // Load metadata once — shared across every task via new_with_metadata
+        // so no task pays for a footer read/parse.
+        let arrow_metadata =
+            load_arrow_metadata(&self.source, self.metadata_cache, object_reader.clone()).await?;
+        let num_row_groups_in_file = arrow_metadata.metadata().num_row_groups();
 
-        let mut batches = Vec::new();
+        let min_skip = self.row_selection_min_skip_per_range;
 
-        for rg_idx in row_groups_to_read {
-            if rg_idx >= metadata.num_row_groups() {
-                continue;
+        let futures_iter = row_groups_vec.iter().copied().filter_map(|rg_idx| {
+            if rg_idx >= num_row_groups_in_file {
+                return None;
             }
+            let ranges: Vec<(u32, u32)> = row_group_ranges
+                .get(&(rg_idx as u16))
+                .cloned()
+                .unwrap_or_default();
+            if ranges.is_empty() {
+                return None;
+            }
+            let object_reader = object_reader.clone();
+            let arrow_metadata = arrow_metadata.clone();
+            let columns = columns.clone();
+            let verification = verification.clone();
+            Some(async move {
+                Self::read_one_row_group(
+                    object_reader,
+                    arrow_metadata,
+                    rg_idx,
+                    ranges,
+                    columns,
+                    verification,
+                    min_skip,
+                )
+                .await
+            })
+        });
 
-            // Recreate builder for each row group (builder doesn't implement Clone)
-            let reader = self.create_object_reader().await?;
-            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
-            let builder = builder.with_projection(projection_mask.clone());
-            let builder = builder.with_batch_size(8192);
-            let mut stream = builder.with_row_groups(vec![rg_idx]).build()?;
+        use futures::TryStreamExt;
+        let per_task: Vec<Vec<RecordBatch>> = futures::stream::iter(futures_iter)
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
 
-            // Get the row ranges for this row group
-            let ranges = row_group_ranges.get(&(rg_idx as u16));
+        let total: usize = per_task.iter().map(Vec::len).sum();
+        let mut all_batches = Vec::with_capacity(total);
+        for mut b in per_task {
+            all_batches.append(&mut b);
+        }
+        Ok(all_batches)
+    }
 
-            let mut row_offset = 0u32;
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                let batch_rows = batch.num_rows() as u32;
+    /// Decode one row group against a shared, pre-loaded `ArrowReaderMetadata`.
+    ///
+    /// Chooses between three strategies based on fragmentation and selectivity:
+    /// 1. **RowSelection + RowFilter** (predicate push-down): index ranges
+    ///    drive the decoder's row selection; the query predicate is evaluated
+    ///    during decode so non-predicate columns are only decoded for rows
+    ///    that pass.
+    /// 2. **RowSelection + post-filter predicate**: index ranges drive decode;
+    ///    query predicate (when present) is applied per batch after decode.
+    /// 3. **No RowSelection + post-filter range (+ predicate)**: ranges are
+    ///    too fragmented for `RowSelection` to pay off — the row group is
+    ///    decoded contiguously and a positional mask built from the index
+    ///    ranges is applied per batch (AND'd with the predicate mask if any).
+    ///
+    /// The split between 1/2 and 3 is controlled by `row_selection_min_skip_per_range`.
+    async fn read_one_row_group(
+        object_reader: ParquetObjectReader,
+        arrow_metadata: ArrowReaderMetadata,
+        rg_idx: usize,
+        ranges: Vec<(u32, u32)>,
+        columns: Option<Vec<String>>,
+        verification: Option<(ParsedQuery, Vec<String>)>,
+        row_selection_min_skip_per_range: usize,
+    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+        if rg_idx >= arrow_metadata.metadata().num_row_groups() {
+            return Ok(Vec::new());
+        }
 
-                if let Some(ranges) = ranges {
-                    // BUG FIX: Convert row-group-relative ranges to batch-relative ranges
-                    // This is the same logic used in read_combined_rows
-                    let batch_relative_ranges: Vec<(u32, u32)> = ranges
-                        .iter()
-                        .filter_map(|&(start, end)| {
-                            // Check if this range overlaps with current batch
-                            if end < row_offset || start >= row_offset + batch_rows {
-                                None // Range doesn't overlap this batch
-                            } else {
-                                // Adjust range to be relative to batch start
-                                let batch_start = start.saturating_sub(row_offset);
-                                let batch_end = (end - row_offset).min(batch_rows - 1);
-                                Some((batch_start, batch_end))
-                            }
-                        })
-                        .collect();
+        let file_schema = arrow_metadata.schema().clone();
+        let schema_descr = arrow_metadata
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .clone();
+        let rg_size = arrow_metadata.metadata().row_group(rg_idx).num_rows() as usize;
 
-                    if batch_relative_ranges.is_empty() {
-                        row_offset += batch_rows;
-                        continue;
-                    }
+        // --- Fragmentation decision ----------------------------------------
+        // RowSelection pays its per-selector bookkeeping cost only when each
+        // range causes enough decode to be skipped. `skip_per_range` guards
+        // against division-by-zero (no ranges → post-decode path handles the
+        // empty case trivially).
+        let total_selected: usize = ranges
+            .iter()
+            .map(|(s, e)| (*e as usize).saturating_sub(*s as usize) + 1)
+            .sum();
+        let skipped = rg_size.saturating_sub(total_selected);
+        let skip_per_range = if ranges.is_empty() {
+            0
+        } else {
+            skipped / ranges.len()
+        };
+        let use_row_selection =
+            !ranges.is_empty() && skip_per_range >= row_selection_min_skip_per_range;
 
-                    let filtered = filter_batch_to_ranges(&batch, &batch_relative_ranges)?;
-                    if filtered.num_rows() > 0 {
-                        batches.push(filtered);
-                    }
-                } else {
-                    batches.push(batch);
-                }
+        // --- Predicate path decision ---------------------------------------
+        // RowFilter (decode fusion) only makes sense when RowSelection is
+        // also in play — otherwise the predicate would see rows outside our
+        // index ranges and potentially admit them. When RowSelection is
+        // dropped, the post-decode path applies both range and predicate
+        // masks together.
+        let output_col_count = columns
+            .as_ref()
+            .map(|c| c.len())
+            .unwrap_or_else(|| file_schema.fields().len());
+        let use_row_filter = use_row_selection
+            && verification
+                .as_ref()
+                .map(|(_, cols)| cols.len() * 3 <= output_col_count.max(1))
+                .unwrap_or(false);
 
-                row_offset += batch_rows;
+        // --- Builder setup -------------------------------------------------
+        let mut builder =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(object_reader, arrow_metadata);
+
+        if let Some(ref cols) = columns {
+            let indices: Vec<usize> = cols
+                .iter()
+                .filter_map(|n| file_schema.fields().iter().position(|f| f.name() == n))
+                .collect();
+            if !indices.is_empty() {
+                builder = builder.with_projection(ProjectionMask::roots(&schema_descr, indices));
             }
         }
 
+        if use_row_filter {
+            if let Some((parsed, check_cols)) = verification.as_ref() {
+                if let Some(predicate) =
+                    build_row_filter_predicate(&file_schema, &schema_descr, check_cols, parsed)
+                {
+                    builder = builder.with_row_filter(RowFilter::new(vec![predicate]));
+                }
+            }
+        }
+
+        let builder = builder.with_row_groups(vec![rg_idx]).with_batch_size(8192);
+        let mut stream = if use_row_selection {
+            let selection = build_row_selection(&ranges, rg_size);
+            if let Some(sel) = selection {
+                builder.with_row_selection(sel).build()?
+            } else {
+                // Ranges yielded no selection (e.g. all out of bounds) — fall
+                // back to reading everything; the range filter below will
+                // drop the non-matching rows.
+                builder.build()?
+            }
+        } else {
+            builder.build()?
+        };
+
+        // --- Post-decode filter setup --------------------------------------
+        // Predicate: compile once against the post-projection batch schema.
+        // Skipped when RowFilter already evaluated the predicate during decode.
+        let compiled_post = if use_row_filter {
+            None
+        } else {
+            verification.as_ref().map(|(parsed, cols)| {
+                CompiledPredicate::from_query(stream.schema().as_ref(), parsed, cols)
+            })
+        };
+        // Range: when RowSelection was skipped, the decoder emits every row
+        // in the row group; we apply the index ranges as a positional mask.
+        let need_range_filter = !use_row_selection;
+
+        // --- Stream and filter ---------------------------------------------
+        use arrow::compute::filter_record_batch;
+        use arrow::compute::kernels::boolean::and_kleene;
+
+        let mut batches = Vec::new();
+        let mut batch_row_offset: u32 = 0;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let batch_len = batch.num_rows();
+            if batch_len == 0 {
+                continue;
+            }
+
+            let range_mask = if need_range_filter {
+                Some(build_range_mask_for_batch(batch_row_offset, batch_len, &ranges))
+            } else {
+                None
+            };
+            let predicate_mask = compiled_post
+                .as_ref()
+                .map(|p| compute_predicate_mask(&batch, p))
+                .transpose()?;
+
+            let combined = match (range_mask, predicate_mask) {
+                (None, None) => None,
+                (Some(r), None) => Some(r),
+                (None, Some(p)) => Some(p),
+                (Some(r), Some(p)) => Some(and_kleene(&r, &p)?),
+            };
+
+            let kept = match combined {
+                None => batch,
+                Some(mask) if mask.true_count() == mask.len() => batch,
+                Some(mask) => filter_record_batch(&batch, &mask)?,
+            };
+            if kept.num_rows() > 0 {
+                batches.push(kept);
+            }
+
+            batch_row_offset += batch_len as u32;
+        }
         Ok(batches)
     }
 }
@@ -1172,53 +1740,6 @@ pub struct PruningStats {
     pub rows_skipped: u64,
     pub row_skip_percentage: f64,
 }
-
-/// Filter a record batch to only include rows in the specified ranges
-/// OPTIMIZATION: Use fill() for contiguous ranges and slice() for single ranges
-fn filter_batch_to_ranges(
-    batch: &RecordBatch,
-    ranges: &[(u32, u32)],
-) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-    let num_rows = batch.num_rows();
-
-    // Special case: single contiguous range - use zero-copy slice
-    if ranges.len() == 1 {
-        let start = ranges[0].0 as usize;
-        let end = (ranges[0].1 as usize).min(num_rows - 1);
-        return Ok(batch.slice(start, end - start + 1));
-    }
-
-    // Multiple ranges: collect indices and use take() for direct indexing
-    // This is much more efficient than creating a boolean mask for sparse selections
-    let indices: Vec<u32> = ranges.iter()
-        .flat_map(|&(start, end)| {
-            let end = end.min(num_rows as u32 - 1);
-            start..=end
-        })
-        .collect();
-
-    if indices.is_empty() {
-        // No valid indices, return empty batch with same schema
-        return Ok(RecordBatch::new_empty(batch.schema()));
-    }
-
-    // Use Arrow's take() for efficient direct indexing
-    use arrow::array::UInt32Array;
-    use arrow::compute::take;
-
-    let indices_array = UInt32Array::from(indices);
-
-    // Apply take() to each column
-    let taken_columns: Result<Vec<_>, _> = batch.columns()
-        .iter()
-        .map(|column| take(column.as_ref(), &indices_array, None))
-        .collect();
-
-    // Reconstruct RecordBatch from taken columns
-    let taken_columns = taken_columns?;
-    Ok(RecordBatch::try_new(batch.schema(), taken_columns)?)
-}
-
 
 #[cfg(test)]
 mod tests {
