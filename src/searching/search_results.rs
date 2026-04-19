@@ -214,6 +214,13 @@ pub struct SearchResult {
 ///     println!("Matched at level 1 (whitespace/punctuation splits)");
 /// }
 /// ```
+/// Canonical per-row-group row ranges used internally by the reader path.
+/// `(start_row, end_row)` inclusive, sorted + merged per row group.
+/// Wrapped in `Arc` so it can be cheaply cloned into `MatchPlan` without
+/// re-walking `column_details` at every pipeline stage.
+pub(crate) type CanonicalRangesByRg =
+    std::sync::Arc<std::collections::HashMap<u16, Vec<(u32, u32)>>>;
+
 #[derive(Debug, Clone)]
 pub struct KeywordLocationData {
     /// Names of all columns that contain this keyword.
@@ -247,6 +254,11 @@ pub struct KeywordLocationData {
     ///
     /// Contains row group and row-level location data. The length matches `columns.len()`.
     pub column_details: Vec<ColumnLocation>,
+
+    /// Internal: canonical per-row-group range form, pre-built during search
+    /// so the reader path doesn't re-walk `column_details` for every scan.
+    /// All combine/plan/reader stages share this via `Arc::clone`.
+    pub(crate) ranges_by_rg: CanonicalRangesByRg,
 }
 
 /// Location data for a keyword within a specific column.
@@ -442,20 +454,58 @@ pub struct RowRange {
 /// println!("Combined search for: {:?}", result.keywords);
 /// println!("Found matches in {} row group(s)", result.row_groups.len());
 /// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombinerKind {
+    And,
+    Or,
+}
+
+/// Per-term data carried through a combined query so the reader can evaluate
+/// the term's predicate against the actual Parquet value for rows the index
+/// could not pre-verify (e.g. rows that landed in `needs_verification` due to
+/// split elimination).
+///
+/// `verified_row_groups` are rows the index guarantees match this term; no
+/// Parquet access is needed to confirm them. `pending_row_groups` are rows
+/// where the index thinks a match is possible but can't confirm — the reader
+/// must decode the listed `check_columns` and compare to `query`.
+#[derive(Debug, Clone)]
+pub struct CombinedTerm {
+    pub query: String,
+    /// Columns to compare against `query` for pending rows. Mirrors
+    /// `KeywordLocationData.columns` for the source `SearchResult`.
+    pub check_columns: Vec<String>,
+    pub verified_row_groups: Vec<CombinedRowGroupLocation>,
+    pub pending_row_groups: Vec<CombinedRowGroupLocation>,
+    /// Internal: canonical per-row-group range form for the reader path.
+    /// Shared via `Arc` with the source `SearchResult.verified_matches.ranges_by_rg`.
+    pub(crate) verified_ranges: CanonicalRangesByRg,
+    pub(crate) pending_ranges: CanonicalRangesByRg,
+}
+
 #[derive(Debug, Clone)]
 pub struct CombinedSearchResult {
     /// Keywords that were combined in this search operation.
-    ///
-    /// The order and contents depend on the type of combination performed.
-    /// For AND queries, all keywords must be present. For OR queries, at least
-    /// one keyword must be present.
     pub keywords: Vec<String>,
 
-    /// Row groups that satisfy the combination criteria.
-    ///
-    /// Each row group contains row ranges where the combination condition is met.
-    /// Empty if no matches found.
+    /// How the per-term matches are combined to decide keep/drop.
+    pub combiner: CombinerKind,
+
+    /// Per-term contribution — one entry per input `SearchResult`. The reader
+    /// uses these to apply per-term predicates to pending rows and combine
+    /// term-level match results via `combiner`.
+    pub terms: Vec<CombinedTerm>,
+
+    /// Scan candidate set: union of every term's verified + pending ranges,
+    /// deduplicated per row group. Drives `RowSelection` / fragmentation
+    /// decisions in the reader; the final kept-rows set is a subset determined
+    /// by applying each term's verification and combining via `combiner`.
     pub row_groups: Vec<CombinedRowGroupLocation>,
+
+    /// Internal: canonical per-row-group scan range form for the reader.
+    /// Mirrors `row_groups` but in the `HashMap` shape the reader needs —
+    /// pre-computed here so `plan_from_combined` doesn't rebuild it.
+    pub(crate) scan_ranges: CanonicalRangesByRg,
 }
 
 /// Row group location for combined search results.

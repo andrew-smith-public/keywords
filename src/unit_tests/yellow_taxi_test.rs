@@ -879,4 +879,324 @@ mod yellow_taxi_index_test {
         let _ = std::fs::remove_file(&temp_path);
         let _ = std::fs::remove_dir_all(format!("{}.index", temp_path_str));
     }
+
+    /// Three-column AND combined query on yellow taxi data vs DataFusion.
+    /// Exercises `combine_and` across three specific-column `Equals`
+    /// searches where at least one term's keyword is frequent enough to
+    /// trigger split-elimination — so the pending-predicate path in the
+    /// unified reader has to fire to get the right answer.
+    #[tokio::test]
+    async fn test_yellow_taxi_three_column_and_vs_datafusion() {
+        use std::time::Instant;
+        use std::collections::HashSet;
+        use crate::build_and_save_index;
+        use crate::searching::keyword_search::KeywordSearcher;
+        use crate::searching::pruned_reader::PrunedParquetReader;
+        use crate::searching::search_results::SearchMode;
+        use datafusion::prelude::*;
+
+        println!("\n=============================================================");
+        println!("NYC YELLOW TAXI — 3-COLUMN AND vs DATAFUSION");
+        println!("=============================================================");
+        println!(
+            "Query: passenger_count = 1  AND  VendorID = 2  AND  payment_type = 1"
+        );
+        println!();
+
+        // ── Download + write temp parquet ────────────────────────────────────
+        println!("Step 1: Downloading parquet…");
+        let response = reqwest::get(YELLOW_TAXI_URL).await
+            .expect("Failed to download yellow taxi parquet");
+        let parquet_bytes = response.bytes().await
+            .expect("Failed to read response bytes");
+        println!("  {:.2} MB received", parquet_bytes.len() as f64 / (1024.0 * 1024.0));
+
+        let temp_path = std::env::temp_dir()
+            .join("yellow_taxi_three_col_and_perf_test.parquet");
+        let temp_path_str = temp_path.to_str().unwrap().to_string();
+        std::fs::write(&temp_path, &parquet_bytes)
+            .expect("Failed to write temp parquet");
+
+        // ── Build index (same thresholds as the other yellow_taxi tests) ─────
+        println!("\nStep 2: Building index (split_elim_threshold = 0.2)…");
+        let build_start = Instant::now();
+        build_and_save_index(
+            &temp_path_str,
+            Some(HashSet::from([
+                "tpep_pickup_datetime".to_string(),
+                "tpep_dropoff_datetime".to_string(),
+            ])),
+            Some(0.01), None, None, None, None, Some(true), None,
+            Some(0.2), Some(0.2),
+        ).await.expect("Index build failed");
+        println!("  Index built in {:.2?}", build_start.elapsed());
+
+        // ── Keyword index: 3 specific-column searches + combine_and ──────────
+        println!("\nStep 3: Keyword index 3-column AND…");
+        let ki_load_start = Instant::now();
+        let searcher = KeywordSearcher::load(&temp_path_str, None).await
+            .expect("KeywordSearcher::load failed");
+        let ki_load_time = ki_load_start.elapsed();
+
+        let ki_index_start = Instant::now();
+        let r_pc = searcher.search_with_mode(
+            "1", Some("passenger_count"), false, SearchMode::Equals,
+        ).await.expect("search passenger_count failed");
+        let r_vid = searcher.search_with_mode(
+            "2", Some("VendorID"), false, SearchMode::Equals,
+        ).await.expect("search VendorID failed");
+        let r_pt = searcher.search_with_mode(
+            "1", Some("payment_type"), false, SearchMode::Equals,
+        ).await.expect("search payment_type failed");
+
+        assert!(r_pc.found && r_vid.found && r_pt.found,
+                "All three per-column searches must find their keywords");
+
+        let combined = KeywordSearcher::combine_and(&[r_pc.clone(), r_vid.clone(), r_pt.clone()])
+            .expect("combine_and must return Some");
+        let ki_index_time = ki_index_start.elapsed();
+
+        let any_pending = [&r_pc, &r_vid, &r_pt]
+            .iter()
+            .any(|r| r.needs_verification.is_some());
+        println!(
+            "  per-term pending (split-eliminated): passenger_count={}  VendorID={}  payment_type={}",
+            r_pc.needs_verification.is_some(),
+            r_vid.needs_verification.is_some(),
+            r_pt.needs_verification.is_some(),
+        );
+
+        let ki_scan_start = Instant::now();
+        let reader = PrunedParquetReader::from_path(&temp_path_str).with_metadata_cache(
+            searcher.filters.parquet_metadata_offset,
+            searcher.filters.parquet_metadata_length,
+        );
+        let ki_batches = reader.read_combined_rows(&combined, None).await
+            .expect("read_combined_rows failed");
+        let ki_scan_time = ki_scan_start.elapsed();
+
+        let ki_total = ki_load_time + ki_index_time + ki_scan_time;
+        let ki_rows: usize = ki_batches.iter().map(|b| b.num_rows()).sum();
+        println!(
+            "  load={:.2?}  index={:.2?}  scan={:.2?}  total={:.2?}  rows={}",
+            ki_load_time, ki_index_time, ki_scan_time, ki_total, ki_rows
+        );
+
+        // ── DataFusion: equivalent SQL ───────────────────────────────────────
+        println!("\nStep 4: DataFusion equivalent…");
+        let df_reg_start = Instant::now();
+        let ctx = SessionContext::new();
+        ctx.register_parquet("data", &temp_path_str, Default::default()).await
+            .expect("DataFusion parquet registration failed");
+        let df_reg_time = df_reg_start.elapsed();
+
+        let sql = "SELECT * FROM data WHERE \"passenger_count\" = 1 \
+                   AND \"VendorID\" = 2 AND \"payment_type\" = 1";
+        println!("  SQL: {}", sql);
+
+        let df_scan_start = Instant::now();
+        let df = ctx.sql(sql).await.expect("DataFusion query failed");
+        let df_batches = df.collect().await.expect("DataFusion collect failed");
+        let df_scan_time = df_scan_start.elapsed();
+        let df_rows: usize = df_batches.iter().map(|b| b.num_rows()).sum();
+        let df_total = df_reg_time + df_scan_time;
+        println!(
+            "  register={:.2?}  scan={:.2?}  total={:.2?}  rows={}",
+            df_reg_time, df_scan_time, df_total, df_rows
+        );
+
+        // ── Summary ──────────────────────────────────────────────────────────
+        println!();
+        println!("=============================================================");
+        println!("RESULTS  (3-column AND)");
+        println!("=============================================================");
+        println!();
+        println!("┌──────────────────────────────┬────────────┬────────────┬────────────┬────────────┐");
+        println!("│ Approach                     │ Setup      │ Index      │ Scan       │ Total      │");
+        println!("├──────────────────────────────┼────────────┼────────────┼────────────┼────────────┤");
+        println!("│ Keyword index                │ {:>10.2?} │ {:>10.2?} │ {:>10.2?} │ {:>10.2?} │",
+                 ki_load_time, ki_index_time, ki_scan_time, ki_total);
+        println!("│ DataFusion                   │ {:>10.2?} │ {:>10}   │ {:>10.2?} │ {:>10.2?} │",
+                 df_reg_time, "n/a", df_scan_time, df_total);
+        println!("└──────────────────────────────┴────────────┴────────────┴────────────┴────────────┘");
+        println!();
+
+        let scan_ratio = df_scan_time.as_secs_f64() / ki_scan_time.as_secs_f64();
+        if scan_ratio >= 1.0 {
+            println!("Scan-only: keyword index is {:.2}x FASTER than DataFusion", scan_ratio);
+        } else {
+            println!("Scan-only: keyword index is {:.2}x slower than DataFusion", 1.0 / scan_ratio);
+        }
+        let total_ratio = df_total.as_secs_f64() / ki_total.as_secs_f64();
+        if total_ratio >= 1.0 {
+            println!("End-to-end: keyword index is {:.2}x FASTER than DataFusion", total_ratio);
+        } else {
+            println!("End-to-end: keyword index is {:.2}x slower than DataFusion", 1.0 / total_ratio);
+        }
+        println!();
+        println!("At least one term hit the pending/verification path: {}", any_pending);
+
+        assert_eq!(
+            ki_rows, df_rows,
+            "Keyword index and DataFusion must return the same row count for 3-column AND"
+        );
+
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_dir_all(format!("{}.index", temp_path_str));
+    }
+
+    /// Three-column OR combined query on yellow taxi data vs DataFusion.
+    /// Exercises `combine_or` across three specific-column `Equals` searches.
+    /// At least one term is split-eliminated, so the unified reader must
+    /// stitch per-term verified sets together with per-term pending predicate
+    /// results.
+    #[tokio::test]
+    async fn test_yellow_taxi_three_column_or_vs_datafusion() {
+        use std::time::Instant;
+        use std::collections::HashSet;
+        use crate::build_and_save_index;
+        use crate::searching::keyword_search::KeywordSearcher;
+        use crate::searching::pruned_reader::PrunedParquetReader;
+        use crate::searching::search_results::SearchMode;
+        use datafusion::prelude::*;
+
+        println!("\n=============================================================");
+        println!("NYC YELLOW TAXI — 3-COLUMN OR vs DATAFUSION");
+        println!("=============================================================");
+        println!(
+            "Query: passenger_count = 2  OR  VendorID = 2  OR  payment_type = 2"
+        );
+        println!();
+
+        println!("Step 1: Downloading parquet…");
+        let response = reqwest::get(YELLOW_TAXI_URL).await
+            .expect("Failed to download yellow taxi parquet");
+        let parquet_bytes = response.bytes().await
+            .expect("Failed to read response bytes");
+        println!("  {:.2} MB received", parquet_bytes.len() as f64 / (1024.0 * 1024.0));
+
+        let temp_path = std::env::temp_dir()
+            .join("yellow_taxi_three_col_or_perf_test.parquet");
+        let temp_path_str = temp_path.to_str().unwrap().to_string();
+        std::fs::write(&temp_path, &parquet_bytes)
+            .expect("Failed to write temp parquet");
+
+        println!("\nStep 2: Building index (split_elim_threshold = 0.2)…");
+        let build_start = Instant::now();
+        build_and_save_index(
+            &temp_path_str,
+            Some(HashSet::from([
+                "tpep_pickup_datetime".to_string(),
+                "tpep_dropoff_datetime".to_string(),
+            ])),
+            Some(0.01), None, None, None, None, Some(true), None,
+            Some(0.2), Some(0.2),
+        ).await.expect("Index build failed");
+        println!("  Index built in {:.2?}", build_start.elapsed());
+
+        println!("\nStep 3: Keyword index 3-column OR…");
+        let ki_load_start = Instant::now();
+        let searcher = KeywordSearcher::load(&temp_path_str, None).await
+            .expect("KeywordSearcher::load failed");
+        let ki_load_time = ki_load_start.elapsed();
+
+        let ki_index_start = Instant::now();
+        let r_pc = searcher.search_with_mode(
+            "2", Some("passenger_count"), false, SearchMode::Equals,
+        ).await.expect("search passenger_count failed");
+        let r_vid = searcher.search_with_mode(
+            "2", Some("VendorID"), false, SearchMode::Equals,
+        ).await.expect("search VendorID failed");
+        let r_pt = searcher.search_with_mode(
+            "2", Some("payment_type"), false, SearchMode::Equals,
+        ).await.expect("search payment_type failed");
+
+        assert!(r_pc.found && r_vid.found && r_pt.found,
+                "All three per-column searches must find their keywords");
+
+        let combined = KeywordSearcher::combine_or(&[r_pc.clone(), r_vid.clone(), r_pt.clone()])
+            .expect("combine_or must return Some");
+        let ki_index_time = ki_index_start.elapsed();
+
+        println!(
+            "  per-term pending (split-eliminated): passenger_count={}  VendorID={}  payment_type={}",
+            r_pc.needs_verification.is_some(),
+            r_vid.needs_verification.is_some(),
+            r_pt.needs_verification.is_some(),
+        );
+
+        let ki_scan_start = Instant::now();
+        let reader = PrunedParquetReader::from_path(&temp_path_str).with_metadata_cache(
+            searcher.filters.parquet_metadata_offset,
+            searcher.filters.parquet_metadata_length,
+        );
+        let ki_batches = reader.read_combined_rows(&combined, None).await
+            .expect("read_combined_rows failed");
+        let ki_scan_time = ki_scan_start.elapsed();
+
+        let ki_total = ki_load_time + ki_index_time + ki_scan_time;
+        let ki_rows: usize = ki_batches.iter().map(|b| b.num_rows()).sum();
+        println!(
+            "  load={:.2?}  index={:.2?}  scan={:.2?}  total={:.2?}  rows={}",
+            ki_load_time, ki_index_time, ki_scan_time, ki_total, ki_rows
+        );
+
+        println!("\nStep 4: DataFusion equivalent…");
+        let df_reg_start = Instant::now();
+        let ctx = SessionContext::new();
+        ctx.register_parquet("data", &temp_path_str, Default::default()).await
+            .expect("DataFusion parquet registration failed");
+        let df_reg_time = df_reg_start.elapsed();
+
+        let sql = "SELECT * FROM data WHERE \"passenger_count\" = 2 \
+                   OR \"VendorID\" = 2 OR \"payment_type\" = 2";
+        println!("  SQL: {}", sql);
+
+        let df_scan_start = Instant::now();
+        let df = ctx.sql(sql).await.expect("DataFusion query failed");
+        let df_batches = df.collect().await.expect("DataFusion collect failed");
+        let df_scan_time = df_scan_start.elapsed();
+        let df_rows: usize = df_batches.iter().map(|b| b.num_rows()).sum();
+        let df_total = df_reg_time + df_scan_time;
+        println!(
+            "  register={:.2?}  scan={:.2?}  total={:.2?}  rows={}",
+            df_reg_time, df_scan_time, df_total, df_rows
+        );
+
+        println!();
+        println!("=============================================================");
+        println!("RESULTS  (3-column OR)");
+        println!("=============================================================");
+        println!();
+        println!("┌──────────────────────────────┬────────────┬────────────┬────────────┬────────────┐");
+        println!("│ Approach                     │ Setup      │ Index      │ Scan       │ Total      │");
+        println!("├──────────────────────────────┼────────────┼────────────┼────────────┼────────────┤");
+        println!("│ Keyword index                │ {:>10.2?} │ {:>10.2?} │ {:>10.2?} │ {:>10.2?} │",
+                 ki_load_time, ki_index_time, ki_scan_time, ki_total);
+        println!("│ DataFusion                   │ {:>10.2?} │ {:>10}   │ {:>10.2?} │ {:>10.2?} │",
+                 df_reg_time, "n/a", df_scan_time, df_total);
+        println!("└──────────────────────────────┴────────────┴────────────┴────────────┴────────────┘");
+        println!();
+
+        let scan_ratio = df_scan_time.as_secs_f64() / ki_scan_time.as_secs_f64();
+        if scan_ratio >= 1.0 {
+            println!("Scan-only: keyword index is {:.2}x FASTER than DataFusion", scan_ratio);
+        } else {
+            println!("Scan-only: keyword index is {:.2}x slower than DataFusion", 1.0 / scan_ratio);
+        }
+        let total_ratio = df_total.as_secs_f64() / ki_total.as_secs_f64();
+        if total_ratio >= 1.0 {
+            println!("End-to-end: keyword index is {:.2}x FASTER than DataFusion", total_ratio);
+        } else {
+            println!("End-to-end: keyword index is {:.2}x slower than DataFusion", 1.0 / total_ratio);
+        }
+
+        assert_eq!(
+            ki_rows, df_rows,
+            "Keyword index and DataFusion must return the same row count for 3-column OR"
+        );
+
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_dir_all(format!("{}.index", temp_path_str));
+    }
 }

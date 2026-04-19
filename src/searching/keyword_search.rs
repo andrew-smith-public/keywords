@@ -52,27 +52,212 @@ use crate::searching::search_results::*;
 use crate::utils::file_interaction_local_and_cloud::get_object_store;
 
 /// Helper function to convert sorted row numbers into ranges
-fn rows_to_ranges(sorted_rows: &[u32]) -> Vec<CombinedRowRange> {
-    if sorted_rows.is_empty() {
-        return Vec::new();
+/// Clone the canonical ranges Arc from a `KeywordLocationData`, or return
+/// an empty one. `Arc::clone` is O(1); the actual range data is shared
+/// between the `SearchResult`, the `CombinedTerm`, and the reader's
+/// `MatchPlan` without any HashMap rebuild.
+fn location_data_to_ranges(
+    data: Option<&KeywordLocationData>,
+) -> CanonicalRangesByRg {
+    match data {
+        Some(d) => d.ranges_by_rg.clone(),
+        None => std::sync::Arc::new(std::collections::HashMap::new()),
     }
+}
 
-    let mut ranges = Vec::new();
-    let mut start = sorted_rows[0];
-    let mut end = sorted_rows[0];
-
-    for &row in &sorted_rows[1..] {
-        if row == end + 1 {
-            end = row;
+/// Merge overlapping/adjacent sorted ranges in place.
+fn merge_adjacent_ranges(ranges: &mut Vec<(u32, u32)>) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut write = 0;
+    for read in 1..ranges.len() {
+        if ranges[read].0 <= ranges[write].1.saturating_add(1) {
+            ranges[write].1 = ranges[write].1.max(ranges[read].1);
         } else {
-            ranges.push(CombinedRowRange { start_row: start, end_row: end });
-            start = row;
-            end = row;
+            write += 1;
+            ranges[write] = ranges[read];
         }
     }
+    ranges.truncate(write + 1);
+}
 
-    ranges.push(CombinedRowRange { start_row: start, end_row: end });
-    ranges
+/// Intersect two sorted, merged range lists, producing a new sorted, merged list.
+fn intersect_range_lists(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() && j < b.len() {
+        let start = a[i].0.max(b[j].0);
+        let end = a[i].1.min(b[j].1);
+        if start <= end {
+            out.push((start, end));
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
+fn ranges_to_combined_row_groups(
+    ranges: &HashMap<u16, Vec<(u32, u32)>>,
+) -> Vec<CombinedRowGroupLocation> {
+    let mut out: Vec<CombinedRowGroupLocation> = ranges
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(rg_id, ranges)| CombinedRowGroupLocation {
+            row_group_id: *rg_id,
+            row_ranges: ranges
+                .iter()
+                .map(|&(s, e)| CombinedRowRange { start_row: s, end_row: e })
+                .collect(),
+        })
+        .collect();
+    out.sort_by_key(|r| r.row_group_id);
+    out
+}
+
+/// Unified implementation for `combine_and` / `combine_or`. Preserves each
+/// input term's verified + pending ranges and its check columns + query, so
+/// the reader can evaluate per-term predicates on rows the index couldn't
+/// pre-verify. Computes the scan candidate set as the intersection (AND) or
+/// union (OR) of per-term `(verified ∪ pending)` ranges.
+fn combine_impl(
+    results: &[SearchResult],
+    combiner: CombinerKind,
+) -> Option<CombinedSearchResult> {
+    use std::sync::Arc;
+
+    if results.is_empty() {
+        return None;
+    }
+
+    let empty_ranges: CanonicalRangesByRg = Arc::new(HashMap::new());
+
+    // Short-circuit AND when any term found nothing — intersection is empty.
+    if combiner == CombinerKind::And && results.iter().any(|r| !r.found) {
+        return Some(CombinedSearchResult {
+            keywords: results.iter().map(|r| r.query.clone()).collect(),
+            combiner,
+            terms: Vec::new(),
+            row_groups: Vec::new(),
+            scan_ranges: empty_ranges,
+        });
+    }
+
+    // Build per-term CombinedTerm + collect each term's candidate range set
+    // (verified ∪ pending) for the scan-set computation. Per-term verified
+    // and pending ranges are shared as Arcs with the source SearchResult —
+    // zero-cost to store, zero-cost for the reader to clone.
+    let mut terms: Vec<CombinedTerm> = Vec::with_capacity(results.len());
+    let mut per_term_candidates: Vec<HashMap<u16, Vec<(u32, u32)>>> =
+        Vec::with_capacity(results.len());
+
+    for result in results {
+        let verified: CanonicalRangesByRg = location_data_to_ranges(result.verified_matches.as_ref());
+        let pending: CanonicalRangesByRg = location_data_to_ranges(result.needs_verification.as_ref());
+        let check_columns = result
+            .verified_matches
+            .as_ref()
+            .or(result.needs_verification.as_ref())
+            .map(|d| d.columns.clone())
+            .unwrap_or_default();
+
+        // Union verified + pending into a fresh candidate HashMap used only
+        // for scan-set computation below. Iterating the Arcs is zero-copy.
+        let mut candidate: HashMap<u16, Vec<(u32, u32)>> = HashMap::new();
+        for (rg_id, r) in verified.iter() {
+            candidate.entry(*rg_id).or_insert_with(Vec::new).extend(r.iter().copied());
+        }
+        for (rg_id, r) in pending.iter() {
+            candidate.entry(*rg_id).or_insert_with(Vec::new).extend(r.iter().copied());
+        }
+        for ranges in candidate.values_mut() {
+            ranges.sort_unstable();
+            merge_adjacent_ranges(ranges);
+        }
+
+        // Build the display-only Vec<CombinedRowGroupLocation> from the Arc'd
+        // HashMaps without consuming them.
+        let verified_row_groups = ranges_to_combined_row_groups(&verified);
+        let pending_row_groups = ranges_to_combined_row_groups(&pending);
+
+        terms.push(CombinedTerm {
+            query: result.query.clone(),
+            check_columns,
+            verified_row_groups,
+            pending_row_groups,
+            verified_ranges: verified,
+            pending_ranges: pending,
+        });
+        per_term_candidates.push(candidate);
+    }
+
+    // Scan candidate set: intersect for AND, union for OR.
+    let scan_ranges: HashMap<u16, Vec<(u32, u32)>> = match combiner {
+        CombinerKind::Or => {
+            let mut out: HashMap<u16, Vec<(u32, u32)>> = HashMap::new();
+            for term in &per_term_candidates {
+                for (rg_id, ranges) in term {
+                    out.entry(*rg_id)
+                        .or_insert_with(Vec::new)
+                        .extend(ranges.iter().copied());
+                }
+            }
+            for ranges in out.values_mut() {
+                ranges.sort_unstable();
+                merge_adjacent_ranges(ranges);
+            }
+            out
+        }
+        CombinerKind::And => {
+            // Intersect per row group: a row qualifies only if every term has
+            // a candidate range covering it. Row groups missing from any term
+            // drop out of the result entirely.
+            let Some(first) = per_term_candidates.first() else {
+                return Some(CombinedSearchResult {
+                    keywords: results.iter().map(|r| r.query.clone()).collect(),
+                    combiner,
+                    terms,
+                    row_groups: Vec::new(),
+                    scan_ranges: empty_ranges,
+                });
+            };
+            let mut out: HashMap<u16, Vec<(u32, u32)>> = first.clone();
+            for term in &per_term_candidates[1..] {
+                let mut next: HashMap<u16, Vec<(u32, u32)>> = HashMap::new();
+                for (rg_id, acc_ranges) in &out {
+                    if let Some(term_ranges) = term.get(rg_id) {
+                        let intersected = intersect_range_lists(acc_ranges, term_ranges);
+                        if !intersected.is_empty() {
+                            next.insert(*rg_id, intersected);
+                        }
+                    }
+                }
+                out = next;
+                if out.is_empty() {
+                    break;
+                }
+            }
+            out
+        }
+    };
+
+    // Materialise the display-only scan row_groups; the authoritative form for
+    // the reader is the Arc'd HashMap, not this Vec.
+    let row_groups = ranges_to_combined_row_groups(&scan_ranges);
+    let scan_ranges_arc = Arc::new(scan_ranges);
+
+    Some(CombinedSearchResult {
+        keywords: results.iter().map(|r| r.query.clone()).collect(),
+        combiner,
+        terms,
+        row_groups,
+        scan_ranges: scan_ranges_arc,
+    })
 }
 
 /// Handle for searching keywords in a distributed index.
@@ -831,6 +1016,16 @@ impl KeywordSearcher {
             .filter(|&id| id != 0)
             .collect();
 
+        // Canonical per-row-group `(start, end)` ranges for the reader path —
+        // built inline alongside the `RowRange` pushes below so the reader
+        // doesn't have to re-walk `column_details` downstream. Only one col
+        // enters this loop body (specific-target or col 0 for aggregate),
+        // so these maps capture that single col's ranges.
+        let mut verified_ranges_by_rg: std::collections::HashMap<u16, Vec<(u32, u32)>> =
+            std::collections::HashMap::new();
+        let mut needs_verif_ranges_by_rg: std::collections::HashMap<u16, Vec<(u32, u32)>> =
+            std::collections::HashMap::new();
+
         for col in archived_item.columns.iter() {
             let column_id: u32 = col.column_id.to_native();
 
@@ -855,6 +1050,12 @@ impl KeywordSearcher {
                 let row_group_id: u16 = rg.row_group_id.to_native();
                 let mut row_ranges = Vec::new();
                 let mut needs_verif_ranges = Vec::new();
+                let verified_ranges_bucket = verified_ranges_by_rg
+                    .entry(row_group_id)
+                    .or_insert_with(Vec::new);
+                let needs_verif_ranges_bucket = needs_verif_ranges_by_rg
+                    .entry(row_group_id)
+                    .or_insert_with(Vec::new);
 
                 for flat_row in rg.rows.iter() {
                     let row: u32 = flat_row.row.to_native();
@@ -864,9 +1065,10 @@ impl KeywordSearcher {
                     let parent_chunk: Option<u16> = flat_row.parent_chunk.as_ref().map(|c| c.to_native());
                     let parent_position: Option<u16> = flat_row.parent_position.as_ref().map(|p| p.to_native());
 
+                    let end_row = row + additional_rows;
                     let range = RowRange {
                         start_row: row,
-                        end_row: row + additional_rows,
+                        end_row,
                         splits_matched,
                         parent_chunk,
                         parent_position,
@@ -878,11 +1080,13 @@ impl KeywordSearcher {
                             Some(sm) if sm.get() & 1 != 0 => {
                                 // Bit 0 set: this is a root value → verified equals
                                 row_ranges.push(range);
+                                verified_ranges_bucket.push((row, end_row));
                                 total_occurrences = total_occurrences.saturating_add(num_rows);
                             }
                             None => {
                                 // Split-eliminated: can't tell → needs verification
                                 needs_verif_ranges.push(range);
+                                needs_verif_ranges_bucket.push((row, end_row));
                                 needs_verif_occurrences = needs_verif_occurrences.saturating_add(num_rows);
                             }
                             _ => {
@@ -891,6 +1095,7 @@ impl KeywordSearcher {
                         }
                     } else {
                         row_ranges.push(range);
+                        verified_ranges_bucket.push((row, end_row));
                         total_occurrences = total_occurrences.saturating_add(num_rows);
                     }
                 }
@@ -959,9 +1164,18 @@ impl KeywordSearcher {
                 .map(|s| s.to_string())
                 .collect()
         } else {
-            column_details.iter()
-                .map(|cd| cd.column_name.clone())
-                .collect()
+            // Specific-column search: the `columns` list must reflect the
+            // target column regardless of whether rows went to verified or
+            // needs_verification. When split elimination has pushed every row
+            // into needs_verif_column_details, `column_details` is empty —
+            // fall through to the pending entries so the check-column name
+            // is preserved for post-decode verification.
+            column_details
+                .iter()
+                .chain(needs_verif_column_details.iter())
+                .next()
+                .map(|cd| vec![cd.column_name.clone()])
+                .unwrap_or_default()
         };
 
         let keyword_splits = archived_item.splits_matched.as_ref()
@@ -969,12 +1183,21 @@ impl KeywordSearcher {
 
         let found = !column_details.is_empty() || !needs_verif_column_details.is_empty();
 
+        // Drop empty per-rg buckets so consumers see only row groups that
+        // actually contain ranges. Wrap the canonical maps in Arc once; every
+        // downstream stage clones the Arc instead of rebuilding the HashMap.
+        verified_ranges_by_rg.retain(|_, v| !v.is_empty());
+        needs_verif_ranges_by_rg.retain(|_, v| !v.is_empty());
+        let verified_ranges_by_rg = std::sync::Arc::new(verified_ranges_by_rg);
+        let needs_verif_ranges_by_rg = std::sync::Arc::new(needs_verif_ranges_by_rg);
+
         let verified = if !column_details.is_empty() {
             Some(KeywordLocationData {
                 columns: columns.clone(),
                 total_occurrences,
                 splits_matched: keyword_splits,
                 column_details,
+                ranges_by_rg: verified_ranges_by_rg,
             })
         } else {
             None
@@ -986,6 +1209,7 @@ impl KeywordSearcher {
                 total_occurrences: needs_verif_occurrences,
                 splits_matched: keyword_splits,
                 column_details: needs_verif_column_details,
+                ranges_by_rg: needs_verif_ranges_by_rg,
             })
         } else {
             None
@@ -1177,6 +1401,13 @@ impl KeywordSearcher {
             .filter(|&id| id != 0)
             .collect();
 
+        // Canonical per-row-group range form, built inline — see first
+        // search_with_mode flat_row loop for full explanation.
+        let mut verified_ranges_by_rg: std::collections::HashMap<u16, Vec<(u32, u32)>> =
+            std::collections::HashMap::new();
+        let mut needs_verif_ranges_by_rg: std::collections::HashMap<u16, Vec<(u32, u32)>> =
+            std::collections::HashMap::new();
+
         for col in &archived_data.columns {
             let column_id: u32 = col.column_id;
 
@@ -1201,11 +1432,18 @@ impl KeywordSearcher {
                 let row_group_id: u16 = rg.row_group_id;
                 let mut row_ranges = Vec::new();
                 let mut needs_verif_ranges = Vec::new();
+                let verified_ranges_bucket = verified_ranges_by_rg
+                    .entry(row_group_id)
+                    .or_insert_with(Vec::new);
+                let needs_verif_ranges_bucket = needs_verif_ranges_by_rg
+                    .entry(row_group_id)
+                    .or_insert_with(Vec::new);
 
                 for flat_row in &rg.rows {
+                    let end_row = flat_row.row + flat_row.additional_rows;
                     let range = RowRange {
                         start_row: flat_row.row,
-                        end_row: flat_row.row + flat_row.additional_rows,
+                        end_row,
                         splits_matched: flat_row.splits_matched,
                         parent_chunk: flat_row.parent_chunk,
                         parent_position: flat_row.parent_position,
@@ -1216,16 +1454,19 @@ impl KeywordSearcher {
                         match flat_row.splits_matched {
                             Some(sm) if sm.get() & 1 != 0 => {
                                 row_ranges.push(range);
+                                verified_ranges_bucket.push((flat_row.row, end_row));
                                 total_occurrences = total_occurrences.saturating_add(num_rows);
                             }
                             None => {
                                 needs_verif_ranges.push(range);
+                                needs_verif_ranges_bucket.push((flat_row.row, end_row));
                                 needs_verif_occurrences = needs_verif_occurrences.saturating_add(num_rows);
                             }
                             _ => {}
                         }
                     } else {
                         row_ranges.push(range);
+                        verified_ranges_bucket.push((flat_row.row, end_row));
                         total_occurrences = total_occurrences.saturating_add(num_rows);
                     }
                 }
@@ -1297,13 +1538,30 @@ impl KeywordSearcher {
                 .map(|s| s.to_string())
                 .collect()
         } else {
-            column_details.iter()
-                .map(|cd| cd.column_name.clone())
-                .collect()
+            // Specific-column search: the `columns` list must reflect the
+            // target column regardless of whether rows went to verified or
+            // needs_verification. When split elimination has pushed every row
+            // into needs_verif_column_details, `column_details` is empty —
+            // fall through to the pending entries so the check-column name
+            // is preserved for post-decode verification.
+            column_details
+                .iter()
+                .chain(needs_verif_column_details.iter())
+                .next()
+                .map(|cd| vec![cd.column_name.clone()])
+                .unwrap_or_default()
         };
 
         let keyword_splits = archived_data.splits_matched;
         let found = !column_details.is_empty() || !needs_verif_column_details.is_empty();
+
+        // Drop empty per-rg buckets so consumers see only row groups that
+        // actually contain ranges. Wrap the canonical maps in Arc once; every
+        // downstream stage clones the Arc instead of rebuilding the HashMap.
+        verified_ranges_by_rg.retain(|_, v| !v.is_empty());
+        needs_verif_ranges_by_rg.retain(|_, v| !v.is_empty());
+        let verified_ranges_by_rg = std::sync::Arc::new(verified_ranges_by_rg);
+        let needs_verif_ranges_by_rg = std::sync::Arc::new(needs_verif_ranges_by_rg);
 
         let verified = if !column_details.is_empty() {
             Some(KeywordLocationData {
@@ -1311,6 +1569,7 @@ impl KeywordSearcher {
                 total_occurrences,
                 splits_matched: keyword_splits,
                 column_details,
+                ranges_by_rg: verified_ranges_by_rg,
             })
         } else {
             None
@@ -1322,6 +1581,7 @@ impl KeywordSearcher {
                 total_occurrences: needs_verif_occurrences,
                 splits_matched: keyword_splits,
                 column_details: needs_verif_column_details,
+                ranges_by_rg: needs_verif_ranges_by_rg,
             })
         } else {
             None
@@ -1592,105 +1852,7 @@ impl KeywordSearcher {
     /// }
     /// ```
     pub fn combine_and(results: &[SearchResult]) -> Option<CombinedSearchResult> {
-        if results.is_empty() {
-            return None;
-        }
-
-        // Check if all keywords were found
-        if results.iter().any(|r| !r.found) {
-            return Some(CombinedSearchResult {
-                keywords: results.iter().map(|r| r.query.clone()).collect(),
-                row_groups: Vec::new(),
-            });
-        }
-
-        // Build per-column row sets for each result
-        // Structure: result_idx -> column_name -> row_group_id -> HashSet<row>
-        let mut per_result_columns: Vec<HashMap<String, HashMap<u16, std::collections::HashSet<u32>>>> = Vec::new();
-
-        for result in results {
-            let mut column_map: HashMap<String, HashMap<u16, std::collections::HashSet<u32>>> = HashMap::new();
-
-            if let Some(data) = &result.verified_matches {
-                for col in &data.column_details {
-                    let rg_map = column_map.entry(col.column_name.clone()).or_insert_with(HashMap::new);
-
-                    for rg in &col.row_groups {
-                        let rows = rg_map.entry(rg.row_group_id).or_insert_with(std::collections::HashSet::new);
-                        for range in &rg.row_ranges {
-                            for row in range.start_row..=range.end_row {
-                                rows.insert(row);
-                            }
-                        }
-                    }
-                }
-            }
-
-            per_result_columns.push(column_map);
-        }
-
-        // Find intersection: rows that appear across all results in ANY column combination
-        let mut combined_row_groups: HashMap<u16, std::collections::HashSet<u32>> = HashMap::new();
-
-        // Start with all row groups from first result
-        if let Some(first_columns) = per_result_columns.first() {
-            for rg_map in first_columns.values() {
-                for (&rg_id, first_rows) in rg_map {
-                    // For each row in this row group, check if it exists in remaining results
-                    for &row in first_rows {
-                        let mut found_in_all = true;
-
-                        // Check if this row exists in ANY column of each remaining result
-                        for other_columns in &per_result_columns[1..] {
-                            let mut found_in_this_result = false;
-
-                            for other_rg_map in other_columns.values() {
-                                if let Some(other_rows) = other_rg_map.get(&rg_id) {
-                                    if other_rows.contains(&row) {
-                                        found_in_this_result = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if !found_in_this_result {
-                                found_in_all = false;
-                                break;
-                            }
-                        }
-
-                        if found_in_all {
-                            combined_row_groups
-                                .entry(rg_id)
-                                .or_insert_with(std::collections::HashSet::new)
-                                .insert(row);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Convert to result format
-        let mut row_groups = Vec::new();
-        for (rg_id, rows) in combined_row_groups {
-            let mut sorted_rows: Vec<u32> = rows.into_iter().collect();
-            sorted_rows.sort_unstable();
-
-            // Combine consecutive rows into ranges
-            let ranges = rows_to_ranges(&sorted_rows);
-
-            row_groups.push(CombinedRowGroupLocation {
-                row_group_id: rg_id,
-                row_ranges: ranges,
-            });
-        }
-
-        row_groups.sort_by_key(|rg| rg.row_group_id);
-
-        Some(CombinedSearchResult {
-            keywords: results.iter().map(|r| r.query.clone()).collect(),
-            row_groups,
-        })
+        combine_impl(results, CombinerKind::And)
     }
 
     /// Combine multiple search results with OR logic.
@@ -1773,53 +1935,7 @@ impl KeywordSearcher {
     /// }
     /// ```
     pub fn combine_or(results: &[SearchResult]) -> Option<CombinedSearchResult> {
-        if results.is_empty() {
-            return None;
-        }
-
-        let mut combined_row_groups: HashMap<u16, std::collections::HashSet<u32>> =
-            HashMap::new();
-
-        // Union all rows from all results
-        for result in results {
-            if !result.found {
-                continue;
-            }
-
-            let data = result.verified_matches.as_ref()?;
-            for col in &data.column_details {
-                for rg in &col.row_groups {
-                    let rows = combined_row_groups.entry(rg.row_group_id).or_insert_with(std::collections::HashSet::new);
-                    for range in &rg.row_ranges {
-                        for row in range.start_row..=range.end_row {
-                            rows.insert(row);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Convert to result format
-        let mut row_groups = Vec::new();
-        for (rg_id, rows) in combined_row_groups {
-            let mut sorted_rows: Vec<u32> = rows.into_iter().collect();
-            sorted_rows.sort_unstable();
-
-            // Combine consecutive rows into ranges
-            let ranges = rows_to_ranges(&sorted_rows);
-
-            row_groups.push(CombinedRowGroupLocation {
-                row_group_id: rg_id,
-                row_ranges: ranges,
-            });
-        }
-
-        row_groups.sort_by_key(|rg| rg.row_group_id);
-
-        Some(CombinedSearchResult {
-            keywords: results.iter().map(|r| r.query.clone()).collect(),
-            row_groups,
-        })
+        combine_impl(results, CombinerKind::Or)
     }
 
     /// Check if the index is valid for the current parquet file
@@ -2338,11 +2454,30 @@ impl KeywordSearcher {
             });
         }
 
+        // Derive canonical per-row-group ranges from the first column_details
+        // entry (for this phrase-search helper all entries share the same
+        // rows, mirroring the aggregate-replication pattern).
+        let mut ranges_by_rg: std::collections::HashMap<u16, Vec<(u32, u32)>> =
+            std::collections::HashMap::new();
+        if let Some(cd) = column_details.first() {
+            for rg in &cd.row_groups {
+                let bucket = ranges_by_rg.entry(rg.row_group_id).or_insert_with(Vec::new);
+                for range in &rg.row_ranges {
+                    bucket.push((range.start_row, range.end_row));
+                }
+            }
+            for v in ranges_by_rg.values_mut() {
+                v.sort_unstable();
+                merge_adjacent_ranges(v);
+            }
+        }
+
         KeywordLocationData {
             columns,
             total_occurrences: total_rows,
             splits_matched,
             column_details,
+            ranges_by_rg: std::sync::Arc::new(ranges_by_rg),
         }
     }
 

@@ -10,3 +10,4 @@ mod different_splitting;
 mod comprehensive_test_modified_splits;
 mod yellow_taxi_test;
 mod split_match_nulls;
+mod combined_with_verification;
