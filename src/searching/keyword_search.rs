@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use rkyv::Archived;
 use rkyv::util::AlignedVec;
 use rkyv::rancor::Error as RkyvError;
-use crate::index_data::{IndexFilters, KeywordDataFlat, ChunkInfo};
+use crate::index_data::{IndexFilters, KeywordDataFlat, RowGroupDataFlat, ChunkInfo};
 use crate::index_structure::column_filter::ColumnFilter;
 use crate::index_structure::index_files::{index_filename, IndexFile};
 use crate::ParquetSource;
@@ -306,6 +306,23 @@ pub struct KeywordSearcher {
     pub(super) index_file_prefix: Option<String>,
 }
 
+/// Specification for one search within a [`KeywordSearcher::search_many`] batch.
+///
+/// Fields mirror the arguments of [`KeywordSearcher::search_with_mode`]:
+/// - `search_for`: the query keyword or phrase
+/// - `in_column`: optional column filter; `None` searches the aggregate column
+/// - `keyword_only`: when `true`, do a single-token keyword lookup; when
+///   `false`, split the query as a phrase and verify multi-token matches
+/// - `mode`: [`SearchMode::Contains`] for substring/token matching,
+///   [`SearchMode::Equals`] for exact value matching
+#[derive(Debug, Clone)]
+pub struct SearchSpec {
+    pub search_for: String,
+    pub in_column: Option<String>,
+    pub keyword_only: bool,
+    pub mode: SearchMode,
+}
+
 impl KeywordSearcher {
     /// Create searcher from serialized index data (used for testing and after load).
     ///
@@ -349,10 +366,12 @@ impl KeywordSearcher {
             keywords_compression: match &archived_filters.keywords_compression {
                 crate::index_data::ArchivedCompressionAlgorithm::None => crate::index_data::CompressionAlgorithm::None,
                 crate::index_data::ArchivedCompressionAlgorithm::Zstd { level } => { crate::index_data::CompressionAlgorithm::Zstd { level: level.to_native() } }
+                crate::index_data::ArchivedCompressionAlgorithm::Lz4 => crate::index_data::CompressionAlgorithm::Lz4,
             },
             data_compression: match &archived_filters.data_compression {
                 crate::index_data::ArchivedCompressionAlgorithm::None => crate::index_data::CompressionAlgorithm::None,
                 crate::index_data::ArchivedCompressionAlgorithm::Zstd { level } => { crate::index_data::CompressionAlgorithm::Zstd { level: level.to_native() } }
+                crate::index_data::ArchivedCompressionAlgorithm::Lz4 => crate::index_data::CompressionAlgorithm::Lz4,
             },
             column_pool: {
                 let mut pool = crate::utils::column_pool::ColumnPool::new();
@@ -561,101 +580,6 @@ impl KeywordSearcher {
         Ok(archived.iter().map(|s| s.to_string()).collect())
     }
 
-    /// Read a complete chunk (keywords + data) from data.bin.
-    ///
-    /// Performs a single range read to fetch both the keyword list and the
-    /// occurrence data for a chunk. Returns both deserialized structures.
-    ///
-    /// # Arguments
-    ///
-    /// * `chunk_number` - The chunk number to read (0-indexed)
-    ///
-    /// # Returns
-    ///
-    /// `Ok((Vec<String>, Vec<KeywordDataFlat>))` containing keywords and their data
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Chunk number is out of bounds
-    /// - File I/O fails
-    /// - Deserialization fails
-    async fn read_full_chunk(&self, chunk_number: u16) -> Result<(Vec<String>, Vec<KeywordDataFlat>), Box<dyn std::error::Error + Send + Sync>> {
-        let chunk_info = self.filters.chunk_index.get(chunk_number as usize)
-            .ok_or_else(|| format!("Chunk {} not found in index", chunk_number))?;
-
-        let data_path = format!("{}/{}", self.index_dir,
-                                index_filename(IndexFile::Data, self.index_file_prefix.as_deref()));
-
-        // Use object store abstraction
-        let (store, obj_path) = get_object_store(&data_path).await?;
-
-        // Read the entire chunk (keywords + data)
-        let start = chunk_info.offset;
-        let length = chunk_info.total_length as u64;
-
-        let range = start..(start + length);
-
-        let result = store.get_range(&obj_path, range).await?;
-        let buffer = result.to_vec();
-
-        // Split buffer into compressed keyword section and compressed data section
-        let keyword_length = chunk_info.keyword_list_length as usize;
-        let compressed_keyword_bytes = &buffer[..keyword_length];
-        let compressed_data_bytes = &buffer[keyword_length..];
-
-        // Decompress keyword list
-        let keyword_bytes = self.filters.keywords_compression.decompress(compressed_keyword_bytes)?;
-
-        // Deserialize keyword list
-        let mut keyword_buffer = AlignedVec::<16>::new();
-        keyword_buffer.extend_from_slice(&keyword_bytes);
-
-        let archived_keywords: &Archived<Vec<String>> = rkyv::access(&keyword_buffer)
-            .map_err(|e: RkyvError| format!("Failed to deserialize keyword list: {}", e))?;
-
-        let keywords: Vec<String> = archived_keywords.iter().map(|s| s.to_string()).collect();
-
-        // Decompress data section
-        let data_bytes = self.filters.data_compression.decompress(compressed_data_bytes)?;
-
-        // Deserialize data section
-        let mut data_buffer = AlignedVec::<16>::new();
-        data_buffer.extend_from_slice(&data_bytes);
-
-        let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
-            .map_err(|e: RkyvError| format!("Failed to deserialize chunk data: {}", e))?;
-
-        let data: Vec<KeywordDataFlat> = archived_data.iter().map(|item| {
-            KeywordDataFlat {
-                columns: item.columns.iter().map(|col| {
-                    crate::index_data::ColumnDataFlat {
-                        column_id: col.column_id.to_native(),
-                        row_groups: col.row_groups.iter().map(|rg| {
-                            crate::index_data::RowGroupDataFlat {
-                                row_group_id: rg.row_group_id.to_native(),
-                                rows: rg.rows.iter().map(|row| {
-                                    crate::index_data::FlatRow {
-                                        row: row.row.to_native(),
-                                        additional_rows: row.additional_rows.to_native(),
-                                        splits_matched: row.splits_matched.as_ref()
-                                            .map(|s| s.to_native()),
-                                        parent_chunk: row.parent_chunk.as_ref().map(|c| c.to_native()),
-                                        parent_position: row.parent_position.as_ref().map(|p| p.to_native()),
-                                    }
-                                }).collect(),
-                            }
-                        }).collect(),
-                    }
-                }).collect(),
-                splits_matched: item.splits_matched.as_ref()
-                    .map(|s| s.to_native()),
-            }
-        }).collect();
-
-        Ok((keywords, data))
-    }
-
     /// Look up a parent keyword by its chunk and position.
     ///
     /// Reads the keyword list for the specified chunk and returns the keyword
@@ -819,6 +743,63 @@ impl KeywordSearcher {
         }
     }
 
+    /// Run many independent searches in parallel, preserving the input order.
+    ///
+    /// Each spec is dispatched to its own `tokio::spawn` task so zstd
+    /// decompression and chunk reads can overlap across CPU cores — the
+    /// biggest remaining cost in the index phase for multi-keyword queries.
+    /// Returns once every task has finished; if any task errors the whole
+    /// batch errors.
+    ///
+    /// Caller must hold the searcher behind an `Arc` so each task can own a
+    /// clone for its `'static` future:
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use keywords::searching::keyword_search::{KeywordSearcher, SearchSpec};
+    /// # use keywords::searching::search_results::SearchMode;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// let searcher = Arc::new(KeywordSearcher::load("data.parquet", None).await?);
+    /// let results = searcher.search_many(vec![
+    ///     SearchSpec { search_for: "1".into(), in_column: Some("passenger_count".into()),
+    ///                  keyword_only: false, mode: SearchMode::Equals },
+    ///     SearchSpec { search_for: "2".into(), in_column: Some("VendorID".into()),
+    ///                  keyword_only: false, mode: SearchMode::Equals },
+    /// ]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn search_many(
+        self: &std::sync::Arc<Self>,
+        specs: Vec<SearchSpec>,
+    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let handles: Vec<_> = specs
+            .into_iter()
+            .map(|spec| {
+                let this = std::sync::Arc::clone(self);
+                tokio::spawn(async move {
+                    this.search_with_mode(
+                        &spec.search_for,
+                        spec.in_column.as_deref(),
+                        spec.keyword_only,
+                        spec.mode,
+                    )
+                    .await
+                })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(result)) => results.push(result),
+                Ok(Err(e)) => return Err(e),
+                Err(join_err) => return Err(Box::new(join_err)),
+            }
+        }
+        Ok(results)
+    }
+
     /// Internal zero-copy keyword search implementation.
     ///
     /// Performs keyword lookup with minimal memory allocations by using zero-copy
@@ -858,6 +839,10 @@ impl KeywordSearcher {
         column_filter: Option<&str>,
         mode: SearchMode,
     ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(feature = "timing")]
+        let _t_total = std::time::Instant::now();
+        #[cfg(feature = "timing")]
+        let _t_phase = std::time::Instant::now();
         // Step 1: Check appropriate filter
         if let Some(col_name) = column_filter {
             if let Some(filter) = self.filters.column_filters.get(col_name) {
@@ -891,6 +876,11 @@ impl KeywordSearcher {
             }
         }
 
+        #[cfg(feature = "timing")]
+        let _t_filter_elapsed = _t_phase.elapsed();
+        #[cfg(feature = "timing")]
+        let _t_phase = std::time::Instant::now();
+
         // Step 2: Find chunk
         let chunk_info = self.find_chunk_for_keyword(keyword);
         let chunk_idx = match chunk_info {
@@ -919,6 +909,10 @@ impl KeywordSearcher {
 
         // Copy into buffer
         let buffer = result.to_vec();
+        #[cfg(feature = "timing")]
+        let _t_io_elapsed = _t_phase.elapsed();
+        #[cfg(feature = "timing")]
+        let _t_phase = std::time::Instant::now();
 
         // Step 4: Decompress and access archived data
         let keyword_length = chunk_info.keyword_list_length as usize;
@@ -947,24 +941,42 @@ impl KeywordSearcher {
                 });
             }
         };
+        #[cfg(feature = "timing")]
+        let _t_kw_decompress_elapsed = _t_phase.elapsed();
+        #[cfg(feature = "timing")]
+        let _t_phase = std::time::Instant::now();
 
-        // Decompress data section
-        let data_bytes = self.filters.data_compression.decompress(compressed_data_bytes)?;
+        // Access data section directly — the outer data section is stored
+        // uncompressed (row-group bytes are compressed per-column inside each
+        // KeywordDataFlat). This is intentional: re-compressing already-
+        // compressed blobs would near-zero gain and double the work on read.
         let mut data_buffer = AlignedVec::<16>::new();
-        data_buffer.extend_from_slice(&data_bytes);
+        data_buffer.extend_from_slice(compressed_data_bytes);
 
-        // Access data section
         let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize chunk data: {}", e))?;
 
         // Get only the one item we need (still zero-copy)
         let archived_item = &archived_data[position];
+        #[cfg(feature = "timing")]
+        let _t_data_access_elapsed = _t_phase.elapsed();
+        #[cfg(feature = "timing")]
+        let _t_phase = std::time::Instant::now();
+
+        // Normalise the archived enum: pull splits_matched out, decompress the
+        // Inline blob once up front (its bytes need to live until after the
+        // column loop), and pre-build `all_column_ids` / the column_id lookup.
+        use crate::index_data::{ArchivedKeywordDataFlat, ColumnDataInline};
+        let splits_matched_archived = match archived_item {
+            ArchivedKeywordDataFlat::Inline { splits_matched, .. } => splits_matched,
+            ArchivedKeywordDataFlat::PerColumn { splits_matched, .. } => splits_matched,
+        };
 
         // For Equals mode: check keyword-level splits_matched for bit 0.
-        // If bit 0 is not set, this keyword was never a root value — it only ever
-        // appeared as a sub-token from splitting.  Return not found.
+        // If bit 0 is not set, this keyword was never a root value — it only
+        // ever appeared as a sub-token from splitting.  Return not found.
         if mode == SearchMode::Equals {
-            let keyword_has_root = archived_item.splits_matched.as_ref()
+            let keyword_has_root = splits_matched_archived.as_ref()
                 .map(|s| s.to_native().get() & 1 != 0)
                 .unwrap_or(false);
             if !keyword_has_root {
@@ -978,18 +990,61 @@ impl KeywordSearcher {
             }
         }
 
+        // If this keyword is stored Inline, decompress the single blob once
+        // so the archived column view is stable for the whole lookup.
+        // Keep `inline_buffer` alive in this outer scope.
+        let inline_buffer: Option<AlignedVec<16>> = match archived_item {
+            ArchivedKeywordDataFlat::Inline { compressed_columns, .. } => {
+                let inline_bytes = self
+                    .filters
+                    .data_compression
+                    .decompress(compressed_columns.as_ref())?;
+                let mut buf = AlignedVec::<16>::new();
+                buf.extend_from_slice(&inline_bytes);
+                Some(buf)
+            }
+            ArchivedKeywordDataFlat::PerColumn { .. } => None,
+        };
+        let archived_inline: Option<&Archived<Vec<ColumnDataInline>>> = match &inline_buffer {
+            Some(buf) => Some(
+                rkyv::access(buf)
+                    .map_err(|e: RkyvError| format!("Failed to deserialize inline columns: {}", e))?,
+            ),
+            None => None,
+        };
+
+        // `all_column_ids` (non-0) used later when expanding the aggregate.
+        let all_column_ids: Vec<u32> = match archived_item {
+            ArchivedKeywordDataFlat::PerColumn { columns, .. } => columns
+                .iter()
+                .map(|c| c.column_id.to_native())
+                .filter(|&id| id != 0)
+                .collect(),
+            ArchivedKeywordDataFlat::Inline { .. } => archived_inline
+                .expect("inline_buffer set for Inline variant")
+                .iter()
+                .map(|c| c.column_id.to_native())
+                .filter(|&id| id != 0)
+                .collect(),
+        };
+
         // Determine which column(s) to process
         let filter_to_column_id: Option<u32> = if let Some(col_name) = column_filter {
-            let found_id = archived_item.columns.iter()
-                .map(|col| col.column_id.to_native())
-                .find(|&id| {
-                    if id == 0 { return false; }
-                    if let Some(name) = self.filters.column_pool.get(id) {
-                        name == col_name
-                    } else {
-                        false
-                    }
-                });
+            let name_matches = |id: u32| -> bool {
+                if id == 0 { return false; }
+                self.filters.column_pool.get(id).map(|n| n == col_name).unwrap_or(false)
+            };
+            let found_id: Option<u32> = match archived_item {
+                ArchivedKeywordDataFlat::PerColumn { columns, .. } => columns
+                    .iter()
+                    .map(|c| c.column_id.to_native())
+                    .find(|&id| name_matches(id)),
+                ArchivedKeywordDataFlat::Inline { .. } => archived_inline
+                    .expect("inline_buffer set for Inline variant")
+                    .iter()
+                    .map(|c| c.column_id.to_native())
+                    .find(|&id| name_matches(id)),
+            };
 
             if found_id.is_none() {
                 return Ok(SearchResult {
@@ -1011,11 +1066,6 @@ impl KeywordSearcher {
         let mut total_occurrences = 0u64;
         let mut needs_verif_occurrences = 0u64;
 
-        let all_column_ids: Vec<u32> = archived_item.columns.iter()
-            .map(|col| col.column_id.to_native())
-            .filter(|&id| id != 0)
-            .collect();
-
         // Canonical per-row-group `(start, end)` ranges for the reader path —
         // built inline alongside the `RowRange` pushes below so the reader
         // doesn't have to re-walk `column_details` downstream. Only one col
@@ -1026,15 +1076,19 @@ impl KeywordSearcher {
         let mut needs_verif_ranges_by_rg: std::collections::HashMap<u16, Vec<(u32, u32)>> =
             std::collections::HashMap::new();
 
-        for col in archived_item.columns.iter() {
-            let column_id: u32 = col.column_id.to_native();
-
-            if let Some(target_id) = filter_to_column_id {
-                if column_id != target_id {
-                    continue;
-                }
-            }
-
+        // Closure: walk one column's archived row_groups and fold into the
+        // shared output state. Shared between the Inline and PerColumn paths
+        // so the downstream merge/dedup logic lives in exactly one place.
+        let process_column =
+            |column_id: u32,
+             archived_row_groups: &Archived<Vec<RowGroupDataFlat>>,
+             column_details: &mut Vec<ColumnLocation>,
+             needs_verif_column_details: &mut Vec<ColumnLocation>,
+             total_occurrences: &mut u64,
+             needs_verif_occurrences: &mut u64,
+             verified_ranges_by_rg: &mut std::collections::HashMap<u16, Vec<(u32, u32)>>,
+             needs_verif_ranges_by_rg: &mut std::collections::HashMap<u16, Vec<(u32, u32)>>|
+             -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let column_name = if column_id == 0 {
                 "_all_columns_aggregate_".to_string()
             } else {
@@ -1046,7 +1100,7 @@ impl KeywordSearcher {
             let mut row_groups = Vec::new();
             let mut needs_verif_row_groups = Vec::new();
 
-            for rg in col.row_groups.iter() {
+            for rg in archived_row_groups.iter() {
                 let row_group_id: u16 = rg.row_group_id.to_native();
                 let mut row_ranges = Vec::new();
                 let mut needs_verif_ranges = Vec::new();
@@ -1078,16 +1132,14 @@ impl KeywordSearcher {
                     if mode == SearchMode::Equals {
                         match splits_matched {
                             Some(sm) if sm.get() & 1 != 0 => {
-                                // Bit 0 set: this is a root value → verified equals
                                 row_ranges.push(range);
                                 verified_ranges_bucket.push((row, end_row));
-                                total_occurrences = total_occurrences.saturating_add(num_rows);
+                                *total_occurrences = total_occurrences.saturating_add(num_rows);
                             }
                             None => {
-                                // Split-eliminated: can't tell → needs verification
                                 needs_verif_ranges.push(range);
                                 needs_verif_ranges_bucket.push((row, end_row));
-                                needs_verif_occurrences = needs_verif_occurrences.saturating_add(num_rows);
+                                *needs_verif_occurrences = needs_verif_occurrences.saturating_add(num_rows);
                             }
                             _ => {
                                 // No bit 0: sub-token only → skip
@@ -1096,15 +1148,12 @@ impl KeywordSearcher {
                     } else {
                         row_ranges.push(range);
                         verified_ranges_bucket.push((row, end_row));
-                        total_occurrences = total_occurrences.saturating_add(num_rows);
+                        *total_occurrences = total_occurrences.saturating_add(num_rows);
                     }
                 }
 
                 if !row_ranges.is_empty() {
-                    row_groups.push(RowGroupLocation {
-                        row_group_id,
-                        row_ranges,
-                    });
+                    row_groups.push(RowGroupLocation { row_group_id, row_ranges });
                 }
                 if !needs_verif_ranges.is_empty() {
                     needs_verif_row_groups.push(RowGroupLocation {
@@ -1126,7 +1175,64 @@ impl KeywordSearcher {
                     row_groups: needs_verif_row_groups,
                 });
             }
+            Ok(())
+        };
+
+        match archived_item {
+            ArchivedKeywordDataFlat::Inline { .. } => {
+                // Inline: every column's row_groups is already archived inside
+                // the single decompressed blob, so just iterate them directly.
+                let archived_inline = archived_inline.expect("inline_buffer set for Inline variant");
+                for col in archived_inline.iter() {
+                    let column_id: u32 = col.column_id.to_native();
+                    if let Some(target_id) = filter_to_column_id {
+                        if column_id != target_id { continue; }
+                    }
+                    process_column(
+                        column_id,
+                        &col.row_groups,
+                        &mut column_details,
+                        &mut needs_verif_column_details,
+                        &mut total_occurrences,
+                        &mut needs_verif_occurrences,
+                        &mut verified_ranges_by_rg,
+                        &mut needs_verif_ranges_by_rg,
+                    )?;
+                }
+            }
+            ArchivedKeywordDataFlat::PerColumn { columns, .. } => {
+                // PerColumn: decompress only the columns we actually consume.
+                for col in columns.iter() {
+                    let column_id: u32 = col.column_id.to_native();
+                    if let Some(target_id) = filter_to_column_id {
+                        if column_id != target_id { continue; }
+                    }
+                    let col_bytes = self
+                        .filters
+                        .data_compression
+                        .decompress(col.compressed_row_groups.as_ref())?;
+                    let mut col_buffer = AlignedVec::<16>::new();
+                    col_buffer.extend_from_slice(&col_bytes);
+                    let archived_row_groups: &Archived<Vec<RowGroupDataFlat>> =
+                        rkyv::access(&col_buffer)
+                            .map_err(|e: RkyvError| format!("Failed to deserialize row_groups: {}", e))?;
+                    process_column(
+                        column_id,
+                        archived_row_groups,
+                        &mut column_details,
+                        &mut needs_verif_column_details,
+                        &mut total_occurrences,
+                        &mut needs_verif_occurrences,
+                        &mut verified_ranges_by_rg,
+                        &mut needs_verif_ranges_by_rg,
+                    )?;
+                }
+            }
         }
+        #[cfg(feature = "timing")]
+        let _t_row_walk_elapsed = _t_phase.elapsed();
+        #[cfg(feature = "timing")]
+        let _t_phase = std::time::Instant::now();
 
         if filter_to_column_id == Some(0) && !column_details.is_empty() {
             let aggregate_row_groups = column_details[0].row_groups.clone();
@@ -1157,10 +1263,9 @@ impl KeywordSearcher {
         }
 
         let columns: Vec<String> = if filter_to_column_id == Some(0) {
-            archived_item.columns.iter()
-                .map(|col| col.column_id.to_native())
-                .filter(|&id| id != 0)
-                .filter_map(|id| self.filters.column_pool.get(id))
+            all_column_ids
+                .iter()
+                .filter_map(|id| self.filters.column_pool.get(*id))
                 .map(|s| s.to_string())
                 .collect()
         } else {
@@ -1178,7 +1283,7 @@ impl KeywordSearcher {
                 .unwrap_or_default()
         };
 
-        let keyword_splits = archived_item.splits_matched.as_ref()
+        let keyword_splits = splits_matched_archived.as_ref()
             .map(|s| s.to_native());
 
         let found = !column_details.is_empty() || !needs_verif_column_details.is_empty();
@@ -1215,377 +1320,23 @@ impl KeywordSearcher {
             None
         };
 
-        Ok(SearchResult {
-            query: keyword.to_string(),
-            found,
-            tokens: vec![keyword.to_string()],
-            verified_matches: verified,
-            needs_verification,
-        })
-    }
-
-    /// Internal keyword search implementation with full deserialization.
-    ///
-    /// Alternative search implementation that fully deserializes chunk data.
-    /// Currently not used by the public API, which prefers `search_keyword_internal_zerocopy`
-    /// for better performance.
-    ///
-    /// # Arguments
-    ///
-    /// * `keyword` - The exact keyword to search for (case-sensitive)
-    /// * `column_filter` - Optional column name to restrict search to a specific column
-    ///
-    /// # Returns
-    ///
-    /// `Ok(SearchResult)` containing:
-    /// * `found: false` - Keyword not in index (bloom filter rejection)
-    /// * `found: true` - Keyword found with complete location information
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// * Index data cannot be read or deserialized
-    /// * Column pool lookup fails
-    ///
-    /// # Implementation Note
-    ///
-    /// This method performs full deserialization of chunk data, while
-    /// `search_keyword_internal_zerocopy` uses zero-copy deserialization for
-    /// better performance. Kept for potential future use or debugging.
-    async fn search_keyword_internal(
-        &self,
-        keyword: &str,
-        column_filter: Option<&str>,
-    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
-        self.search_keyword_internal_with_mode(keyword, column_filter, SearchMode::Contains).await
-    }
-
-    async fn search_keyword_internal_with_mode(
-        &self,
-        keyword: &str,
-        column_filter: Option<&str>,
-        mode: SearchMode,
-    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Step 1: Check appropriate filter based on whether we have a column filter
-        if let Some(col_name) = column_filter {
-            // When filtering to a specific column, check that column's bloom filter first
-            if let Some(filter) = self.filters.column_filters.get(col_name) {
-                if !filter.might_contain(keyword) {
-                    return Ok(SearchResult {
-                        query: keyword.to_string(),
-                        found: false,
-                        tokens: vec![keyword.to_string()],
-                        verified_matches: None,
-                        needs_verification: None,
-                    });
-                }
-            } else {
-                // Column doesn't exist in the index
-                return Ok(SearchResult {
-                    query: keyword.to_string(),
-                    found: false,
-                    tokens: vec![keyword.to_string()],
-                    verified_matches: None,
-                    needs_verification: None,
-                });
-            }
-        } else {
-            // When no column filter, check global filter (fast rejection)
-            if !self.filters.global_filter.might_contain(keyword) {
-                return Ok(SearchResult {
-                    query: keyword.to_string(),
-                    found: false,
-                    tokens: vec![keyword.to_string()],
-                    verified_matches: None,
-                    needs_verification: None,
-                });
-            }
+        #[cfg(feature = "timing")]
+        {
+            let _t_build_elapsed = _t_phase.elapsed();
+            let _t_total_elapsed = _t_total.elapsed();
+            eprintln!(
+                "  [timing] search '{}' col={:?}: total={:.2?}  filter={:.2?}  io={:.2?}  kw_decompress={:.2?}  data_access={:.2?}  row_walk+decompress={:.2?}  build={:.2?}",
+                keyword,
+                column_filter,
+                _t_total_elapsed,
+                _t_filter_elapsed,
+                _t_io_elapsed,
+                _t_kw_decompress_elapsed,
+                _t_data_access_elapsed,
+                _t_row_walk_elapsed,
+                _t_build_elapsed,
+            );
         }
-
-        // Step 2: Find the chunk that might contain this keyword
-        let chunk_info = self.find_chunk_for_keyword(keyword);
-
-        let chunk_idx = match chunk_info {
-            Some((idx, _)) => idx,
-            None => {
-                return Ok(SearchResult {
-                    query: keyword.to_string(),
-                    found: false,
-                    tokens: vec![keyword.to_string()],
-                    verified_matches: None,
-                    needs_verification: None,
-                });
-            }
-        };
-
-        // Step 3: Load and search the chunk
-        let (keywords, chunk_data) = self.read_full_chunk(chunk_idx).await?;
-
-        // Find the keyword in the chunk
-        let position = match keywords.binary_search_by(|k| k.as_str().cmp(keyword)) {
-            Ok(pos) => pos,
-            Err(_) => {
-                // Not found (bloom filter false positive)
-                return Ok(SearchResult {
-                    query: keyword.to_string(),
-                    found: false,
-                    tokens: vec![keyword.to_string()],
-                    verified_matches: None,
-                    needs_verification: None,
-                });
-            }
-        };
-
-        // Step 4: Get the keyword data
-        let archived_data = &chunk_data[position];
-
-        // For Equals mode: check keyword-level splits_matched for bit 0.
-        if mode == SearchMode::Equals {
-            let keyword_has_root = archived_data.splits_matched
-                .map(|s| s.get() & 1 != 0)
-                .unwrap_or(false);
-            if !keyword_has_root {
-                return Ok(SearchResult {
-                    query: keyword.to_string(),
-                    found: false,
-                    tokens: vec![keyword.to_string()],
-                    verified_matches: None,
-                    needs_verification: None,
-                });
-            }
-        }
-
-        // Determine which column(s) to process
-        // When column_filter is None, use column_id 0 (aggregate of all columns)
-        // When column_filter is Some, process only that specific column
-        let filter_to_column_id: Option<u32> = if let Some(col_name) = column_filter {
-            // Find the column_id for the requested column
-            let found_id = archived_data.columns.iter()
-                .map(|col| col.column_id)
-                .find(|&id| {
-                    if id == 0 {
-                        return false; // Never match column_id 0 here
-                    }
-                    if let Some(name) = self.filters.column_pool.get(id) {
-                        name == col_name
-                    } else {
-                        false
-                    }
-                });
-
-            if found_id.is_none() {
-                // Column not found in results - return not found
-                return Ok(SearchResult {
-                    query: keyword.to_string(),
-                    found: false,
-                    tokens: vec![keyword.to_string()],
-                    verified_matches: None,
-                    needs_verification: None,
-                });
-            }
-            found_id
-        } else {
-            // No filter - use column_id 0 (aggregate)
-            Some(0)
-        };
-
-        // Step 5: Convert to owned types and build result
-        let mut column_details = Vec::new();
-        let mut needs_verif_column_details = Vec::new();
-        let mut total_occurrences = 0u64;
-        let mut needs_verif_occurrences = 0u64;
-
-        // Collect all column IDs for later expansion if using aggregate
-        let all_column_ids: Vec<u32> = archived_data.columns.iter()
-            .map(|col| col.column_id)
-            .filter(|&id| id != 0)
-            .collect();
-
-        // Canonical per-row-group range form, built inline — see first
-        // search_with_mode flat_row loop for full explanation.
-        let mut verified_ranges_by_rg: std::collections::HashMap<u16, Vec<(u32, u32)>> =
-            std::collections::HashMap::new();
-        let mut needs_verif_ranges_by_rg: std::collections::HashMap<u16, Vec<(u32, u32)>> =
-            std::collections::HashMap::new();
-
-        for col in &archived_data.columns {
-            let column_id: u32 = col.column_id;
-
-            if let Some(target_id) = filter_to_column_id {
-                if column_id != target_id {
-                    continue;
-                }
-            }
-
-            let column_name = if column_id == 0 {
-                "_all_columns_aggregate_".to_string()
-            } else {
-                self.filters.column_pool.get(column_id)
-                    .ok_or("Column not found in pool")?
-                    .to_string()
-            };
-
-            let mut row_groups = Vec::new();
-            let mut needs_verif_row_groups = Vec::new();
-
-            for rg in &col.row_groups {
-                let row_group_id: u16 = rg.row_group_id;
-                let mut row_ranges = Vec::new();
-                let mut needs_verif_ranges = Vec::new();
-                let verified_ranges_bucket = verified_ranges_by_rg
-                    .entry(row_group_id)
-                    .or_insert_with(Vec::new);
-                let needs_verif_ranges_bucket = needs_verif_ranges_by_rg
-                    .entry(row_group_id)
-                    .or_insert_with(Vec::new);
-
-                for flat_row in &rg.rows {
-                    let end_row = flat_row.row + flat_row.additional_rows;
-                    let range = RowRange {
-                        start_row: flat_row.row,
-                        end_row,
-                        splits_matched: flat_row.splits_matched,
-                        parent_chunk: flat_row.parent_chunk,
-                        parent_position: flat_row.parent_position,
-                    };
-                    let num_rows = flat_row.additional_rows as u64 + 1;
-
-                    if mode == SearchMode::Equals {
-                        match flat_row.splits_matched {
-                            Some(sm) if sm.get() & 1 != 0 => {
-                                row_ranges.push(range);
-                                verified_ranges_bucket.push((flat_row.row, end_row));
-                                total_occurrences = total_occurrences.saturating_add(num_rows);
-                            }
-                            None => {
-                                needs_verif_ranges.push(range);
-                                needs_verif_ranges_bucket.push((flat_row.row, end_row));
-                                needs_verif_occurrences = needs_verif_occurrences.saturating_add(num_rows);
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        row_ranges.push(range);
-                        verified_ranges_bucket.push((flat_row.row, end_row));
-                        total_occurrences = total_occurrences.saturating_add(num_rows);
-                    }
-                }
-
-                if !row_ranges.is_empty() {
-                    row_groups.push(RowGroupLocation { row_group_id, row_ranges });
-                }
-                if !needs_verif_ranges.is_empty() {
-                    needs_verif_row_groups.push(RowGroupLocation { row_group_id, row_ranges: needs_verif_ranges });
-                }
-            }
-
-            if !row_groups.is_empty() {
-                column_details.push(ColumnLocation { column_name: column_name.clone(), row_groups });
-            }
-            if !needs_verif_row_groups.is_empty() {
-                needs_verif_column_details.push(ColumnLocation { column_name, row_groups: needs_verif_row_groups });
-            }
-        }
-
-        // TODO: Performance Optimization - Reduce memory duplication when expanding aggregate
-        //
-        // When we expand column_id 0 (aggregate) into per-column entries below, we clone
-        // the row_groups Vec for each column. For keywords appearing in many columns with
-        // many matches, this creates O(columns × row_ranges) memory overhead.
-        //
-        // Potential optimizations if profiling shows this is a bottleneck:
-        // 1. Use Arc<Vec<RowGroupLocation>> to share row group data across columns
-        //    - Pro: Zero-copy sharing, same memory footprint as aggregate
-        //    - Con: 16 bytes Arc overhead per column, more complex serialization
-        // 2. Implement copy-on-write semantics with reference counting
-        // 3. Add a flag to KeywordSearcher to optionally disable expansion for users
-        //    who don't need per-column details (though this hurts API ergonomics)
-        //
-        // Current memory overhead: ~10-200 KB per search result (worst case)
-        // This is negligible compared to index I/O (ms scale) and acceptable for POC.
-        // Profile before optimizing!
-
-        if filter_to_column_id == Some(0) && !column_details.is_empty() {
-            let aggregate_row_groups = column_details[0].row_groups.clone();
-            column_details.clear();
-            for column_id in &all_column_ids {
-                if let Some(column_name) = self.filters.column_pool.get(*column_id) {
-                    column_details.push(ColumnLocation {
-                        column_name: column_name.to_string(),
-                        row_groups: aggregate_row_groups.clone(),
-                    });
-                }
-            }
-        }
-        if filter_to_column_id == Some(0) && !needs_verif_column_details.is_empty() {
-            let aggregate_row_groups = needs_verif_column_details[0].row_groups.clone();
-            needs_verif_column_details.clear();
-            for column_id in &all_column_ids {
-                if let Some(column_name) = self.filters.column_pool.get(*column_id) {
-                    needs_verif_column_details.push(ColumnLocation {
-                        column_name: column_name.to_string(),
-                        row_groups: aggregate_row_groups.clone(),
-                    });
-                }
-            }
-        }
-
-        let columns: Vec<String> = if filter_to_column_id == Some(0) {
-            archived_data.columns.iter()
-                .map(|col| col.column_id)
-                .filter(|&id| id != 0)
-                .filter_map(|id| self.filters.column_pool.get(id))
-                .map(|s| s.to_string())
-                .collect()
-        } else {
-            // Specific-column search: the `columns` list must reflect the
-            // target column regardless of whether rows went to verified or
-            // needs_verification. When split elimination has pushed every row
-            // into needs_verif_column_details, `column_details` is empty —
-            // fall through to the pending entries so the check-column name
-            // is preserved for post-decode verification.
-            column_details
-                .iter()
-                .chain(needs_verif_column_details.iter())
-                .next()
-                .map(|cd| vec![cd.column_name.clone()])
-                .unwrap_or_default()
-        };
-
-        let keyword_splits = archived_data.splits_matched;
-        let found = !column_details.is_empty() || !needs_verif_column_details.is_empty();
-
-        // Drop empty per-rg buckets so consumers see only row groups that
-        // actually contain ranges. Wrap the canonical maps in Arc once; every
-        // downstream stage clones the Arc instead of rebuilding the HashMap.
-        verified_ranges_by_rg.retain(|_, v| !v.is_empty());
-        needs_verif_ranges_by_rg.retain(|_, v| !v.is_empty());
-        let verified_ranges_by_rg = std::sync::Arc::new(verified_ranges_by_rg);
-        let needs_verif_ranges_by_rg = std::sync::Arc::new(needs_verif_ranges_by_rg);
-
-        let verified = if !column_details.is_empty() {
-            Some(KeywordLocationData {
-                columns: columns.clone(),
-                total_occurrences,
-                splits_matched: keyword_splits,
-                column_details,
-                ranges_by_rg: verified_ranges_by_rg,
-            })
-        } else {
-            None
-        };
-
-        let needs_verification = if !needs_verif_column_details.is_empty() {
-            Some(KeywordLocationData {
-                columns,
-                total_occurrences: needs_verif_occurrences,
-                splits_matched: keyword_splits,
-                column_details: needs_verif_column_details,
-                ranges_by_rg: needs_verif_ranges_by_rg,
-            })
-        } else {
-            None
-        };
 
         Ok(SearchResult {
             query: keyword.to_string(),
@@ -2186,9 +1937,12 @@ impl KeywordSearcher {
             });
         }
 
-        // If single token, use the mode-aware keyword search
+        // If single token, use the mode-aware keyword search. Route to the
+        // zero-copy variant — the full-deserialize path is equivalent but
+        // allocates every keyword's owned Vec<KeywordDataFlat> even though we
+        // only read one, costing ~1 ms/search on realistic chunks.
         if tokens.len() == 1 {
-            let result = self.search_keyword_internal_with_mode(&tokens[0], column_filter, mode).await?;
+            let result = self.search_keyword_internal_zerocopy(&tokens[0], column_filter, mode).await?;
 
             return Ok(SearchResult {
                 query: phrase.to_string(),
@@ -2210,7 +1964,7 @@ impl KeywordSearcher {
         // find_and_verify_multi_token_matches) and rows where a larger value contains
         // the phrase.  No shortcut needed.
         if mode == SearchMode::Equals && tokens.contains(&phrase.to_string()) {
-            let result = self.search_keyword_internal_with_mode(phrase, column_filter, mode).await?;
+            let result = self.search_keyword_internal_zerocopy(phrase, column_filter, mode).await?;
             if result.found {
                 return Ok(SearchResult {
                     query: phrase.to_string(),
@@ -2238,7 +1992,7 @@ impl KeywordSearcher {
             if token == phrase {
                 continue;
             }
-            let result = self.search_keyword_internal(token, column_filter).await?;
+            let result = self.search_keyword_internal_zerocopy(token, column_filter, SearchMode::Contains).await?;
             if result.found {
                 token_results.push(result);
                 found_tokens.push(token.clone());
@@ -2888,7 +2642,7 @@ impl KeywordSearcher {
         }
 
         // Search for the current keyword in the index to get its parent
-        match self.search_keyword_internal(current_keyword, None).await {
+        match self.search_keyword_internal_zerocopy(current_keyword, None, SearchMode::Contains).await {
             Ok(result) => {
                 if !result.found {
                     return MatchStatus::NeedsVerification {

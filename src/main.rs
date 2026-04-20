@@ -129,6 +129,8 @@ use std::process;
 fn parse_compression_arg(arg: &str) -> keywords::index_data::CompressionAlgorithm {
     if arg == "none" {
         keywords::index_data::CompressionAlgorithm::None
+    } else if arg == "lz4" {
+        keywords::index_data::CompressionAlgorithm::Lz4
     } else if arg.starts_with("zstd:") {
         let level_str = &arg[5..];
         match level_str.parse::<i32>() {
@@ -146,7 +148,7 @@ fn parse_compression_arg(arg: &str) -> keywords::index_data::CompressionAlgorith
             }
         }
     } else {
-        eprintln!("Error: Invalid compression format '{}'. Use 'none' or 'zstd:LEVEL'\n", arg);
+        eprintln!("Error: Invalid compression format '{}'. Use 'none', 'lz4', or 'zstd:LEVEL'\n", arg);
         print_help();
         process::exit(1);
     }
@@ -546,6 +548,7 @@ fn format_compression(compression: &keywords::index_data::CompressionAlgorithm) 
     match compression {
         keywords::index_data::CompressionAlgorithm::None => "None".to_string(),
         keywords::index_data::CompressionAlgorithm::Zstd { level } => format!("Zstd (level {})", level),
+        keywords::index_data::CompressionAlgorithm::Lz4 => "Lz4".to_string(),
     }
 }
 

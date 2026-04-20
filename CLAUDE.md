@@ -9,16 +9,22 @@ Understand that it is designed to work with object storage, to be cost effective
 
 ## Build & Test Commands
 
+All test invocations should enable the `timing` feature so fine-grained
+stderr breakdowns are produced for any test that exercises the hot search
+path. The feature compiles out completely when disabled, so there is no
+runtime cost — keeping it on by default just makes perf regressions
+visible when they happen.
+
 ```bash
 cargo build                        # debug build
 cargo build --release              # release build (uses target-cpu=native via .cargo/config.toml)
-cargo check                        # fast type-check without building
+cargo check --features timing      # fast type-check without building
 cargo fmt                          # format code
-cargo clippy                       # lint
-cargo test                         # all tests
-cargo test <test_name>             # single test by name
-cargo test <test_name> -- --nocapture  # with stdout
-cargo test --release performance_test -- --nocapture  # performance benchmarks (must use --release)
+cargo clippy --features timing     # lint
+cargo test --features timing                                    # all tests
+cargo test --features timing <test_name>                        # single test by name
+cargo test --features timing <test_name> -- --nocapture         # with stdout
+cargo test --release --features timing performance_test -- --nocapture  # performance benchmarks (must use --release)
 ```
 3
 `.cargo/config.toml` sets `RUST_TEST_THREADS=16` and `rustflags = ["-C", "target-cpu=native"]` automatically.

@@ -16,6 +16,68 @@ mod tests {
     #[cfg(feature = "perf_generate_figures")]
     use serial_test::serial;
     use crate::build_and_save_index;
+    use crate::index_data::{
+        ArchivedKeywordDataFlat, CompressionAlgorithm, FlatRow, RowGroupDataFlat, ColumnDataInline,
+    };
+    use rkyv::util::AlignedVec;
+    use rkyv::Archived;
+
+    /// Materialise an archived keyword entry into owned `(column_id, row_groups)`
+    /// pairs, hiding the Inline-vs-PerColumn enum split so call sites in the
+    /// perf tests don't each duplicate the variant handling.
+    fn materialize_columns(
+        archived: &ArchivedKeywordDataFlat,
+        data_compression: &CompressionAlgorithm,
+    ) -> Result<Vec<(u32, Vec<RowGroupDataFlat>)>, Box<dyn std::error::Error + Send + Sync>> {
+        fn clone_archived_rgs(
+            archived_rgs: &Archived<Vec<RowGroupDataFlat>>,
+        ) -> Vec<RowGroupDataFlat> {
+            archived_rgs
+                .iter()
+                .map(|rg| RowGroupDataFlat {
+                    row_group_id: rg.row_group_id.to_native(),
+                    rows: rg
+                        .rows
+                        .iter()
+                        .map(|r| FlatRow {
+                            row: r.row.to_native(),
+                            additional_rows: r.additional_rows.to_native(),
+                            splits_matched: r.splits_matched.as_ref().map(|s| s.to_native()),
+                            parent_chunk: r.parent_chunk.as_ref().map(|c| c.to_native()),
+                            parent_position: r.parent_position.as_ref().map(|p| p.to_native()),
+                        })
+                        .collect(),
+                })
+                .collect()
+        }
+
+        match archived {
+            ArchivedKeywordDataFlat::Inline { compressed_columns, .. } => {
+                let bytes = data_compression.decompress(compressed_columns.as_ref())?;
+                let mut buf = AlignedVec::<16>::new();
+                buf.extend_from_slice(&bytes);
+                let archived_inline: &Archived<Vec<ColumnDataInline>> = rkyv::access(&buf)
+                    .map_err(|e: RkyvError| format!("inline deserialize: {}", e))?;
+                Ok(archived_inline
+                    .iter()
+                    .map(|col| (col.column_id.to_native(), clone_archived_rgs(&col.row_groups)))
+                    .collect())
+            }
+            ArchivedKeywordDataFlat::PerColumn { columns, .. } => {
+                let mut out = Vec::with_capacity(columns.len());
+                for col in columns.iter() {
+                    let col_id = col.column_id.to_native();
+                    let rg_bytes = data_compression.decompress(col.compressed_row_groups.as_ref())?;
+                    let mut rg_buf = AlignedVec::<16>::new();
+                    rg_buf.extend_from_slice(&rg_bytes);
+                    let archived_rgs: &Archived<Vec<RowGroupDataFlat>> = rkyv::access(&rg_buf)
+                        .map_err(|e: RkyvError| format!("row_groups deserialize: {}", e))?;
+                    out.push((col_id, clone_archived_rgs(archived_rgs)));
+                }
+                Ok(out)
+            }
+        }
+    }
 
     #[tokio::test]
     #[cfg_attr(feature = "ci", ignore)]
@@ -246,19 +308,25 @@ mod tests {
                 Archived::<CompressionAlgorithm>::Zstd { level } => {
                     CompressionAlgorithm::Zstd { level: level.to_native() }
                 }
+                Archived::<CompressionAlgorithm>::Lz4 => CompressionAlgorithm::Lz4,
             };
             let data_compression = match &archived_filters.data_compression {
                 Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
                 Archived::<CompressionAlgorithm>::Zstd { level } => {
                     CompressionAlgorithm::Zstd { level: level.to_native() }
                 }
+                Archived::<CompressionAlgorithm>::Lz4 => CompressionAlgorithm::Lz4,
             };
 
             let uncompressed_keywords = keywords_compression.decompress(compressed_keyword_bytes)?;
-            let uncompressed_data = data_compression.decompress(compressed_data_bytes)?;
+            // Data section is stored uncompressed (per-column compression lives
+            // inside each keyword entry), so the "uncompressed" size is the
+            // on-disk size. The `data_compression` setting still applies — to
+            // the per-column blobs nested inside.
+            let _ = &data_compression;
 
             let uncomp_kw_len = uncompressed_keywords.len();
-            let uncomp_data_len = uncompressed_data.len();
+            let uncomp_data_len = compressed_data_bytes.len();
             let uncomp_total = uncomp_kw_len + uncomp_data_len;
 
             println!("Chunk {} (uncompressed):", idx);
@@ -411,13 +479,11 @@ mod tests {
         // Phase 5: Decompress and access data
         let deser_data_start = Instant::now();
 
-        // Decompress data section
-        let data_bytes = searcher.filters.data_compression.decompress(compressed_data_bytes)?;
-
-        // Deserialize data from decompressed data
+        // Data section is stored uncompressed at the outer layer (per-column
+        // compression lives inside each keyword entry).
         use crate::index_data::KeywordDataFlat;
         let mut data_buffer = AlignedVec::<16>::new();
-        data_buffer.extend_from_slice(&data_bytes);
+        data_buffer.extend_from_slice(compressed_data_bytes);
         let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
         let deser_data_time = deser_data_start.elapsed();
@@ -435,14 +501,19 @@ mod tests {
 
         let mut column_details = Vec::new();
         let mut total_occurrences = 0u64;
-        let all_column_ids: Vec<u32> = archived_data_item.columns.iter()
-            .map(|col| col.column_id.to_native())  // Convert from archived
+        let materialized = materialize_columns(
+            archived_data_item,
+            &searcher.filters.data_compression,
+        )?;
+        let all_column_ids: Vec<u32> = materialized
+            .iter()
+            .map(|(id, _)| *id)
             .filter(|&id| id != 0)
             .collect();
 
-        for col in archived_data_item.columns.iter() {
-            let column_id: u32 = col.column_id.to_native();  // Convert from archived
-            if Some(0) == Some(0) && column_id != 0 {
+        for (column_id, row_groups_vec) in &materialized {
+            let column_id = *column_id;
+            if column_id != 0 {
                 continue;
             }
             let column_name = if column_id == 0 {
@@ -451,20 +522,19 @@ mod tests {
                 searcher.filters.column_pool.get(column_id).unwrap().to_string()
             };
             let mut row_groups = Vec::new();
-            for rg in col.row_groups.iter() {
-                let row_group_id: u16 = rg.row_group_id.to_native();  // Convert from archived
+            for rg in row_groups_vec.iter() {
+                let row_group_id: u16 = rg.row_group_id;
                 let mut row_ranges = Vec::new();
                 for flat_row in rg.rows.iter() {
                     row_ranges.push(RowRange {
-                        start_row: flat_row.row.to_native(),  // Convert from archived
-                        end_row: flat_row.row.to_native() + flat_row.additional_rows.to_native(),
-                        splits_matched: flat_row.splits_matched.as_ref().and_then(|archived_nz| {
-                            NonZeroU16::new(archived_nz.get())
-                        }),
-                        parent_chunk: flat_row.parent_chunk.as_ref().map(|c| c.to_native()),
-                        parent_position: flat_row.parent_position.as_ref().map(|p| p.to_native()),
+                        start_row: flat_row.row,
+                        end_row: flat_row.row + flat_row.additional_rows,
+                        splits_matched: flat_row.splits_matched
+                            .and_then(|nz| NonZeroU16::new(nz.get())),
+                        parent_chunk: flat_row.parent_chunk,
+                        parent_position: flat_row.parent_position,
                     });
-                    total_occurrences = total_occurrences.saturating_add(flat_row.additional_rows.to_native() as u64 + 1);
+                    total_occurrences = total_occurrences.saturating_add(flat_row.additional_rows as u64 + 1);
                 }
                 row_groups.push(RowGroupLocation { row_group_id, row_ranges });
             }
@@ -1010,19 +1080,25 @@ mod tests {
                 Archived::<CompressionAlgorithm>::Zstd { level } => {
                     CompressionAlgorithm::Zstd { level: level.to_native() }
                 }
+                Archived::<CompressionAlgorithm>::Lz4 => CompressionAlgorithm::Lz4,
             };
             let data_compression = match &archived_filters.data_compression {
                 Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
                 Archived::<CompressionAlgorithm>::Zstd { level } => {
                     CompressionAlgorithm::Zstd { level: level.to_native() }
                 }
+                Archived::<CompressionAlgorithm>::Lz4 => CompressionAlgorithm::Lz4,
             };
 
             let uncompressed_keywords = keywords_compression.decompress(compressed_keyword_bytes)?;
-            let uncompressed_data = data_compression.decompress(compressed_data_bytes)?;
+            // Data section is stored uncompressed (per-column compression lives
+            // inside each keyword entry), so the "uncompressed" size is the
+            // on-disk size. The `data_compression` setting still applies — to
+            // the per-column blobs nested inside.
+            let _ = &data_compression;
 
             let uncomp_kw_len = uncompressed_keywords.len();
-            let uncomp_data_len = uncompressed_data.len();
+            let uncomp_data_len = compressed_data_bytes.len();
             let uncomp_total = uncomp_kw_len + uncomp_data_len;
 
             println!("Chunk {} (uncompressed):", idx);
@@ -1175,13 +1251,11 @@ mod tests {
         // Phase 5: Decompress and access data
         let deser_data_start = Instant::now();
 
-        // Decompress data section
-        let data_bytes = searcher.filters.data_compression.decompress(compressed_data_bytes)?;
-
-        // Deserialize data from decompressed data
+        // Data section is stored uncompressed at the outer layer (per-column
+        // compression lives inside each keyword entry).
         use crate::index_data::KeywordDataFlat;
         let mut data_buffer = AlignedVec::<16>::new();
-        data_buffer.extend_from_slice(&data_bytes);
+        data_buffer.extend_from_slice(compressed_data_bytes);
         let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
         let deser_data_time = deser_data_start.elapsed();
@@ -1199,14 +1273,19 @@ mod tests {
 
         let mut column_details = Vec::new();
         let mut total_occurrences = 0u64;
-        let all_column_ids: Vec<u32> = archived_data_item.columns.iter()
-            .map(|col| col.column_id.to_native())  // Convert from archived
+        let materialized = materialize_columns(
+            archived_data_item,
+            &searcher.filters.data_compression,
+        )?;
+        let all_column_ids: Vec<u32> = materialized
+            .iter()
+            .map(|(id, _)| *id)
             .filter(|&id| id != 0)
             .collect();
 
-        for col in archived_data_item.columns.iter() {
-            let column_id: u32 = col.column_id.to_native();  // Convert from archived
-            if Some(0) == Some(0) && column_id != 0 {
+        for (column_id, row_groups_vec) in &materialized {
+            let column_id = *column_id;
+            if column_id != 0 {
                 continue;
             }
             let column_name = if column_id == 0 {
@@ -1215,18 +1294,18 @@ mod tests {
                 searcher.filters.column_pool.get(column_id).unwrap().to_string()
             };
             let mut row_groups = Vec::new();
-            for rg in col.row_groups.iter() {
-                let row_group_id: u16 = rg.row_group_id.to_native();  // Convert from archived
+            for rg in row_groups_vec.iter() {
+                let row_group_id: u16 = rg.row_group_id;
                 let mut row_ranges = Vec::new();
                 for flat_row in rg.rows.iter() {
                     row_ranges.push(RowRange {
-                        start_row: flat_row.row.to_native(),  // Convert from archived
-                        end_row: flat_row.row.to_native() + flat_row.additional_rows.to_native(),
-                        splits_matched: flat_row.splits_matched.as_ref().map(|v| v.to_native()),
-                        parent_chunk: flat_row.parent_chunk.as_ref().map(|c| c.to_native()),
-                        parent_position: flat_row.parent_position.as_ref().map(|p| p.to_native()),
+                        start_row: flat_row.row,
+                        end_row: flat_row.row + flat_row.additional_rows,
+                        splits_matched: flat_row.splits_matched,
+                        parent_chunk: flat_row.parent_chunk,
+                        parent_position: flat_row.parent_position,
                     });
-                    total_occurrences = total_occurrences.saturating_add(flat_row.additional_rows.to_native() as u64 + 1);
+                    total_occurrences = total_occurrences.saturating_add(flat_row.additional_rows as u64 + 1);
                 }
                 row_groups.push(RowGroupLocation { row_group_id, row_ranges });
             }
@@ -1773,19 +1852,25 @@ mod tests {
                 Archived::<CompressionAlgorithm>::Zstd { level } => {
                     CompressionAlgorithm::Zstd { level: level.to_native() }
                 }
+                Archived::<CompressionAlgorithm>::Lz4 => CompressionAlgorithm::Lz4,
             };
             let data_compression = match &archived_filters.data_compression {
                 Archived::<CompressionAlgorithm>::None => CompressionAlgorithm::None,
                 Archived::<CompressionAlgorithm>::Zstd { level } => {
                     CompressionAlgorithm::Zstd { level: level.to_native() }
                 }
+                Archived::<CompressionAlgorithm>::Lz4 => CompressionAlgorithm::Lz4,
             };
 
             let uncompressed_keywords = keywords_compression.decompress(compressed_keyword_bytes)?;
-            let uncompressed_data = data_compression.decompress(compressed_data_bytes)?;
+            // Data section is stored uncompressed (per-column compression lives
+            // inside each keyword entry), so the "uncompressed" size is the
+            // on-disk size. The `data_compression` setting still applies — to
+            // the per-column blobs nested inside.
+            let _ = &data_compression;
 
             let uncomp_kw_len = uncompressed_keywords.len();
-            let uncomp_data_len = uncompressed_data.len();
+            let uncomp_data_len = compressed_data_bytes.len();
             let uncomp_total = uncomp_kw_len + uncomp_data_len;
 
             println!("Chunk {} (uncompressed):", idx);
@@ -1937,13 +2022,11 @@ mod tests {
         // Phase 5: Decompress and access data
         let deser_data_start = Instant::now();
 
-        // Decompress data section
-        let data_bytes = searcher.filters.data_compression.decompress(compressed_data_bytes)?;
-
-        // Deserialize data from decompressed data
+        // Data section is stored uncompressed at the outer layer (per-column
+        // compression lives inside each keyword entry).
         use crate::index_data::KeywordDataFlat;
         let mut data_buffer = AlignedVec::<16>::new();
-        data_buffer.extend_from_slice(&data_bytes);
+        data_buffer.extend_from_slice(compressed_data_bytes);
         let archived_data: &Archived<Vec<KeywordDataFlat>> = rkyv::access(&data_buffer)
             .map_err(|e: RkyvError| format!("Failed to deserialize: {}", e))?;
         let deser_data_time = deser_data_start.elapsed();
@@ -1961,14 +2044,19 @@ mod tests {
 
         let mut column_details = Vec::new();
         let mut total_occurrences = 0u64;
-        let all_column_ids: Vec<u32> = archived_data_item.columns.iter()
-            .map(|col| col.column_id.to_native())  // Convert from archived
+        let materialized = materialize_columns(
+            archived_data_item,
+            &searcher.filters.data_compression,
+        )?;
+        let all_column_ids: Vec<u32> = materialized
+            .iter()
+            .map(|(id, _)| *id)
             .filter(|&id| id != 0)
             .collect();
 
-        for col in archived_data_item.columns.iter() {
-            let column_id: u32 = col.column_id.to_native();  // Convert from archived
-            if Some(0) == Some(0) && column_id != 0 {
+        for (column_id, row_groups_vec) in &materialized {
+            let column_id = *column_id;
+            if column_id != 0 {
                 continue;
             }
             let column_name = if column_id == 0 {
@@ -1977,18 +2065,18 @@ mod tests {
                 searcher.filters.column_pool.get(column_id).unwrap().to_string()
             };
             let mut row_groups = Vec::new();
-            for rg in col.row_groups.iter() {
-                let row_group_id: u16 = rg.row_group_id.to_native();  // Convert from archived
+            for rg in row_groups_vec.iter() {
+                let row_group_id: u16 = rg.row_group_id;
                 let mut row_ranges = Vec::new();
                 for flat_row in rg.rows.iter() {
                     row_ranges.push(RowRange {
-                        start_row: flat_row.row.to_native(),  // Convert from archived
-                        end_row: flat_row.row.to_native() + flat_row.additional_rows.to_native(),
-                        splits_matched: flat_row.splits_matched.as_ref().map(|v| v.to_native()),
-                        parent_chunk: flat_row.parent_chunk.as_ref().map(|c| c.to_native()),
-                        parent_position: flat_row.parent_position.as_ref().map(|p| p.to_native()),
+                        start_row: flat_row.row,
+                        end_row: flat_row.row + flat_row.additional_rows,
+                        splits_matched: flat_row.splits_matched,
+                        parent_chunk: flat_row.parent_chunk,
+                        parent_position: flat_row.parent_position,
                     });
-                    total_occurrences = total_occurrences.saturating_add(flat_row.additional_rows.to_native() as u64 + 1);
+                    total_occurrences = total_occurrences.saturating_add(flat_row.additional_rows as u64 + 1);
                 }
                 row_groups.push(RowGroupLocation { row_group_id, row_ranges });
             }

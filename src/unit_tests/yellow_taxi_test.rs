@@ -934,20 +934,40 @@ mod yellow_taxi_index_test {
         // ── Keyword index: 3 specific-column searches + combine_and ──────────
         println!("\nStep 3: Keyword index 3-column AND…");
         let ki_load_start = Instant::now();
-        let searcher = KeywordSearcher::load(&temp_path_str, None).await
-            .expect("KeywordSearcher::load failed");
+        let searcher = std::sync::Arc::new(
+            KeywordSearcher::load(&temp_path_str, None).await
+                .expect("KeywordSearcher::load failed")
+        );
         let ki_load_time = ki_load_start.elapsed();
 
+        use crate::searching::keyword_search::SearchSpec;
+        let specs = vec![
+            SearchSpec {
+                search_for: "1".to_string(),
+                in_column: Some("passenger_count".to_string()),
+                keyword_only: false,
+                mode: SearchMode::Equals,
+            },
+            SearchSpec {
+                search_for: "2".to_string(),
+                in_column: Some("VendorID".to_string()),
+                keyword_only: false,
+                mode: SearchMode::Equals,
+            },
+            SearchSpec {
+                search_for: "1".to_string(),
+                in_column: Some("payment_type".to_string()),
+                keyword_only: false,
+                mode: SearchMode::Equals,
+            },
+        ];
+
         let ki_index_start = Instant::now();
-        let r_pc = searcher.search_with_mode(
-            "1", Some("passenger_count"), false, SearchMode::Equals,
-        ).await.expect("search passenger_count failed");
-        let r_vid = searcher.search_with_mode(
-            "2", Some("VendorID"), false, SearchMode::Equals,
-        ).await.expect("search VendorID failed");
-        let r_pt = searcher.search_with_mode(
-            "1", Some("payment_type"), false, SearchMode::Equals,
-        ).await.expect("search payment_type failed");
+        let results = searcher.search_many(specs).await
+            .expect("search_many failed");
+        let r_pc = results[0].clone();
+        let r_vid = results[1].clone();
+        let r_pt = results[2].clone();
 
         assert!(r_pc.found && r_vid.found && r_pt.found,
                 "All three per-column searches must find their keywords");
@@ -1096,20 +1116,40 @@ mod yellow_taxi_index_test {
 
         println!("\nStep 3: Keyword index 3-column OR…");
         let ki_load_start = Instant::now();
-        let searcher = KeywordSearcher::load(&temp_path_str, None).await
-            .expect("KeywordSearcher::load failed");
+        let searcher = std::sync::Arc::new(
+            KeywordSearcher::load(&temp_path_str, None).await
+                .expect("KeywordSearcher::load failed")
+        );
         let ki_load_time = ki_load_start.elapsed();
 
+        use crate::searching::keyword_search::SearchSpec;
+        let specs = vec![
+            SearchSpec {
+                search_for: "2".to_string(),
+                in_column: Some("passenger_count".to_string()),
+                keyword_only: false,
+                mode: SearchMode::Equals,
+            },
+            SearchSpec {
+                search_for: "2".to_string(),
+                in_column: Some("VendorID".to_string()),
+                keyword_only: false,
+                mode: SearchMode::Equals,
+            },
+            SearchSpec {
+                search_for: "2".to_string(),
+                in_column: Some("payment_type".to_string()),
+                keyword_only: false,
+                mode: SearchMode::Equals,
+            },
+        ];
+
         let ki_index_start = Instant::now();
-        let r_pc = searcher.search_with_mode(
-            "2", Some("passenger_count"), false, SearchMode::Equals,
-        ).await.expect("search passenger_count failed");
-        let r_vid = searcher.search_with_mode(
-            "2", Some("VendorID"), false, SearchMode::Equals,
-        ).await.expect("search VendorID failed");
-        let r_pt = searcher.search_with_mode(
-            "2", Some("payment_type"), false, SearchMode::Equals,
-        ).await.expect("search payment_type failed");
+        let results = searcher.search_many(specs).await
+            .expect("search_many failed");
+        let r_pc = results[0].clone();
+        let r_vid = results[1].clone();
+        let r_pt = results[2].clone();
 
         assert!(r_pc.found && r_vid.found && r_pt.found,
                 "All three per-column searches must find their keywords");

@@ -24,6 +24,7 @@ once_cell = "1.21.3"
 futures = "0.3.31"
 libc = "0.2.177"
 zstd = "0.13.3"
+lz4_flex = { version = "0.11.6", default-features = false, features = ["std", "safe-decode", "safe-encode"] }
 reqwest = "0.12.24"
 
 # Optional: for better S3 configuration
@@ -41,6 +42,13 @@ ci = []
 compression_comparison = []
 perf_generate_figures = []
 perf_generate_figures_25 = []
+# Enables fine-grained stderr timing breakdowns inside hot search paths.
+# No cost when disabled — all timing code compiles out.
+timing = []
+# Opt-in to slow zstd levels (>=15) in compression analysis tests.
+# These levels can add minutes-per-config to build time without moving the
+# compression ratio meaningfully, so we keep them off the default sweep.
+bigzstd = []
 
 [dev-dependencies]
 tokio-test = "0.4.4"

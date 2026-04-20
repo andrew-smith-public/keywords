@@ -21,11 +21,16 @@ use crate::index_structure::index_files::{index_filename, IndexFile};
 ///   - Level 1-3: Fast compression, lower ratio
 ///   - Level 15: Balanced (default)
 ///   - Level 20-22: Maximum compression, slower
+/// * `Lz4` - LZ4 block compression. Much faster decompression than zstd
+///   (often 3-5x), lower compression ratio (~2-5x). Useful when search
+///   latency matters more than index size — e.g. hot chunks in memory-cached
+///   workflows.
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[rkyv(derive(Debug))]
 pub enum CompressionAlgorithm {
     None,
     Zstd { level: i32 },
+    Lz4,
 }
 
 impl CompressionAlgorithm {
@@ -45,6 +50,12 @@ impl CompressionAlgorithm {
                 zstd::encode_all(data, *level)
                     .map_err(|e| format!("Zstd compression failed: {}", e).into())
             }
+            CompressionAlgorithm::Lz4 => {
+                // `compress_prepend_size` stores the uncompressed length as a
+                // u32 LE header so `decompress_size_prepended` can allocate
+                // the right-sized output buffer without a separate side channel.
+                Ok(lz4_flex::block::compress_prepend_size(data))
+            }
         }
     }
 
@@ -63,6 +74,10 @@ impl CompressionAlgorithm {
             CompressionAlgorithm::Zstd { .. } => {
                 zstd::decode_all(data)
                     .map_err(|e| format!("Zstd decompression failed: {}", e).into())
+            }
+            CompressionAlgorithm::Lz4 => {
+                lz4_flex::block::decompress_size_prepended(data)
+                    .map_err(|e| format!("Lz4 decompression failed: {}", e).into())
             }
         }
     }
@@ -134,18 +149,70 @@ pub struct ChunkInfo {
     pub count: u16,
 }
 
-/// Flattened keyword data (stored in data.bin)
+/// Threshold (total Row objects across all columns) above which a keyword
+/// uses per-column compression instead of a single inline blob.
+///
+/// Below the threshold, compressing ~14 tiny column blobs costs more in
+/// compression-header overhead than it saves on decompress time (which is
+/// already cheap for small data). Above it, per-column pays off: specific-
+/// column searches decompress just 1/N of the data.
+///
+/// 25,000 was chosen to put the crossover well above typical medium
+/// keywords — keeps the bulk of real-world data on the single-blob path
+/// so the index stays small — while still below the ~200k+ Row-object
+/// count of the hottest keywords (e.g. yellow taxi `"1"`/`"2"`) that
+/// actually benefit from per-column decompress.
+pub const PER_COLUMN_COMPRESSION_THRESHOLD: usize = 25_000;
+
+/// Flattened keyword data (stored in data.bin).
+///
+/// Two shapes depending on how many rows the keyword has across all columns:
+///
+/// - [`KeywordDataFlat::Inline`] for small keywords — all columns go into
+///   one compressed blob. Better compression ratio on tiny data, single
+///   decompress covers every column so the speed loss is negligible.
+/// - [`KeywordDataFlat::PerColumn`] for large keywords — each column has its
+///   own independently compressed blob. Specific-column search decompresses
+///   only the target column, cutting ~(N-1)/N of the decompression work.
+///
+/// The per-keyword threshold is [`PER_COLUMN_COMPRESSION_THRESHOLD`].
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
-pub struct KeywordDataFlat {
-    pub columns: Vec<ColumnDataFlat>,
-    pub splits_matched: Option<std::num::NonZeroU16>,
+pub enum KeywordDataFlat {
+    /// Small-keyword path: one compressed blob carries every column's
+    /// `Vec<ColumnDataInline>` together. Matches the pre-per-column format
+    /// but scoped to one keyword at a time (rather than one chunk).
+    Inline {
+        splits_matched: Option<std::num::NonZeroU16>,
+        /// `data_compression.compress(rkyv(Vec<ColumnDataInline>))`.
+        compressed_columns: Vec<u8>,
+    },
+    /// Large-keyword path: each column's `Vec<RowGroupDataFlat>` is its own
+    /// compressed blob inside `ColumnDataFlat`. Search decompresses only the
+    /// columns it needs.
+    PerColumn {
+        splits_matched: Option<std::num::NonZeroU16>,
+        columns: Vec<ColumnDataFlat>,
+    },
 }
 
-/// Per-column data for a keyword
+/// Per-column data inside a [`KeywordDataFlat::Inline`] blob. Fully
+/// uncompressed once the outer blob is decompressed.
+#[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
+pub struct ColumnDataInline {
+    pub column_id: u32,
+    pub row_groups: Vec<RowGroupDataFlat>,
+}
+
+/// Per-column data for a keyword in the PerColumn layout.
+///
+/// `compressed_row_groups` is a self-contained, independently-compressed
+/// payload — bytes produced by `data_compression.compress(rkyv(Vec<RowGroupDataFlat>))`.
+/// Each column compresses independently so a specific-column search
+/// decompresses only its own column's data instead of the whole chunk.
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone)]
 pub struct ColumnDataFlat {
     pub column_id: u32,
-    pub row_groups: Vec<RowGroupDataFlat>,
+    pub compressed_row_groups: Vec<u8>,
 }
 
 /// Per-row-group data for a column
@@ -216,8 +283,12 @@ struct KeywordLocation {
 fn convert_to_flat(
     keyword_data: &KeywordOneFile,
     keyword_to_location: &HashMap<&str, KeywordLocation>,
-) -> KeywordDataFlat {
-    let mut columns = Vec::new();
+    data_compression: &CompressionAlgorithm,
+) -> Result<KeywordDataFlat, Box<dyn std::error::Error + Send + Sync>> {
+    // Build the plain (uncompressed) per-column data first so we can count
+    // rows and decide which compression path to take.
+    let mut inline_columns: Vec<ColumnDataInline> = Vec::new();
+    let mut total_row_objects: usize = 0;
 
     // Iterate through all columns (index 0 is the aggregate bucket, included here)
     for (col_idx, &column_id) in keyword_data.column_references.iter().enumerate() {
@@ -251,6 +322,7 @@ fn convert_to_flat(
                     }
                 }
 
+                total_row_objects += rows.len();
                 row_groups.push(RowGroupDataFlat {
                     row_group_id,
                     rows,
@@ -258,15 +330,40 @@ fn convert_to_flat(
             }
         }
 
-        columns.push(ColumnDataFlat {
+        inline_columns.push(ColumnDataInline {
             column_id,
             row_groups,
         });
     }
 
-    KeywordDataFlat {
-        columns,
-        splits_matched: keyword_data.splits_matched,
+    if total_row_objects < PER_COLUMN_COMPRESSION_THRESHOLD {
+        // Inline path: one compressed blob covers every column together.
+        // Smaller keywords compress better as a single blob than as N tiny
+        // ones, and decompressing the whole thing is cheap at this size.
+        let columns_bytes = to_bytes::<RkyvError>(&inline_columns)
+            .map_err(|e| format!("Failed to serialize inline columns: {}", e))?;
+        let compressed_columns = data_compression.compress(&columns_bytes)?;
+        Ok(KeywordDataFlat::Inline {
+            splits_matched: keyword_data.splits_matched,
+            compressed_columns,
+        })
+    } else {
+        // Per-column path: each column's row_groups gets its own compressed
+        // blob so specific-column search decompresses ~1/N of the data.
+        let mut columns = Vec::with_capacity(inline_columns.len());
+        for inline_col in inline_columns {
+            let rg_bytes = to_bytes::<RkyvError>(&inline_col.row_groups)
+                .map_err(|e| format!("Failed to serialize row_groups for col {}: {}", inline_col.column_id, e))?;
+            let compressed_row_groups = data_compression.compress(&rg_bytes)?;
+            columns.push(ColumnDataFlat {
+                column_id: inline_col.column_id,
+                compressed_row_groups,
+            });
+        }
+        Ok(KeywordDataFlat::PerColumn {
+            splits_matched: keyword_data.splits_matched,
+            columns,
+        })
     }
 }
 
@@ -456,8 +553,15 @@ pub async fn build_distributed_index(
     let mut current_chunk_size = 0;
 
     for (idx, (keyword, keyword_data)) in sorted_keywords.iter().enumerate() {
-        // Serialize without parent mapping (pass empty map)
-        let flat_data = convert_to_flat(keyword_data, &empty_map);
+        // Chunk-boundary pre-pass: we only need a size estimate to decide
+        // chunk boundaries, not the final compressed bytes. Passing
+        // `CompressionAlgorithm::None` makes `convert_to_flat` skip the
+        // (expensive) real compression and just returns raw payload bytes
+        // — giving us a safe UPPER bound on the actual compressed size.
+        // Without this, every keyword gets compressed twice during build
+        // (once here, once in the real build loop), which dominates build
+        // time for mid/high Zstd levels.
+        let flat_data = convert_to_flat(keyword_data, &empty_map, &CompressionAlgorithm::None)?;
         let data_bytes = to_bytes::<RkyvError>(&flat_data)
             .map_err(|e| format!("Failed to serialize keyword data: {}", e))?;
 
@@ -553,12 +657,16 @@ pub async fn build_distributed_index(
             .map(|(keyword, _)| keyword.to_string())
             .collect();
 
-        // Build data list for this chunk with proper parent mapping
+        // Build data list for this chunk with proper parent mapping.
+        // Each column's row_groups is compressed independently inside the
+        // KeywordDataFlat payload, so we don't compress the outer data
+        // section a second time — that would only re-compress already-
+        // compressed bytes for near-zero gain and extra decompression work.
         let mut data_in_chunk = Vec::new();
 
         for (_keyword, keyword_data) in chunk {
             // Convert to flat structure with parent chunk+position mapping
-            let flat_data = convert_to_flat(keyword_data, &keyword_to_location);
+            let flat_data = convert_to_flat(keyword_data, &keyword_to_location, &data_compression)?;
             data_in_chunk.push(flat_data);
         }
 
@@ -569,12 +677,12 @@ pub async fn build_distributed_index(
         let keyword_list_length = compressed_keyword_list.len() as u32;
         data_file.extend_from_slice(&compressed_keyword_list);
 
-        // Serialize and compress data section
+        // Serialize data section (uncompressed outer — per-column blobs
+        // inside are already compressed).
         let data_bytes = to_bytes::<RkyvError>(&data_in_chunk)
             .map_err(|e| format!("Failed to serialize chunk data: {}", e))?;
-        let compressed_data = data_compression.compress(&data_bytes)?;
-        let data_length = compressed_data.len() as u32;
-        data_file.extend_from_slice(&compressed_data);
+        let data_length = data_bytes.len() as u32;
+        data_file.extend_from_slice(&data_bytes);
 
         let total_length = keyword_list_length + data_length;
         assert!(
