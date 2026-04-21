@@ -29,9 +29,9 @@ High-performance Rust library and CLI tool for building keyword indexes on Parqu
 
 ## Project Context
 
-This proof-of-concept was developed over 2-3 weeks "out of hours" to explore the foundational architecture for a fast, low-cost multi-petabyte query system capable of running purely from cloud object storage (e.g., AWS S3) without requiring significant expensive local NVMe storage.
+This proof-of-concept was originally developed over 2-3 weeks "out of hours" to explore the foundational architecture for a fast, low-cost multi-petabyte query system capable of running purely from cloud object storage (e.g., AWS S3) without requiring significant expensive local NVMe storage.
 
-Built as a first Rust project using hands-on implementation combined with AI-assisted learning for Rust-specific patterns.
+Built as a first Rust project using hands-on implementation with advice from AI combined with AI-assisted coding, and most recently using Claude Code.
 
 ### Current Status
 
