@@ -95,6 +95,7 @@ mod comprehensive_custom_features_tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_custom_splits_and_full_keywords() {
         println!("\n=============================================================");
         println!("COMPREHENSIVE CUSTOM FEATURES TEST");

@@ -17,7 +17,7 @@ High-performance Rust library and CLI tool for building keyword indexes on Parqu
 - **Index 0 optimization**: Aggregates keywords across all columns for efficient unfiltered searches on wide tables
 
 **Production-Oriented Patterns**
-- **Comprehensive testing**: 13 test modules covering edge cases, integration, and performance scenarios
+- **Comprehensive testing**: 200+ tests across 20+ modules covering edge cases, integration, and performance scenarios
 - **Distributed index structure with dynamic chunk sizing** for efficient partial loading
 
 **Tested Capabilities**
@@ -203,7 +203,7 @@ This hierarchical approach enables:
 
 ### Example Performance Results
 
-Testing on representative hardware with a 500,000-row Parquet file containing 5,000 random values across 10 columns (see [`test_performance_with_debug`](src/unit_tests/test_performance_with_debug.rs) for full test implementation):
+Testing on representative hardware with a 500,000-row Parquet file containing 5,000 random values across 10 columns (see [`test_performance_with_debug`](src/unit_tests/performance_test.rs) for full test implementation):
 
 ```
 ┌─────────────────────────────────┬──────────────┬──────────────┐
@@ -340,7 +340,7 @@ A **129x** speedup
 Key dependencies used in this project:
 
 - **arrow** (57.0.0): Arrow data format integration
-- **bytes** (1.10.1): Efficient byte buffer management
+- **bytes** (1.11.0): Efficient byte buffer management
 - **dashmap** (6.1.0): Concurrent hash map
 - **futures** (0.3.31): Async programming primitives
 - **hashbrown** (0.16.0): High-performance hash maps
@@ -381,7 +381,7 @@ keywords/
 │   │   ├── file_interaction_local_and_cloud.rs  # Storage abstraction
 │   │   └── mod.rs
 │   ├── unit_tests/                # Integration and performance tests
-│   └── keyword_shred/test/        # Hierarchical keyword extraction tests
+│   └── keyword_shred/tests/       # Hierarchical keyword extraction tests
 ├── Cargo.toml
 ├── COPYRIGHT.txt
 └── README.md
@@ -399,7 +399,7 @@ Current implementation has the following constraints (appropriate for POC phase)
 - **Memory bound during searching**: Entire index must fit in memory
 - **Single-threaded indexing**: Indexing is not parallelized (but I/O is optimized)
 - **No incremental updates**: Index must be rebuilt if Parquet file changes
-- **String columns only**: Currently focuses on string data types
+- **Numeric precision**: Non-string columns are stringified during indexing (whole-number floats lose their trailing `.0`); use exact-match searches with care for floats
 
 ---
 

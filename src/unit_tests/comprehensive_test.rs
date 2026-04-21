@@ -648,6 +648,7 @@ mod comprehensive_large_file_tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_comprehensive_large_parquet_search() {
         println!("\n=== COMPREHENSIVE LARGE PARQUET SEARCH TEST ===\n");
 

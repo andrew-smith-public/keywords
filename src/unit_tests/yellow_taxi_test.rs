@@ -35,6 +35,7 @@ mod yellow_taxi_index_test {
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_yellow_taxi_april_2020_index() {
         println!("\n=============================================================");
         println!("NYC YELLOW TAXI DATA - APRIL 2020 INDEX TEST");
@@ -560,6 +561,7 @@ mod yellow_taxi_index_test {
     /// This is an apples-to-apples comparison demonstrating performance parity on
     /// a high-frequency keyword (~70% of rows match).
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_yellow_taxi_single_column_vs_datafusion() {
         use std::time::Instant;
         use std::collections::HashSet;
@@ -708,6 +710,7 @@ mod yellow_taxi_index_test {
     /// on the aggregate column), the keyword index performs comparably to DataFusion
     /// when both must scan the full file.
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_yellow_taxi_all_columns_split_elimination_vs_datafusion() {
         use std::time::Instant;
         use std::collections::HashSet;
@@ -886,6 +889,7 @@ mod yellow_taxi_index_test {
     /// trigger split-elimination — so the pending-predicate path in the
     /// unified reader has to fire to get the right answer.
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_yellow_taxi_three_column_and_vs_datafusion() {
         use std::time::Instant;
         use std::collections::HashSet;
@@ -1071,6 +1075,7 @@ mod yellow_taxi_index_test {
     /// stitch per-term verified sets together with per-term pending predicate
     /// results.
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_yellow_taxi_three_column_or_vs_datafusion() {
         use std::time::Instant;
         use std::collections::HashSet;

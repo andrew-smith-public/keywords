@@ -328,6 +328,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "ci", ignore)]
     async fn test_read_local_parquet_larger() {
         println!("\n=== Reading metadata from generated larger parquet ===");
 
