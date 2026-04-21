@@ -198,12 +198,8 @@ pub struct SearchResult {
 /// ```no_run
 /// # use keywords::searching::search_results::KeywordLocationData;
 /// # use std::num::NonZeroU16;
-/// # let data = KeywordLocationData {
-/// #     columns: vec!["email".to_string(), "notes".to_string()],
-/// #     total_occurrences: 127,
-/// #     splits_matched: NonZeroU16::new(6),
-/// #     column_details: vec![],
-/// # };
+/// # fn get_data() -> KeywordLocationData { unimplemented!() }
+/// # let data = get_data();
 /// // Check which columns have the keyword
 /// for col in &data.columns {
 ///     println!("Keyword appears in column: {}", col);
@@ -446,10 +442,8 @@ pub struct RowRange {
 ///
 /// ```no_run
 /// # use keywords::searching::search_results::CombinedSearchResult;
-/// # let result = CombinedSearchResult {
-/// #     keywords: vec!["python".to_string(), "developer".to_string()],
-/// #     row_groups: vec![],
-/// # };
+/// # fn get_result() -> CombinedSearchResult { unimplemented!() }
+/// # let result = get_result();
 /// // AND query: rows containing both "python" AND "developer"
 /// println!("Combined search for: {:?}", result.keywords);
 /// println!("Found matches in {} row group(s)", result.row_groups.len());
